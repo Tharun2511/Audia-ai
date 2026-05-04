@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
+import { toast } from "sonner";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { buildColorMap, formatDuration } from "./utils";
 import TitleInput from "./TitleInput";
@@ -42,17 +43,21 @@ export default function TranscriptPanel({
     );
     if (Object.keys(speakerMap).length === 0) { setShowRenamer(false); return; }
     setSaving(true);
-    const res = await fetch(`/api/transcriptions/${transcriptionId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ speakerMap }),
-    });
-    if (res.ok) {
+    try {
+      const res = await fetch(`/api/transcriptions/${transcriptionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speakerMap }),
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
       const { segments: updated } = await res.json();
       onSegmentsUpdate(updated);
+      setShowRenamer(false);
+    } catch {
+      toast.error("Couldn't rename speakers. Try again.");
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
-    setShowRenamer(false);
   };
 
   const handleCopy = async () => {

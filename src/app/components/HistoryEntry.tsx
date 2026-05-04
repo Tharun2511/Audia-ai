@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import { toast } from "sonner";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { buildColorMap, formatDuration } from "./utils";
 import TitleInput from "./TitleInput";
@@ -52,8 +53,14 @@ export default function HistoryEntry({
   const handleDelete = async (e: React.MouseEvent) => {
     e.stopPropagation();
     setDeleting(true);
-    await fetch(`/api/transcriptions/${record.id}`, { method: "DELETE" });
-    onDelete(record.id);
+    try {
+      const res = await fetch(`/api/transcriptions/${record.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      onDelete(record.id);
+    } catch {
+      toast.error("Couldn't delete this transcript. Try again.");
+      setDeleting(false);
+    }
   };
 
   return (

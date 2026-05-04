@@ -1,5 +1,6 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import EmailGate from "./components/EmailGate";
 import RecorderPanel from "./components/RecorderPanel";
@@ -48,12 +49,16 @@ export default function Home() {
 
   const loadHistory = useCallback(async (email: string) => {
     setHistoryLoading(true);
-    const res = await fetch(`/api/transcriptions?email=${encodeURIComponent(email)}`);
-    if (res.ok) {
+    try {
+      const res = await fetch(`/api/transcriptions?email=${encodeURIComponent(email)}`);
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
       setHistory(await res.json());
       setHistoryLoaded(true);
+    } catch {
+      toast.error("Couldn't load your transcripts. Try refreshing.");
+    } finally {
+      setHistoryLoading(false);
     }
-    setHistoryLoading(false);
   }, []);
 
   useEffect(() => {

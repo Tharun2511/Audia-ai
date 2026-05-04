@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import { toast } from "sonner";
 
 interface Props {
   transcriptionId: string;
@@ -16,14 +17,20 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
   const save = async () => {
     const trimmed = value.trim();
     setSaving(true);
-    await fetch(`/api/transcriptions/${transcriptionId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: trimmed || null }),
-    });
-    onSaved(trimmed || null);
-    setSaving(false);
-    setEditing(false);
+    try {
+      const res = await fetch(`/api/transcriptions/${transcriptionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: trimmed || null }),
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      onSaved(trimmed || null);
+      setEditing(false);
+    } catch {
+      toast.error("Couldn't save the title.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const cancel = () => {
