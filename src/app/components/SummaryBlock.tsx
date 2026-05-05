@@ -1,81 +1,106 @@
 "use client";
 import { useState } from "react";
+import Box from "@mui/material/Box";
+import Button from "@mui/material/Button";
+import Card from "@mui/material/Card";
+import CardContent from "@mui/material/CardContent";
+import List from "@mui/material/List";
+import ListItem from "@mui/material/ListItem";
+import Stack from "@mui/material/Stack";
+import Typography from "@mui/material/Typography";
+import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import { toast } from "sonner";
 
 interface Props {
-  transcriptionId: string;
-  initialSummary: string | null;
-  onSaved: (summary: string | null) => void;
+    transcriptionId: string;
+    initialSummary: string | null;
+    onSaved: (summary: string | null) => void;
 }
 
 export default function SummaryBlock({ transcriptionId, initialSummary, onSaved }: Props) {
-  const [summary, setSummary] = useState(initialSummary);
-  const [generating, setGenerating] = useState(false);
+    const [summary, setSummary] = useState(initialSummary);
+    const [generating, setGenerating] = useState(false);
 
-  const generate = async () => {
-    setGenerating(true);
-    const res = await fetch(`/api/transcriptions/${transcriptionId}/summary`, { method: "POST" });
-    if (res.ok) {
-      const { summary: s } = await res.json();
-      setSummary(s);
-      onSaved(s);
-    }
-    setGenerating(false);
-  };
+    const generate = async () => {
+        setGenerating(true);
+        try {
+            const res = await fetch(`/api/transcriptions/${transcriptionId}/summary`, { method: "POST" });
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            const { summary: s } = await res.json();
+            setSummary(s);
+            onSaved(s);
+        } catch {
+            toast.error("Couldn't generate summary. Try again.");
+        } finally {
+            setGenerating(false);
+        }
+    };
 
-  const isShort = summary?.trim() === "Not enough conversation to summarize.";
-  const bullets =
-    summary && !isShort
-      ? summary
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0)
-          .map((l) => l.replace(/^([•\-*]|\d+[.)]) */, "").trim())
-          .filter((l) => l.length > 0)
-      : [];
+    const isShort = summary?.trim() === "Not enough conversation to summarize.";
+    const bullets =
+        summary && !isShort
+            ? summary
+                .split("\n")
+                .map((l) => l.trim())
+                .filter((l) => l.length > 0)
+                .map((l) => l.replace(/^([•\-*]|\d+[.)]) */, "").trim())
+                .filter((l) => l.length > 0)
+            : [];
 
-  return (
-    <div className="bg-white rounded-xl border border-[#e2e8f2] overflow-hidden shadow-sm">
-      {/* Gradient accent bar */}
-      <div className="h-[3px] bg-gradient-to-r from-[#5b21b6] via-[#6d28d9] to-[#4f46e5]" />
+    return (
+        <Card sx={{ overflow: "hidden" }}>
+            <Box sx={{ height: 3, background: "linear-gradient(to right, #5b21b6, #6d28d9, #4f46e5)" }} />
+            <CardContent sx={{ p: 2 }}>
+                <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", mb: 1.5 }}>
+                    <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+                        <AutoAwesomeIcon sx={{ fontSize: 14, color: "#6d28d9" }} />
+                        <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "#6d28d9", lineHeight: 1 }}>
+                            AI Summary
+                        </Typography>
+                    </Stack>
+                    {!summary && (
+                        <Button
+                            onClick={generate}
+                            disabled={generating}
+                            size="small"
+                            variant="outlined"
+                            sx={{ color: "text.secondary", borderColor: "divider", "&:hover": { borderColor: "#c4b5fd", color: "text.primary" } }}
+                        >
+                            {generating ? "Generating…" : "Generate"}
+                        </Button>
+                    )}
+                </Stack>
 
-      <div className="px-4 py-4">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] font-bold tracking-[0.2em] text-[#6d28d9] uppercase">
-              AI Summary
-            </span>
-          </div>
-          {!summary && (
-            <button
-              onClick={generate}
-              disabled={generating}
-              className="text-xs px-3 py-1 border border-[#e2e8f2] rounded-lg text-[#64748b] hover:text-[#1e1b4b] hover:border-[#c4b5fd] transition-colors disabled:opacity-50"
-            >
-              {generating ? "Generating…" : "Generate"}
-            </button>
-          )}
-        </div>
-
-        {generating && !summary && (
-          <p className="text-xs text-[#94a3b8] italic">Analyzing conversation…</p>
-        )}
-        {isShort && (
-          <p className="text-sm text-[#94a3b8] italic">Not enough content to summarize.</p>
-        )}
-        {bullets.length > 0 && (
-          <ul className="space-y-2">
-            {bullets.map((b, i) => (
-              <li key={i} className="flex gap-2.5 items-start">
-                <span className="text-[#6d28d9] text-xs mt-[3px] flex-shrink-0">▸</span>
-                <span className="text-sm text-[#475569] leading-relaxed">{b}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-        {!summary && !generating && (
-          <p className="text-xs text-[#94a3b8] italic">No summary yet — click Generate to create one.</p>
-        )}
-      </div>
-    </div>
-  );
+                {generating && !summary && (
+                    <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic" }}>
+                        Analyzing conversation…
+                    </Typography>
+                )}
+                {isShort && (
+                    <Typography variant="body2" sx={{ color: "text.disabled", fontStyle: "italic" }}>
+                        Not enough content to summarize.
+                    </Typography>
+                )}
+                {bullets.length > 0 && (
+                    <List dense disablePadding>
+                        {bullets.map((b, i) => (
+                            <ListItem key={i} disableGutters sx={{ alignItems: "flex-start", py: 0.75 }}>
+                                <Typography component="span" sx={{ color: "#6d28d9", fontSize: 12, mt: "3px", mr: 1.25, flexShrink: 0 }}>
+                                    ▸
+                                </Typography>
+                                <Typography variant="body2" sx={{ color: "#475569", lineHeight: 1.6 }}>
+                                    {b}
+                                </Typography>
+                            </ListItem>
+                        ))}
+                    </List>
+                )}
+                {!summary && !generating && (
+                    <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic" }}>
+                        No summary yet — click Generate to create one.
+                    </Typography>
+                )}
+            </CardContent>
+        </Card>
+    );
 }

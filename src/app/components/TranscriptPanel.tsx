@@ -1,226 +1,260 @@
 "use client";
 import { useState, useEffect } from "react";
 import { toast } from "sonner";
+import Box from "@mui/material/Box";
+import Button from "@mui/material/Button";
+import Card from "@mui/material/Card";
+import Chip from "@mui/material/Chip";
+import CircularProgress from "@mui/material/CircularProgress";
+import Stack from "@mui/material/Stack";
+import TextField from "@mui/material/TextField";
+import Typography from "@mui/material/Typography";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import CheckIcon from "@mui/icons-material/Check";
+import EditIcon from "@mui/icons-material/Edit";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { buildColorMap, formatDuration } from "./utils";
 import TitleInput from "./TitleInput";
 
 interface Props {
-  segments: TranscriptSegment[];
-  transcriptionId?: string;
-  currentTitle?: string | null;
-  onSegmentsUpdate?: (segments: TranscriptSegment[]) => void;
-  onTitleSave?: (title: string | null) => void;
-  isProcessing?: boolean;
+    segments: TranscriptSegment[];
+    transcriptionId?: string;
+    currentTitle?: string | null;
+    onSegmentsUpdate?: (segments: TranscriptSegment[]) => void;
+    onTitleSave?: (title: string | null) => void;
+    isProcessing?: boolean;
 }
 
 export default function TranscriptPanel({
-  segments,
-  transcriptionId,
-  currentTitle,
-  onSegmentsUpdate,
-  onTitleSave,
-  isProcessing,
+    segments,
+    transcriptionId,
+    currentTitle,
+    onSegmentsUpdate,
+    onTitleSave,
+    isProcessing,
 }: Props) {
-  const [copied, setCopied] = useState(false);
-  const [showRenamer, setShowRenamer] = useState(false);
-  const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
-  const [saving, setSaving] = useState(false);
+    const [copied, setCopied] = useState(false);
+    const [showRenamer, setShowRenamer] = useState(false);
+    const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
+    const [saving, setSaving] = useState(false);
 
-  const uniqueSpeakers = [...new Set(segments.map((s) => s.speaker))];
-  const colorMap = buildColorMap(uniqueSpeakers);
+    const uniqueSpeakers = [...new Set(segments.map((s) => s.speaker))];
+    const colorMap = buildColorMap(uniqueSpeakers);
 
-  useEffect(() => {
-    setSpeakerNames(Object.fromEntries(uniqueSpeakers.map((s) => [s, s])));
-    setShowRenamer(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segments]);
+    useEffect(() => {
+        setSpeakerNames(Object.fromEntries(uniqueSpeakers.map((s) => [s, s])));
+        setShowRenamer(false);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [segments]);
 
-  const handleSaveRenames = async () => {
-    if (!transcriptionId || !onSegmentsUpdate) return;
-    const speakerMap = Object.fromEntries(
-      Object.entries(speakerNames).filter(([orig, renamed]) => orig !== renamed)
+    const handleSaveRenames = async () => {
+        if (!transcriptionId || !onSegmentsUpdate) return;
+        const speakerMap = Object.fromEntries(
+            Object.entries(speakerNames).filter(([orig, renamed]) => orig !== renamed)
+        );
+        if (Object.keys(speakerMap).length === 0) { setShowRenamer(false); return; }
+        setSaving(true);
+        try {
+            const res = await fetch(`/api/transcriptions/${transcriptionId}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ speakerMap }),
+            });
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            const { segments: updated } = await res.json();
+            onSegmentsUpdate(updated);
+            setShowRenamer(false);
+        } catch {
+            toast.error("Couldn't rename speakers. Try again.");
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleCopy = async () => {
+        const text = segments
+            .map((s) => `${s.speaker} (${formatDuration(s.start)}): ${s.text}`)
+            .join("\n\n");
+        try {
+            await navigator.clipboard.writeText(text);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+        } catch {
+            toast.error("Couldn't copy to clipboard.");
+        }
+    };
+
+    return (
+        <Card sx={{ overflow: "hidden" }}>
+            {/* Header */}
+            <Stack
+                direction="row"
+                spacing={1}
+                sx={{ alignItems: "center", justifyContent: "space-between", px: 2, py: 1.75, borderBottom: 1, borderColor: "divider" }}
+            >
+                <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", minWidth: 0, flex: 1 }}>
+                    <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "text.disabled", lineHeight: 1, flexShrink: 0 }}>
+                        Transcript
+                    </Typography>
+                    {transcriptionId && onTitleSave && (
+                        <TitleInput
+                            transcriptionId={transcriptionId}
+                            initialTitle={currentTitle ?? null}
+                            fallback="Untitled — click to name"
+                            onSaved={onTitleSave}
+                        />
+                    )}
+                </Stack>
+                {!isProcessing && segments.length > 0 && (
+                    <Button
+                        onClick={handleCopy}
+                        variant="outlined"
+                        size="small"
+                        startIcon={copied ? <CheckIcon /> : <ContentCopyIcon />}
+                        sx={{ color: copied ? "primary.main" : "text.secondary", flexShrink: 0 }}
+                    >
+                        {copied ? "Copied" : "Copy"}
+                    </Button>
+                )}
+            </Stack>
+
+            <Box sx={{ p: 2 }}>
+                {isProcessing ? (
+                    <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", justifyContent: "center", py: 3 }}>
+                        <Box sx={{ display: "flex", alignItems: "flex-end", gap: "3px", height: 24 }}>
+                            {[0, 0.1, 0.2, 0.3, 0.4].map((delay, i) => (
+                                <Box
+                                    key={i}
+                                    sx={{
+                                        width: 6,
+                                        height: "100%",
+                                        borderRadius: 0.5,
+                                        background: "linear-gradient(to top, #5b21b6, #a78bfa)",
+                                        animation: `bar-wave 0.8s ease-in-out ${delay}s infinite`,
+                                    }}
+                                />
+                            ))}
+                        </Box>
+                        <Typography variant="body2" color="text.secondary">
+                            Processing audio…
+                        </Typography>
+                    </Stack>
+                ) : segments.length === 0 ? (
+                    <Typography variant="body2" sx={{ color: "text.disabled", fontStyle: "italic", textAlign: "center", py: 3 }}>
+                        No speech detected.
+                    </Typography>
+                ) : (
+                    <>
+                        {/* Speaker legend + rename trigger */}
+                        <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", mb: 2 }}>
+                            <Stack direction="row" spacing={1.5} sx={{ flexWrap: "wrap" }}>
+                                {uniqueSpeakers.map((sp) => (
+                                    <Stack key={sp} direction="row" spacing={0.75} sx={{ alignItems: "center" }}>
+                                        <Box sx={{ width: 10, height: 10, borderRadius: "50%", bgcolor: colorMap[sp], flexShrink: 0 }} />
+                                        <Typography variant="caption" sx={{ color: "text.secondary", fontWeight: 500 }}>
+                                            {sp}
+                                        </Typography>
+                                    </Stack>
+                                ))}
+                            </Stack>
+                            {transcriptionId && onSegmentsUpdate && (
+                                <Button
+                                    onClick={() => setShowRenamer((v) => !v)}
+                                    variant={showRenamer ? "contained" : "outlined"}
+                                    size="small"
+                                    startIcon={<EditIcon />}
+                                    sx={{ flexShrink: 0 }}
+                                >
+                                    Rename
+                                </Button>
+                            )}
+                        </Stack>
+
+                        {/* Renamer */}
+                        {showRenamer && (
+                            <Box sx={{ bgcolor: "#f5f3ff", border: 1, borderColor: "#ddd6fe", borderRadius: 3, p: 2, mb: 2 }}>
+                                <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "#6d28d9", display: "block", mb: 1.5 }}>
+                                    Rename Speakers
+                                </Typography>
+                                <Stack spacing={1.5}>
+                                    {uniqueSpeakers.map((sp) => (
+                                        <Stack key={sp} direction="row" spacing={1.5} sx={{ alignItems: "center" }}>
+                                            <Stack direction="row" spacing={1} sx={{ alignItems: "center", flexShrink: 0, minWidth: 80 }}>
+                                                <Box sx={{ width: 10, height: 10, borderRadius: "50%", bgcolor: colorMap[sp] }} />
+                                                <Typography variant="caption" sx={{ fontWeight: 500, color: "#475569" }}>
+                                                    {sp}
+                                                </Typography>
+                                            </Stack>
+                                            <Typography sx={{ color: "text.disabled", fontSize: 12 }}>→</Typography>
+                                            <TextField
+                                                value={speakerNames[sp] ?? sp}
+                                                onChange={(e) => setSpeakerNames((prev) => ({ ...prev, [sp]: e.target.value }))}
+                                                size="small"
+                                                sx={{ flex: 1, maxWidth: 200 }}
+                                            />
+                                        </Stack>
+                                    ))}
+                                    <Stack direction="row" spacing={1} sx={{ pt: 0.5 }}>
+                                        <Button
+                                            onClick={handleSaveRenames}
+                                            disabled={saving}
+                                            variant="contained"
+                                            size="small"
+                                            startIcon={saving ? <CircularProgress size={12} sx={{ color: "inherit" }} /> : null}
+                                        >
+                                            {saving ? "Saving…" : "Save"}
+                                        </Button>
+                                        <Button onClick={() => setShowRenamer(false)} size="small" sx={{ color: "text.secondary" }}>
+                                            Cancel
+                                        </Button>
+                                    </Stack>
+                                </Stack>
+                            </Box>
+                        )}
+
+                        {/* Conversation bubbles */}
+                        <Stack spacing={1.5}>
+                            {segments.map((seg, i) => (
+                                <Card
+                                    key={i}
+                                    sx={{
+                                        borderRadius: 1.5,
+                                        borderLeftStyle: "solid",
+                                        borderLeftWidth: 3,
+                                        borderLeftColor: colorMap[seg.speaker] ?? "text.disabled",
+                                    }}
+                                >
+                                    <Box sx={{ px: 2, py: 1.5 }}>
+                                        <Stack direction="row" spacing={1.25} sx={{ alignItems: "center", mb: 0.75 }}>
+                                            <Typography
+                                                variant="caption"
+                                                sx={{ fontWeight: 700, color: colorMap[seg.speaker] ?? "text.secondary" }}
+                                            >
+                                                {seg.speaker}
+                                            </Typography>
+                                            <Chip
+                                                label={formatDuration(seg.start)}
+                                                size="small"
+                                                sx={{
+                                                    height: 18,
+                                                    fontSize: 10,
+                                                    fontFamily: "var(--font-geist-mono), monospace",
+                                                    color: "text.disabled",
+                                                    bgcolor: "background.default",
+                                                    "& .MuiChip-label": { px: 0.75 },
+                                                }}
+                                            />
+                                        </Stack>
+                                        <Typography variant="body2" sx={{ color: "#334155", lineHeight: 1.65 }}>
+                                            {seg.text}
+                                        </Typography>
+                                    </Box>
+                                </Card>
+                            ))}
+                        </Stack>
+                    </>
+                )}
+            </Box>
+        </Card>
     );
-    if (Object.keys(speakerMap).length === 0) { setShowRenamer(false); return; }
-    setSaving(true);
-    try {
-      const res = await fetch(`/api/transcriptions/${transcriptionId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ speakerMap }),
-      });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
-      const { segments: updated } = await res.json();
-      onSegmentsUpdate(updated);
-      setShowRenamer(false);
-    } catch {
-      toast.error("Couldn't rename speakers. Try again.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleCopy = async () => {
-    const text = segments
-      .map((s) => `${s.speaker} (${formatDuration(s.start)}): ${s.text}`)
-      .join("\n\n");
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {}
-  };
-
-  return (
-    <div className="bg-white rounded-xl border border-[#e2e8f2] overflow-hidden shadow-sm">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3.5 border-b border-[#e2e8f2]">
-        <div className="flex items-center gap-3 min-w-0">
-          <span className="text-[10px] font-bold tracking-[0.2em] text-[#94a3b8] uppercase flex-shrink-0">
-            Transcript
-          </span>
-          {transcriptionId && onTitleSave && (
-            <TitleInput
-              transcriptionId={transcriptionId}
-              initialTitle={currentTitle ?? null}
-              fallback="Untitled — click to name"
-              onSaved={onTitleSave}
-            />
-          )}
-        </div>
-        {!isProcessing && segments.length > 0 && (
-          <button
-            onClick={handleCopy}
-            className="text-xs px-3 py-1.5 border border-[#e2e8f2] rounded-lg text-[#64748b] hover:text-[#1e1b4b] hover:border-[#c4b5fd] transition-colors flex-shrink-0 ml-2"
-          >
-            {copied ? "✓ Copied" : "Copy"}
-          </button>
-        )}
-      </div>
-
-      <div className="p-4">
-        {isProcessing ? (
-          <div className="flex items-center gap-3 py-6 justify-center">
-            <div className="flex items-end gap-[3px] h-6">
-              {[0, 0.1, 0.2, 0.3, 0.4].map((delay, i) => (
-                <div
-                  key={i}
-                  className="w-1.5 rounded-sm"
-                  style={{
-                    height: "100%",
-                    background: "linear-gradient(to top, #5b21b6, #a78bfa)",
-                    animation: `bar-wave 0.8s ease-in-out ${delay}s infinite`,
-                  }}
-                />
-              ))}
-            </div>
-            <span className="text-sm text-[#64748b]">Processing audio…</span>
-          </div>
-        ) : segments.length === 0 ? (
-          <p className="text-[#94a3b8] italic text-sm py-6 text-center">No speech detected.</p>
-        ) : (
-          <>
-            {/* Speaker legend + rename */}
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex gap-3 flex-wrap">
-                {uniqueSpeakers.map((sp) => (
-                  <div key={sp} className="flex items-center gap-1.5">
-                    <span
-                      className="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                      style={{ background: colorMap[sp] }}
-                    />
-                    <span className="text-xs text-[#64748b] font-medium">{sp}</span>
-                  </div>
-                ))}
-              </div>
-              {transcriptionId && onSegmentsUpdate && (
-                <button
-                  onClick={() => setShowRenamer((v) => !v)}
-                  className={`text-xs px-3 py-1 rounded-lg border transition-colors flex-shrink-0 ml-2 ${
-                    showRenamer
-                      ? "border-[#6d28d9] text-[#6d28d9] bg-[#f5f3ff]"
-                      : "border-[#e2e8f2] text-[#64748b] hover:border-[#c4b5fd] hover:text-[#6d28d9]"
-                  }`}
-                >
-                  Rename Users
-                </button>
-              )}
-            </div>
-
-            {/* Renamer panel */}
-            {showRenamer && (
-              <div className="bg-[#f5f3ff] border border-[#ddd6fe] rounded-xl p-4 mb-4 space-y-3">
-                <p className="text-[10px] font-bold tracking-[0.2em] text-[#6d28d9] uppercase">
-                  Rename Speakers
-                </p>
-                {uniqueSpeakers.map((sp) => (
-                  <div key={sp} className="flex items-center gap-3">
-                    <div className="flex items-center gap-2 flex-shrink-0 min-w-[80px]">
-                      <span
-                        className="w-2.5 h-2.5 rounded-full"
-                        style={{ background: colorMap[sp] }}
-                      />
-                      <span className="text-xs font-medium text-[#475569]">{sp}</span>
-                    </div>
-                    <span className="text-[#94a3b8] text-xs">→</span>
-                    <input
-                      value={speakerNames[sp] ?? sp}
-                      onChange={(e) =>
-                        setSpeakerNames((prev) => ({ ...prev, [sp]: e.target.value }))
-                      }
-                      className="border border-[#ddd6fe] focus:border-[#6d28d9] focus:ring-1 focus:ring-[#6d28d9]/10 text-[#1e1b4b] text-sm rounded-lg px-3 py-1.5 outline-none flex-1 max-w-[180px] bg-white transition-all"
-                    />
-                  </div>
-                ))}
-                <div className="flex gap-2 pt-1">
-                  <button
-                    onClick={handleSaveRenames}
-                    disabled={saving}
-                    className="text-xs px-4 py-1.5 bg-[#5b21b6] hover:bg-[#4c1d95] text-white rounded-lg transition-colors disabled:opacity-50"
-                  >
-                    {saving ? "Saving…" : "Save"}
-                  </button>
-                  <button
-                    onClick={() => setShowRenamer(false)}
-                    className="text-xs px-3 py-1.5 text-[#64748b] hover:text-[#1e1b4b] transition-colors"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Conversation bubbles — left-bordered by speaker color */}
-            <div className="space-y-3">
-              {segments.map((seg, i) => (
-                <div
-                  key={i}
-                  className="rounded-lg border border-[#e2e8f2] overflow-hidden"
-                  style={{
-                    borderLeftColor: colorMap[seg.speaker] ?? "#94a3b8",
-                    borderLeftWidth: "3px",
-                  }}
-                >
-                  <div className="px-4 py-3">
-                    <div className="flex items-center gap-2.5 mb-1.5">
-                      <span
-                        className="text-xs font-bold"
-                        style={{ color: colorMap[seg.speaker] ?? "#64748b" }}
-                      >
-                        {seg.speaker}
-                      </span>
-                      <span className="text-[10px] text-[#94a3b8] font-mono bg-[#f1f4f9] px-1.5 py-0.5 rounded">
-                        {formatDuration(seg.start)}
-                      </span>
-                    </div>
-                    <p className="text-sm text-[#334155] leading-relaxed">{seg.text}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
 }

@@ -2,6 +2,7 @@ import { getDatabase } from "@/db/data-source";
 import { Transcription } from "@/entity/Transcription";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { deepgram, summarizeTranscript } from "@/lib/ai";
+import { getCurrentUser } from "@/lib/dal";
 
 type DeepgramWord = {
     word: string;
@@ -54,9 +55,11 @@ function parseSegments(words: DeepgramWord[]): TranscriptSegment[] {
 }
 
 export async function POST(req: Request) {
+    const user = await getCurrentUser();
+    if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
     const formData = await req.formData();
     const audioFile = formData.get("audio") as File | null;
-    const userEmail = (formData.get("email") as string | null) ?? "";
 
     if (!audioFile) {
         return Response.json({ error: "No audio file provided" }, { status: 400 });
@@ -80,7 +83,7 @@ export async function POST(req: Request) {
 
     const db = await getDatabase();
     const repo = db.getRepository(Transcription);
-    const record = repo.create({ duration, segments, userEmail, summary });
+    const record = repo.create({ duration, segments, userEmail: user.email, summary });
     await repo.save(record);
 
     return Response.json({ id: record.id, segments, duration, summary });

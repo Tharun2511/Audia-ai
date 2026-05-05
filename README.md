@@ -89,8 +89,8 @@ src/
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/Tharun2511/Swades-AI-Hackathon.git
-cd Swades-AI-Hackathon
+git clone https://github.com/Tharun2511/Audia-ai.git
+cd Audia-ai
 npm install
 ```
 

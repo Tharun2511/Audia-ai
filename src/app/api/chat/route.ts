@@ -1,8 +1,12 @@
 import { getDatabase } from "@/db/data-source";
 import { Chat } from "@/entity/Chat";
 import { groq } from "@/lib/ai";
+import { getCurrentUser } from "@/lib/dal";
 
 export async function POST(req: Request) {
+    const user = await getCurrentUser();
+    if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
     const { prompt } = await req.json();
 
     const db = await getDatabase();

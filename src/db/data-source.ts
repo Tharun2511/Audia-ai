@@ -2,6 +2,7 @@ import "reflect-metadata";
 import { DataSource } from "typeorm";
 import { Chat } from "../entity/Chat";
 import { Transcription } from "../entity/Transcription";
+import { User } from "../entity/User";
 
 export const AppDataSource = new DataSource({
     type: "postgres",
@@ -11,7 +12,7 @@ export const AppDataSource = new DataSource({
     },
     synchronize: true,
     logging: false,
-    entities: [Chat, Transcription],
+    entities: [Chat, Transcription, User],
 });
 
 // This helper prevents Next.js from creating too many connections during development
