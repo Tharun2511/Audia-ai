@@ -24,8 +24,17 @@ export default async function SignupPage() {
                 py: 5,
             }}
         >
-            <Card sx={{ width: "100%", maxWidth: 440, overflow: "hidden", boxShadow: "0 20px 50px -20px rgba(91,33,182,0.18)" }}>
-                <Box sx={{ height: 4, background: "linear-gradient(to right, #5b21b6, #4f46e5)" }} />
+            <Card
+                sx={(theme) => ({
+                    width: "100%",
+                    maxWidth: 440,
+                    overflow: "hidden",
+                    boxShadow: theme.palette.mode === "dark"
+                        ? "0 20px 50px -20px rgba(0,0,0,0.6)"
+                        : "0 20px 50px -20px rgba(91,33,182,0.18)",
+                })}
+            >
+                <Box sx={{ height: 4, background: "linear-gradient(to right, var(--mui-palette-primary-main), var(--mui-palette-secondary-main))" }} />
                 <CardContent sx={{ p: 4 }}>
                     <Stack direction="row" spacing={1.25} sx={{ alignItems: "center", mb: 3 }}>
                         <BrandLogo size={32} />

@@ -115,7 +115,7 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
 
     return (
         <Card sx={{ overflow: "hidden" }}>
-            <Box sx={{ height: 3, background: "linear-gradient(to right, #0369a1, #0ea5e9, #38bdf8)" }} />
+            <Box sx={{ height: 3, background: "linear-gradient(to right, var(--mui-palette-info-dark), var(--mui-palette-info-main), var(--mui-palette-info-light))" }} />
 
             {/* Header */}
             <Stack
@@ -128,7 +128,7 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                     px: 2,
                     py: 1.75,
                     cursor: "pointer",
-                    "&:hover": { bgcolor: "#f8fafc" },
+                    "&:hover": { bgcolor: "action.hover" },
                     transition: "background 150ms",
                 }}
             >
@@ -138,14 +138,13 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                             width: 22,
                             height: 22,
                             borderRadius: "50%",
-                            bgcolor: "#f0f9ff",
-                            border: 1,
-                            borderColor: "#bae6fd",
+                            bgcolor: "info.main",
+                            color: "info.contrastText",
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
                             flexShrink: 0,
-                            color: "#0369a1",
+                            opacity: 0.9,
                         }}
                     >
                         <ChatBubbleOutlineIcon sx={{ fontSize: 12 }} />
@@ -174,10 +173,8 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                                 height: 18,
                                 fontSize: 10,
                                 fontWeight: 600,
-                                bgcolor: "#f0f9ff",
-                                color: "#0369a1",
-                                border: 1,
-                                borderColor: "#bae6fd",
+                                bgcolor: "info.main",
+                                color: "info.contrastText",
                                 "& .MuiChip-label": { px: 0.75 },
                             }}
                         />
@@ -209,9 +206,9 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                                         borderRadius: 999,
                                         border: 1,
                                         borderColor: "divider",
-                                        color: "#475569",
+                                        color: "text.secondary",
                                         bgcolor: "transparent",
-                                        "&:hover": { borderColor: "#7dd3fc", color: "#0369a1", bgcolor: "#f0f9ff" },
+                                        "&:hover": { borderColor: "info.light", color: "info.main", bgcolor: "action.hover" },
                                     }}
                                 />
                             ))}
@@ -234,8 +231,8 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                                             fontSize: 14,
                                             lineHeight: 1.6,
                                             ...(msg.role === "user"
-                                                ? { bgcolor: "#0369a1", color: "#fff", borderTopRightRadius: 4 }
-                                                : { bgcolor: "#f8fafc", border: 1, borderColor: "divider", color: "#334155", borderTopLeftRadius: 4 }),
+                                                ? { bgcolor: "info.main", color: "info.contrastText", borderTopRightRadius: 4 }
+                                                : { bgcolor: "action.hover", border: 1, borderColor: "divider", color: "text.primary", borderTopLeftRadius: 4 }),
                                         }}
                                     >
                                         {msg.role === "assistant" && msg.streaming && msg.content === "" ? (
@@ -247,7 +244,7 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                                                             width: 6,
                                                             height: 6,
                                                             borderRadius: "50%",
-                                                            bgcolor: "#cbd5e1",
+                                                            bgcolor: "text.disabled",
                                                             animation: `rec-blink 1.2s ease-in-out ${delay}s infinite`,
                                                         }}
                                                     />
@@ -308,10 +305,10 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                                                 size="small"
                                                 edge="end"
                                                 sx={{
-                                                    bgcolor: "#0369a1",
-                                                    color: "#fff",
-                                                    "&:hover": { bgcolor: "#0284c7" },
-                                                    "&.Mui-disabled": { bgcolor: "#e2e8f2", color: "#94a3b8" },
+                                                    bgcolor: "info.main",
+                                                    color: "info.contrastText",
+                                                    "&:hover": { bgcolor: "info.dark" },
+                                                    "&.Mui-disabled": { bgcolor: "action.disabledBackground", color: "action.disabled" },
                                                 }}
                                                 aria-label="Send"
                                             >

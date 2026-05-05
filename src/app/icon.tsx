@@ -1,4 +1,4 @@
-import { brandLogoSvgString, BRAND } from "@/app/components/BrandLogo";
+import { brandLogoSvgString, BRAND } from "@/app/components/brand";
 
 export const contentType = "image/svg+xml";
 export const size = { width: BRAND.canvas, height: BRAND.canvas };

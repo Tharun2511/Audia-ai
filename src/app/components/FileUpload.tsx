@@ -76,12 +76,12 @@ export default function FileUpload({ onUpload, disabled }: Props) {
                     ...(disabled
                         ? { opacity: 0.4, cursor: "not-allowed", borderColor: "divider" }
                         : dragging
-                            ? { borderColor: "#6d28d9", bgcolor: "#f5f3ff", cursor: "copy" }
+                            ? { borderColor: "primary.main", bgcolor: "action.hover", cursor: "copy" }
                             : {
                                 borderColor: "divider",
                                 cursor: "pointer",
-                                "&:hover": { borderColor: "#c4b5fd", bgcolor: "#faf9ff" },
-                                "&:focus-visible": { borderColor: "#6d28d9" },
+                                "&:hover": { borderColor: "primary.light", bgcolor: "action.hover" },
+                                "&:focus-visible": { borderColor: "primary.main" },
                             }),
                 }}
             >
@@ -108,7 +108,7 @@ export default function FileUpload({ onUpload, disabled }: Props) {
                                         width: 4,
                                         height: "100%",
                                         borderRadius: 0.5,
-                                        bgcolor: "#6d28d9",
+                                        bgcolor: "primary.main",
                                         animation: `bar-wave 0.7s ease-in-out ${delay}s infinite`,
                                     }}
                                 />
@@ -118,7 +118,7 @@ export default function FileUpload({ onUpload, disabled }: Props) {
                             variant="caption"
                             sx={{
                                 fontWeight: 500,
-                                color: "#6d28d9",
+                                color: "primary.main",
                                 maxWidth: "100%",
                                 px: 1,
                                 overflow: "hidden",
@@ -134,8 +134,8 @@ export default function FileUpload({ onUpload, disabled }: Props) {
                     </Stack>
                 ) : dragging ? (
                     <Stack spacing={0.5} sx={{ alignItems: "center" }}>
-                        <LibraryMusicIcon sx={{ fontSize: 28, color: "#6d28d9" }} />
-                        <Typography variant="caption" sx={{ fontWeight: 600, color: "#6d28d9" }}>
+                        <LibraryMusicIcon sx={{ fontSize: 28, color: "primary.main" }} />
+                        <Typography variant="caption" sx={{ fontWeight: 600, color: "primary.main" }}>
                             Drop to upload
                         </Typography>
                     </Stack>
@@ -144,7 +144,7 @@ export default function FileUpload({ onUpload, disabled }: Props) {
                         <UploadFileIcon sx={{ fontSize: 24, color: "text.disabled" }} />
                         <Typography variant="caption" sx={{ fontWeight: 500, color: "text.secondary" }}>
                             Drop audio file or{" "}
-                            <Box component="span" sx={{ color: "#6d28d9" }}>
+                            <Box component="span" sx={{ color: "primary.main" }}>
                                 browse
                             </Box>
                         </Typography>

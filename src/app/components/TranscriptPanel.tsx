@@ -129,7 +129,7 @@ export default function TranscriptPanel({
                                         width: 6,
                                         height: "100%",
                                         borderRadius: 0.5,
-                                        background: "linear-gradient(to top, #5b21b6, #a78bfa)",
+                                        background: "linear-gradient(to top, var(--mui-palette-primary-main), var(--mui-palette-primary-light))",
                                         animation: `bar-wave 0.8s ease-in-out ${delay}s infinite`,
                                     }}
                                 />
@@ -172,8 +172,8 @@ export default function TranscriptPanel({
 
                         {/* Renamer */}
                         {showRenamer && (
-                            <Box sx={{ bgcolor: "#f5f3ff", border: 1, borderColor: "#ddd6fe", borderRadius: 3, p: 2, mb: 2 }}>
-                                <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "#6d28d9", display: "block", mb: 1.5 }}>
+                            <Box sx={{ bgcolor: "action.hover", border: 1, borderColor: "divider", borderRadius: 3, p: 2, mb: 2 }}>
+                                <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "primary.main", display: "block", mb: 1.5 }}>
                                     Rename Speakers
                                 </Typography>
                                 <Stack spacing={1.5}>
@@ -181,7 +181,7 @@ export default function TranscriptPanel({
                                         <Stack key={sp} direction="row" spacing={1.5} sx={{ alignItems: "center" }}>
                                             <Stack direction="row" spacing={1} sx={{ alignItems: "center", flexShrink: 0, minWidth: 80 }}>
                                                 <Box sx={{ width: 10, height: 10, borderRadius: "50%", bgcolor: colorMap[sp] }} />
-                                                <Typography variant="caption" sx={{ fontWeight: 500, color: "#475569" }}>
+                                                <Typography variant="caption" sx={{ fontWeight: 500, color: "text.secondary" }}>
                                                     {sp}
                                                 </Typography>
                                             </Stack>
@@ -240,12 +240,12 @@ export default function TranscriptPanel({
                                                     fontSize: 10,
                                                     fontFamily: "var(--font-geist-mono), monospace",
                                                     color: "text.disabled",
-                                                    bgcolor: "background.default",
+                                                    bgcolor: "action.hover",
                                                     "& .MuiChip-label": { px: 0.75 },
                                                 }}
                                             />
                                         </Stack>
-                                        <Typography variant="body2" sx={{ color: "#334155", lineHeight: 1.65 }}>
+                                        <Typography variant="body2" sx={{ color: "text.primary", lineHeight: 1.65 }}>
                                             {seg.text}
                                         </Typography>
                                     </Box>

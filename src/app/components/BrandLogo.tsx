@@ -1,23 +1,21 @@
-/**
- * Audia brand mark — single source of truth.
- *
- * Used by:
- *   - <BrandLogo />          (React component, rendered inside pages)
- *   - app/icon.tsx           (favicon route, serves the same SVG to browsers)
- *
- * Change values here → both surfaces update together.
- */
+"use client";
+import { useId } from "react";
+import { BRAND } from "./brand";
 
-export const BRAND = {
-    primary: "#5b21b6",
-    secondary: "#4f46e5",
-    inner: "#ffffff",
-    /** All values below are on a 32-unit canvas. */
-    canvas: 32,
-    /** Half the canvas → perfect circle. Drop to ~8 for a rounded square. */
-    cornerRadius: 16,
-    innerCircleRadius: 5,
-} as const;
+/**
+ * Audia brand mark — React component.
+ *
+ * Two reasons this is a client component:
+ *   1. useId() guarantees a unique gradient ID per instance, so multiple
+ *      BrandLogos on the same page (e.g. desktop sidebar + mobile app bar)
+ *      don't share an ID and break each other's `url(#...)` references.
+ *   2. The dark-mode white border is rendered as a normal SVG element with a
+ *      class. globals.css shows it only when an ancestor has the
+ *      `.mui-color-scheme-dark` class. No JS color-scheme guard, no hydration
+ *      flash, no theme-prop drilling.
+ *
+ * Constants and the favicon string generator live in ./brand.ts (server-safe).
+ */
 
 interface BrandLogoProps {
     /** Rendered pixel size. Internal proportions are preserved via viewBox. */
@@ -27,6 +25,10 @@ interface BrandLogoProps {
 }
 
 export function BrandLogo({ size = 32, title = "Audia" }: BrandLogoProps) {
+    // useId() returns ":r1:" — sanitize for the SVG id/url(#...) reference.
+    const reactId = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+    const gradId = `audia-grad-${reactId}`;
+
     return (
         <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -36,9 +38,10 @@ export function BrandLogo({ size = 32, title = "Audia" }: BrandLogoProps) {
             role={title ? "img" : "presentation"}
             aria-label={title || undefined}
             aria-hidden={title ? undefined : true}
+            className="brand-logo-svg"
         >
             <defs>
-                <linearGradient id="audia-brand-grad" x1="0" y1="0" x2="1" y2="1">
+                <linearGradient id={gradId} x1="0" y1="0" x2="1" y2="1">
                     <stop offset="0%" stopColor={BRAND.primary} />
                     <stop offset="100%" stopColor={BRAND.secondary} />
                 </linearGradient>
@@ -47,7 +50,17 @@ export function BrandLogo({ size = 32, title = "Audia" }: BrandLogoProps) {
                 width={BRAND.canvas}
                 height={BRAND.canvas}
                 rx={BRAND.cornerRadius}
-                fill="url(#audia-brand-grad)"
+                fill={`url(#${gradId})`}
+            />
+            {/* Dark-mode-only white border ring. Hidden by default in CSS. */}
+            <circle
+                className="brand-logo-dark-ring"
+                cx={BRAND.canvas / 2}
+                cy={BRAND.canvas / 2}
+                r={BRAND.canvas / 2 - 1}
+                fill="none"
+                stroke="#ffffff"
+                strokeWidth={1.5}
             />
             <circle
                 cx={BRAND.canvas / 2}
@@ -59,19 +72,5 @@ export function BrandLogo({ size = 32, title = "Audia" }: BrandLogoProps) {
     );
 }
 
-/**
- * Returns the brand mark as an SVG string. Used by the favicon route handler,
- * which can't render React. Mirrors <BrandLogo /> exactly.
- */
-export function brandLogoSvgString(): string {
-    return [
-        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${BRAND.canvas} ${BRAND.canvas}">`,
-        `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">`,
-        `<stop offset="0%" stop-color="${BRAND.primary}"/>`,
-        `<stop offset="100%" stop-color="${BRAND.secondary}"/>`,
-        `</linearGradient></defs>`,
-        `<rect width="${BRAND.canvas}" height="${BRAND.canvas}" rx="${BRAND.cornerRadius}" fill="url(#g)"/>`,
-        `<circle cx="${BRAND.canvas / 2}" cy="${BRAND.canvas / 2}" r="${BRAND.innerCircleRadius}" fill="${BRAND.inner}"/>`,
-        `</svg>`,
-    ].join("");
-}
+// Re-export so existing imports `import { BrandLogo, brandLogoSvgString } from "./BrandLogo"` still work.
+export { BRAND, brandLogoSvgString } from "./brand";

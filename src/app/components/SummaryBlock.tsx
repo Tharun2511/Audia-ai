@@ -49,12 +49,12 @@ export default function SummaryBlock({ transcriptionId, initialSummary, onSaved 
 
     return (
         <Card sx={{ overflow: "hidden" }}>
-            <Box sx={{ height: 3, background: "linear-gradient(to right, #5b21b6, #6d28d9, #4f46e5)" }} />
+            <Box sx={{ height: 3, background: "linear-gradient(to right, var(--mui-palette-primary-dark), var(--mui-palette-primary-main), var(--mui-palette-secondary-main))" }} />
             <CardContent sx={{ p: 2 }}>
                 <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", mb: 1.5 }}>
                     <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
-                        <AutoAwesomeIcon sx={{ fontSize: 14, color: "#6d28d9" }} />
-                        <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "#6d28d9", lineHeight: 1 }}>
+                        <AutoAwesomeIcon sx={{ fontSize: 14, color: "primary.main" }} />
+                        <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "primary.main", lineHeight: 1 }}>
                             AI Summary
                         </Typography>
                     </Stack>
@@ -64,7 +64,6 @@ export default function SummaryBlock({ transcriptionId, initialSummary, onSaved 
                             disabled={generating}
                             size="small"
                             variant="outlined"
-                            sx={{ color: "text.secondary", borderColor: "divider", "&:hover": { borderColor: "#c4b5fd", color: "text.primary" } }}
                         >
                             {generating ? "Generating…" : "Generate"}
                         </Button>
@@ -85,10 +84,10 @@ export default function SummaryBlock({ transcriptionId, initialSummary, onSaved 
                     <List dense disablePadding>
                         {bullets.map((b, i) => (
                             <ListItem key={i} disableGutters sx={{ alignItems: "flex-start", py: 0.75 }}>
-                                <Typography component="span" sx={{ color: "#6d28d9", fontSize: 12, mt: "3px", mr: 1.25, flexShrink: 0 }}>
+                                <Typography component="span" sx={{ color: "primary.main", fontSize: 12, mt: "3px", mr: 1.25, flexShrink: 0 }}>
                                     ▸
                                 </Typography>
-                                <Typography variant="body2" sx={{ color: "#475569", lineHeight: 1.6 }}>
+                                <Typography variant="body2" sx={{ color: "text.primary", lineHeight: 1.6 }}>
                                     {b}
                                 </Typography>
                             </ListItem>

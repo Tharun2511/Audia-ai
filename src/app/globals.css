@@ -30,21 +30,32 @@
   color-scheme: light;
 }
 
+.mui-color-scheme-dark {
+  color-scheme: dark;
+}
+
 *, *::before, *::after {
   box-sizing: border-box;
 }
 
 body {
-  background-color: #f1f4f9;
-  color: #1e1b4b;
   -webkit-font-smoothing: antialiased;
 }
 
-::-webkit-scrollbar { width: 5px; }
-::-webkit-scrollbar-track { background: #f1f4f9; }
+/* Scrollbar — light scheme */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #ddd6fe; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #c4b5fd; }
+
+/* Scrollbar — dark scheme */
+.mui-color-scheme-dark ::-webkit-scrollbar-thumb { background: rgba(167,139,250,0.25); }
+.mui-color-scheme-dark ::-webkit-scrollbar-thumb:hover { background: rgba(167,139,250,0.45); }
 
 .animate-fade-in {
   animation: fade-in 0.25s ease both;
 }
+
+/* BrandLogo: white border ring, only visible in dark mode */
+.brand-logo-dark-ring { display: none; }
+.mui-color-scheme-dark .brand-logo-dark-ring { display: inline; }

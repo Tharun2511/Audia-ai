@@ -1,9 +1,10 @@
 "use client";
-import Link from "next/link";
+import NextLink from "next/link";
 import { useActionState, useEffect } from "react";
 import { toast } from "sonner";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
+import Link from "@mui/material/Link";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
@@ -69,7 +70,7 @@ export default function SignupForm() {
 
                 <Typography variant="body2" align="center" color="text.secondary">
                     Already have an account?{" "}
-                    <Link href="/login" style={{ color: "#6d28d9", fontWeight: 500, textDecoration: "none" }}>
+                    <Link component={NextLink} href="/login" sx={{ color: "primary.main", fontWeight: 500, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}>
                         Log in
                     </Link>
                 </Typography>
