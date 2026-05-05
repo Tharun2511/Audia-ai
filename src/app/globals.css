@@ -59,3 +59,8 @@ body {
 /* BrandLogo: white border ring, only visible in dark mode */
 .brand-logo-dark-ring { display: none; }
 .mui-color-scheme-dark .brand-logo-dark-ring { display: inline; }
+
+/* Auth-card shadow — swaps per color scheme so server components can use a
+   plain sx string (no theme function, which can't cross the RSC boundary). */
+:root { --audia-card-shadow: 0 20px 50px -20px rgba(91,33,182,0.18); }
+.mui-color-scheme-dark { --audia-card-shadow: 0 20px 50px -20px rgba(0,0,0,0.6); }

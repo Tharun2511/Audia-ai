@@ -14,23 +14,18 @@ import CheckIcon from "@mui/icons-material/Check";
 import EditIcon from "@mui/icons-material/Edit";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { buildColorMap, formatDuration } from "./utils";
-import TitleInput from "./TitleInput";
 
 interface Props {
     segments: TranscriptSegment[];
     transcriptionId?: string;
-    currentTitle?: string | null;
     onSegmentsUpdate?: (segments: TranscriptSegment[]) => void;
-    onTitleSave?: (title: string | null) => void;
     isProcessing?: boolean;
 }
 
 export default function TranscriptPanel({
     segments,
     transcriptionId,
-    currentTitle,
     onSegmentsUpdate,
-    onTitleSave,
     isProcessing,
 }: Props) {
     const [copied, setCopied] = useState(false);
@@ -92,19 +87,9 @@ export default function TranscriptPanel({
                 spacing={1}
                 sx={{ alignItems: "center", justifyContent: "space-between", px: 2, py: 1.75, borderBottom: 1, borderColor: "divider" }}
             >
-                <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", minWidth: 0, flex: 1 }}>
-                    <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "text.disabled", lineHeight: 1, flexShrink: 0 }}>
-                        Transcript
-                    </Typography>
-                    {transcriptionId && onTitleSave && (
-                        <TitleInput
-                            transcriptionId={transcriptionId}
-                            initialTitle={currentTitle ?? null}
-                            fallback="Untitled — click to name"
-                            onSaved={onTitleSave}
-                        />
-                    )}
-                </Stack>
+                <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.2em", color: "text.disabled", lineHeight: 1, flexShrink: 0 }}>
+                    Transcript
+                </Typography>
                 {!isProcessing && segments.length > 0 && (
                     <Button
                         onClick={handleCopy}

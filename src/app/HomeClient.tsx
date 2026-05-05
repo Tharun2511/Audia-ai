@@ -230,20 +230,22 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 </Typography>
             </Box>
 
-            {/* New session CTA */}
-            <Box sx={{ px: 2, py: 1.75, borderBottom: 1, borderColor: "divider" }}>
-                <Button
-                    onClick={startNew}
-                    variant="contained"
-                    color="primary"
-                    fullWidth
-                    startIcon={<AddIcon />}
-                    disabled={status === "recording" || status === "processing"}
-                    sx={{ borderRadius: 999, py: 1.1 }}
-                >
-                    New Session
-                </Button>
-            </Box>
+            {/* New session CTA — only when there's something to leave (a selected session, recording, or processing) */}
+            {mainView !== "ready" && (
+                <Box sx={{ px: 2, py: 1.75, borderBottom: 1, borderColor: "divider" }}>
+                    <Button
+                        onClick={startNew}
+                        variant="contained"
+                        color="primary"
+                        fullWidth
+                        startIcon={<AddIcon />}
+                        disabled={status === "recording" || status === "processing"}
+                        sx={{ borderRadius: 999, py: 1.1 }}
+                    >
+                        New Session
+                    </Button>
+                </Box>
+            )}
 
             {/* Sessions list */}
             <Stack direction="row" spacing={1} sx={{ alignItems: "center", justifyContent: "space-between", px: 2.5, pt: 2, pb: 1, flexShrink: 0 }}>
@@ -309,7 +311,6 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 isJustCompleted={selectedRecord.id === justCompletedId}
                 onTitleSave={(t) => patchRecord(selectedRecord.id, { title: t })}
                 onSegmentsUpdate={(s) => patchRecord(selectedRecord.id, { segments: s })}
-                onSummaryUpdate={(s) => patchRecord(selectedRecord.id, { summary: s })}
             />
         );
     } else {

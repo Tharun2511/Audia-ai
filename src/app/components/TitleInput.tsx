@@ -6,21 +6,40 @@ import Button from "@mui/material/Button";
 import IconButton from "@mui/material/IconButton";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
-import Typography from "@mui/material/Typography";
+import Typography, { type TypographyProps } from "@mui/material/Typography";
 import EditIcon from "@mui/icons-material/Edit";
 import CloseIcon from "@mui/icons-material/Close";
+
+type Variant = "default" | "title";
 
 interface Props {
     transcriptionId: string;
     initialTitle: string | null;
     fallback: string;
     onSaved: (title: string | null) => void;
+    /**
+     * "default" — inline body-text size for use inside card headers.
+     * "title"   — large session title for use at the top of SessionView.
+     */
+    variant?: Variant;
 }
 
-export default function TitleInput({ transcriptionId, initialTitle, fallback, onSaved }: Props) {
+const STYLE: Record<Variant, {
+    typographyVariant: TypographyProps["variant"];
+    typographyWeight: number;
+    fieldWidth: number | string;
+    fieldSize: "small" | "medium";
+    iconSize: number;
+}> = {
+    default: { typographyVariant: "body2", typographyWeight: 600, fieldWidth: 200, fieldSize: "small", iconSize: 12 },
+    title:   { typographyVariant: "h5",    typographyWeight: 700, fieldWidth: "100%", fieldSize: "medium", iconSize: 18 },
+};
+
+export default function TitleInput({ transcriptionId, initialTitle, fallback, onSaved, variant = "default" }: Props) {
     const [editing, setEditing] = useState(false);
     const [value, setValue] = useState(initialTitle ?? "");
     const [saving, setSaving] = useState(false);
+    const style = STYLE[variant];
 
     const save = async () => {
         const trimmed = value.trim();
@@ -51,7 +70,7 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
             <Stack
                 direction="row"
                 spacing={1}
-                sx={{ alignItems: "center" }}
+                sx={{ alignItems: "center", width: variant === "title" ? "100%" : undefined }}
                 onClick={(e) => e.stopPropagation()}
             >
                 <TextField
@@ -63,13 +82,13 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
                         if (e.key === "Escape") cancel();
                     }}
                     placeholder="Name this session…"
-                    size="small"
-                    sx={{ width: 180 }}
+                    size={style.fieldSize}
+                    sx={{ width: style.fieldWidth, maxWidth: variant === "title" ? 480 : undefined }}
                 />
-                <Button onClick={save} disabled={saving} variant="contained" size="small">
+                <Button onClick={save} disabled={saving} variant="contained" size={style.fieldSize}>
                     {saving ? "…" : "Save"}
                 </Button>
-                <IconButton onClick={cancel} size="small" aria-label="Cancel">
+                <IconButton onClick={cancel} size={style.fieldSize} aria-label="Cancel">
                     <CloseIcon fontSize="small" />
                 </IconButton>
             </Stack>
@@ -88,23 +107,24 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
                 cursor: "pointer",
                 display: "inline-flex",
                 alignItems: "center",
-                gap: 0.75,
+                gap: variant === "title" ? 1.25 : 0.75,
                 textAlign: "left",
                 color: "inherit",
-                "&:hover .edit-pencil": { color: "#c4b5fd" },
+                "&:hover .edit-pencil": { color: "primary.light" },
             }}
         >
             <Typography
-                variant="body2"
+                variant={style.typographyVariant}
                 sx={{
-                    fontWeight: 600,
+                    fontWeight: style.typographyWeight,
                     color: initialTitle ? "text.primary" : "text.disabled",
                     fontStyle: initialTitle ? "normal" : "italic",
+                    lineHeight: 1.2,
                 }}
             >
                 {initialTitle ?? fallback}
             </Typography>
-            <EditIcon className="edit-pencil" sx={{ fontSize: 12, color: "transparent", transition: "color 150ms" }} />
+            <EditIcon className="edit-pencil" sx={{ fontSize: style.iconSize, color: "transparent", transition: "color 150ms" }} />
         </Box>
     );
 }

@@ -25,14 +25,12 @@ export default async function SignupPage() {
             }}
         >
             <Card
-                sx={(theme) => ({
+                sx={{
                     width: "100%",
                     maxWidth: 440,
                     overflow: "hidden",
-                    boxShadow: theme.palette.mode === "dark"
-                        ? "0 20px 50px -20px rgba(0,0,0,0.6)"
-                        : "0 20px 50px -20px rgba(91,33,182,0.18)",
-                })}
+                    boxShadow: "var(--audia-card-shadow)",
+                }}
             >
                 <Box sx={{ height: 4, background: "linear-gradient(to right, var(--mui-palette-primary-main), var(--mui-palette-secondary-main))" }} />
                 <CardContent sx={{ p: 4 }}>

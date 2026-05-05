@@ -13,7 +13,6 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SendIcon from "@mui/icons-material/Send";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { formatDuration } from "./utils";
-import TitleInput from "./TitleInput";
 
 type Message = {
     role: "user" | "assistant";
@@ -30,9 +29,6 @@ const QUICK_PROMPTS = [
 
 interface Props {
     segments: TranscriptSegment[];
-    transcriptionId?: string;
-    currentTitle?: string | null;
-    onTitleSave?: (title: string | null) => void;
 }
 
 function buildPrompt(segments: TranscriptSegment[], question: string): string {
@@ -42,7 +38,7 @@ function buildPrompt(segments: TranscriptSegment[], question: string): string {
     return `You are a helpful assistant analyzing a conversation transcript. Answer the question concisely and clearly based only on what's in the transcript.\n\nTranscript:\n${transcript}\n\nQuestion: ${question}`;
 }
 
-export default function ChatPanel({ segments, transcriptionId, currentTitle, onTitleSave }: Props) {
+export default function ChatPanel({ segments }: Props) {
     const [open, setOpen] = useState(false);
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
@@ -150,20 +146,9 @@ export default function ChatPanel({ segments, transcriptionId, currentTitle, onT
                         <ChatBubbleOutlineIcon sx={{ fontSize: 12 }} />
                     </Box>
 
-                    {transcriptionId && onTitleSave ? (
-                        <Box onClick={(e) => e.stopPropagation()}>
-                            <TitleInput
-                                transcriptionId={transcriptionId}
-                                initialTitle={currentTitle ?? null}
-                                fallback="Untitled — click to name"
-                                onSaved={onTitleSave}
-                            />
-                        </Box>
-                    ) : (
-                        <Typography variant="body2" sx={{ fontWeight: 600, color: "text.primary" }}>
-                            Ask about this transcript
-                        </Typography>
-                    )}
+                    <Typography variant="body2" sx={{ fontWeight: 600, color: "text.primary" }}>
+                        Ask about this transcript
+                    </Typography>
 
                     {questionCount > 0 && (
                         <Chip

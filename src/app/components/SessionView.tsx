@@ -6,6 +6,7 @@ import Typography from "@mui/material/Typography";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { formatDuration } from "./utils";
 import SummaryBlock from "./SummaryBlock";
+import TitleInput from "./TitleInput";
 import TranscriptPanel from "./TranscriptPanel";
 import ChatPanel from "./ChatPanel";
 
@@ -19,7 +20,6 @@ interface Props {
     isJustCompleted?: boolean;
     onTitleSave: (title: string | null) => void;
     onSegmentsUpdate: (segments: TranscriptSegment[]) => void;
-    onSummaryUpdate: (summary: string | null) => void;
 }
 
 export default function SessionView({
@@ -32,20 +32,26 @@ export default function SessionView({
     isJustCompleted,
     onTitleSave,
     onSegmentsUpdate,
-    onSummaryUpdate,
 }: Props) {
     const date = new Date(createdAt);
 
     return (
         <Stack spacing={2.5} sx={{ animation: "fade-in 250ms ease both" }}>
-            {/* Header strip */}
+            {/* Page-level header — title + meta. Renaming here renames the whole session. */}
             <Box>
-                <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", flexWrap: "wrap" }}>
-                    <Typography variant="caption" sx={{ fontSize: 10, color: "text.disabled", fontFamily: "var(--font-geist-mono), monospace" }}>
+                <TitleInput
+                    transcriptionId={id}
+                    initialTitle={title}
+                    fallback="Untitled session"
+                    onSaved={onTitleSave}
+                    variant="title"
+                />
+                <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", flexWrap: "wrap", mt: 1.25 }}>
+                    <Typography variant="caption" sx={{ fontSize: 11, color: "text.disabled", fontFamily: "var(--font-geist-mono), monospace" }}>
                         {formatDuration(duration)}
                     </Typography>
-                    <Typography variant="caption" sx={{ fontSize: 10, color: "text.disabled" }}>·</Typography>
-                    <Typography variant="caption" sx={{ fontSize: 10, color: "text.disabled" }}>
+                    <Typography variant="caption" sx={{ fontSize: 11, color: "text.disabled" }}>·</Typography>
+                    <Typography variant="caption" sx={{ fontSize: 11, color: "text.disabled" }}>
                         {date.toLocaleString()}
                     </Typography>
                     {isJustCompleted && (
@@ -58,31 +64,15 @@ export default function SessionView({
                 </Stack>
             </Box>
 
-            {/* Summary */}
-            <SummaryBlock
-                transcriptionId={id}
-                initialSummary={summary}
-                onSaved={onSummaryUpdate}
-            />
+            <SummaryBlock summary={summary} />
 
-            {/* Transcript */}
             <TranscriptPanel
                 segments={segments}
                 transcriptionId={id}
-                currentTitle={title}
                 onSegmentsUpdate={onSegmentsUpdate}
-                onTitleSave={onTitleSave}
             />
 
-            {/* Chat */}
-            {segments.length > 0 && (
-                <ChatPanel
-                    segments={segments}
-                    transcriptionId={id}
-                    currentTitle={title}
-                    onTitleSave={onTitleSave}
-                />
-            )}
+            {segments.length > 0 && <ChatPanel segments={segments} />}
         </Stack>
     );
 }
