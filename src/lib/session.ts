@@ -25,11 +25,15 @@ export async function encrypt(payload: SessionPayload): Promise<string> {
 }
 
 export async function decrypt(token: string | undefined): Promise<SessionPayload | null> {
-    if (!token) return null;
+    if (!token) {
+        console.log("[auth] decrypt: no token in request");
+        return null;
+    }
     try {
         const { payload } = await jwtVerify(token, getKey(), { algorithms: ["HS256"] });
         return payload as SessionPayload;
-    } catch {
+    } catch (err) {
+        console.log("[auth] decrypt: jwtVerify failed:", err instanceof Error ? err.message : err);
         return null;
     }
 }

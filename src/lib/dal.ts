@@ -13,7 +13,10 @@ export const verifySession = cache(async (): Promise<{ userId: string }> => {
 
 export const getCurrentUser = cache(async (): Promise<{ id: string; email: string; name: string | null } | null> => {
     const session = await readSession();
-    if (!session?.userId) return null;
+    if (!session?.userId) {
+        console.log("[auth] getCurrentUser: no valid session");
+        return null;
+    }
 
     const db = await getDatabase();
     const repo = db.getRepository(User);
@@ -21,5 +24,8 @@ export const getCurrentUser = cache(async (): Promise<{ id: string; email: strin
         where: { id: session.userId },
         select: { id: true, email: true, name: true },
     });
+    if (!user) {
+        console.log("[auth] getCurrentUser: session userId", session.userId, "but no matching User row");
+    }
     return user ?? null;
 });
