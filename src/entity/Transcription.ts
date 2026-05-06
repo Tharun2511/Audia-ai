@@ -7,7 +7,7 @@ export type TranscriptSegment = {
   end: number;
 };
 
-@Entity()
+@Entity({ name: "transcription" })
 export class Transcription {
   @PrimaryGeneratedColumn("uuid")
   id!: string;
