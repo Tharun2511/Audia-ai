@@ -5,6 +5,8 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import GraphicEqIcon from "@mui/icons-material/GraphicEq";
 import MicIcon from "@mui/icons-material/Mic";
+import PauseIcon from "@mui/icons-material/Pause";
+import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import StopIcon from "@mui/icons-material/Stop";
 import { formatDuration } from "./utils";
 import FileUpload from "./FileUpload";
@@ -87,8 +89,20 @@ export function ReadyState({
     );
 }
 
-/** Shown while the user is actively recording. */
-export function RecordingState({ elapsed, onStop }: { elapsed: number; onStop: () => void }) {
+/** Shown while the user is actively recording — or paused. */
+export function RecordingState({
+    elapsed,
+    isPaused,
+    onPause,
+    onResume,
+    onStop,
+}: {
+    elapsed: number;
+    isPaused: boolean;
+    onPause: () => void;
+    onResume: () => void;
+    onStop: () => void;
+}) {
     return (
         <Stack
             spacing={3.5}
@@ -101,24 +115,35 @@ export function RecordingState({ elapsed, onStop }: { elapsed: number; onStop: (
                 animation: "fade-in 250ms ease both",
             }}
         >
-            {/* Pulsing rings */}
+            {/* Pulsing rings — only while actively recording */}
             <Box sx={{ position: "relative", width: 160, height: 160, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "rgba(239,68,68,0.4)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite" }} />
-                <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "rgba(239,68,68,0.25)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) 0.5s infinite" }} />
+                {!isPaused && (
+                    <>
+                        <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "rgba(239,68,68,0.4)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite" }} />
+                        <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "rgba(239,68,68,0.25)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) 0.5s infinite" }} />
+                    </>
+                )}
                 <Box
                     sx={{
                         width: 104,
                         height: 104,
                         borderRadius: "50%",
-                        bgcolor: "#ef4444",
+                        bgcolor: isPaused ? "rgba(239,68,68,0.55)" : "#ef4444",
                         color: "#fff",
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        boxShadow: "0 14px 32px -8px rgba(239,68,68,0.55)",
+                        boxShadow: isPaused
+                            ? "0 10px 24px -10px rgba(239,68,68,0.35)"
+                            : "0 14px 32px -8px rgba(239,68,68,0.55)",
+                        transition: "background-color 200ms, box-shadow 200ms",
                     }}
                 >
-                    <GraphicEqIcon sx={{ fontSize: 40, animation: "rec-blink 1.2s ease-in-out infinite" }} />
+                    {isPaused ? (
+                        <PauseIcon sx={{ fontSize: 44 }} />
+                    ) : (
+                        <GraphicEqIcon sx={{ fontSize: 40, animation: "rec-blink 1.2s ease-in-out infinite" }} />
+                    )}
                 </Box>
             </Box>
 
@@ -127,29 +152,55 @@ export function RecordingState({ elapsed, onStop }: { elapsed: number; onStop: (
                     {formatDuration(elapsed)}
                 </Typography>
                 <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
-                    <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: "#ef4444", animation: "rec-blink 1s ease-in-out infinite" }} />
-                    <Typography variant="body2" sx={{ color: "#ef4444", fontWeight: 500 }}>
-                        Recording in progress
+                    {!isPaused && (
+                        <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: "#ef4444", animation: "rec-blink 1s ease-in-out infinite" }} />
+                    )}
+                    <Typography variant="body2" sx={{ color: isPaused ? "warning.main" : "#ef4444", fontWeight: 500 }}>
+                        {isPaused ? "Paused" : "Recording in progress"}
                     </Typography>
                 </Stack>
             </Stack>
 
-            <Button
-                onClick={onStop}
-                variant="contained"
-                size="large"
-                startIcon={<StopIcon />}
-                sx={{
-                    bgcolor: "#ef4444",
-                    color: "#fff",
-                    px: 4,
-                    py: 1.5,
-                    borderRadius: 999,
-                    "&:hover": { bgcolor: "#dc2626" },
-                }}
-            >
-                Stop Recording
-            </Button>
+            {/* Actions — pause/resume is the primary action, stop is the final/red one */}
+            <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
+                {isPaused ? (
+                    <Button
+                        onClick={onResume}
+                        variant="contained"
+                        size="large"
+                        startIcon={<PlayArrowIcon />}
+                        sx={{ px: 3.5, py: 1.5, borderRadius: 999 }}
+                    >
+                        Resume
+                    </Button>
+                ) : (
+                    <Button
+                        onClick={onPause}
+                        variant="outlined"
+                        size="large"
+                        startIcon={<PauseIcon />}
+                        sx={{ px: 3.5, py: 1.5, borderRadius: 999 }}
+                    >
+                        Pause
+                    </Button>
+                )}
+                <Button
+                    onClick={onStop}
+                    variant="contained"
+                    size="large"
+                    startIcon={<StopIcon />}
+                    sx={{
+                        bgcolor: "#ef4444",
+                        color: "#fff",
+                        px: 3.5,
+                        py: 1.5,
+                        borderRadius: 999,
+                        "&:hover": { bgcolor: "#dc2626" },
+                    }}
+                >
+                    Stop
+                </Button>
+            </Stack>
         </Stack>
     );
 }

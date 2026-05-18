@@ -23,7 +23,7 @@ import SessionView from "./components/SessionView";
 import ThemeToggle from "./components/ThemeToggle";
 import { ReadyState, RecordingState, ProcessingState } from "./components/MainPaneStates";
 
-type Status = "idle" | "recording" | "processing" | "done" | "error";
+type Status = "idle" | "recording" | "paused" | "processing" | "done" | "error";
 
 type HistoryRecord = {
     id: string;
@@ -153,7 +153,31 @@ export default function HomeClient({ userEmail, userName }: Props) {
         timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
     };
 
-    const stopRecording = () => mediaRecorderRef.current?.stop();
+    const pauseRecording = () => {
+        const rec = mediaRecorderRef.current;
+        if (!rec || rec.state !== "recording") return;
+        rec.pause();
+        if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+        }
+        setStatus("paused");
+    };
+
+    const resumeRecording = () => {
+        const rec = mediaRecorderRef.current;
+        if (!rec || rec.state !== "paused") return;
+        rec.resume();
+        timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
+        setStatus("recording");
+    };
+
+    const stopRecording = () => {
+        const rec = mediaRecorderRef.current;
+        if (!rec || rec.state === "inactive") return;
+        // mediaRecorder.stop() works from both "recording" and "paused" states.
+        rec.stop();
+    };
 
     /* ---------- File upload ---------- */
     const handleFileUpload = async (file: File) => {
@@ -191,7 +215,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
 
     /* ---------- What does the main pane show? ---------- */
     let mainView: "recording" | "processing" | "session" | "ready";
-    if (status === "recording") mainView = "recording";
+    if (status === "recording" || status === "paused") mainView = "recording";
     else if (status === "processing") mainView = "processing";
     else if (selectedRecord) mainView = "session";
     else mainView = "ready";
@@ -239,7 +263,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
                         color="primary"
                         fullWidth
                         startIcon={<AddIcon />}
-                        disabled={status === "recording" || status === "processing"}
+                        disabled={status === "recording" || status === "paused" || status === "processing"}
                         sx={{ borderRadius: 999, py: 1.1 }}
                     >
                         New Session
@@ -296,7 +320,15 @@ export default function HomeClient({ userEmail, userName }: Props) {
     /* ---------- Main pane content ---------- */
     let mainContent: React.ReactNode;
     if (mainView === "recording") {
-        mainContent = <RecordingState elapsed={elapsed} onStop={stopRecording} />;
+        mainContent = (
+            <RecordingState
+                elapsed={elapsed}
+                isPaused={status === "paused"}
+                onPause={pauseRecording}
+                onResume={resumeRecording}
+                onStop={stopRecording}
+            />
+        );
     } else if (mainView === "processing") {
         mainContent = <ProcessingState />;
     } else if (mainView === "session" && selectedRecord) {
@@ -319,7 +351,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 error={error}
                 onStart={startRecording}
                 onUpload={handleFileUpload}
-                disabled={status === "recording" || status === "processing"}
+                disabled={status === "recording" || status === "paused" || status === "processing"}
             />
         );
     }
