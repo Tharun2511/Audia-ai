@@ -67,9 +67,14 @@ export default function SessionView({
             <SummaryBlock summary={summary} />
 
             <TranscriptPanel
+                key={id}
                 segments={segments}
                 transcriptionId={id}
                 onSegmentsUpdate={onSegmentsUpdate}
+                title={title}
+                summary={summary}
+                duration={duration}
+                createdAt={createdAt}
             />
 
             {segments.length > 0 && <ChatPanel segments={segments} />}

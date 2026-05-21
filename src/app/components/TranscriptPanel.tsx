@@ -1,18 +1,32 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
 import Chip from "@mui/material/Chip";
 import CircularProgress from "@mui/material/CircularProgress";
+import ListItemIcon from "@mui/material/ListItemIcon";
+import ListItemText from "@mui/material/ListItemText";
+import Menu from "@mui/material/Menu";
+import MenuItem from "@mui/material/MenuItem";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
+import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
+import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CheckIcon from "@mui/icons-material/Check";
 import EditIcon from "@mui/icons-material/Edit";
+import FileDownloadOutlinedIcon from "@mui/icons-material/FileDownloadOutlined";
+import TextSnippetOutlinedIcon from "@mui/icons-material/TextSnippetOutlined";
 import type { TranscriptSegment } from "@/entity/Transcription";
+import {
+    downloadAsFile,
+    formatTranscriptAsMd,
+    formatTranscriptAsTxt,
+    suggestedFilename,
+} from "@/lib/transcript-export";
 import { buildColorMap, formatDuration } from "./utils";
 
 interface Props {
@@ -20,6 +34,11 @@ interface Props {
     transcriptionId?: string;
     onSegmentsUpdate?: (segments: TranscriptSegment[]) => void;
     isProcessing?: boolean;
+    /** Optional context — when provided, enables the Download menu. */
+    title?: string | null;
+    summary?: string | null;
+    duration?: number;
+    createdAt?: string;
 }
 
 export default function TranscriptPanel({
@@ -27,20 +46,21 @@ export default function TranscriptPanel({
     transcriptionId,
     onSegmentsUpdate,
     isProcessing,
+    title,
+    summary,
+    duration,
+    createdAt,
 }: Props) {
-    const [copied, setCopied] = useState(false);
-    const [showRenamer, setShowRenamer] = useState(false);
-    const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
-    const [saving, setSaving] = useState(false);
-
     const uniqueSpeakers = [...new Set(segments.map((s) => s.speaker))];
     const colorMap = buildColorMap(uniqueSpeakers);
 
-    useEffect(() => {
-        setSpeakerNames(Object.fromEntries(uniqueSpeakers.map((s) => [s, s])));
-        setShowRenamer(false);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [segments]);
+    const [copied, setCopied] = useState(false);
+    const [showRenamer, setShowRenamer] = useState(false);
+    const [speakerNames, setSpeakerNames] = useState<Record<string, string>>(
+        () => Object.fromEntries(uniqueSpeakers.map((s) => [s, s]))
+    );
+    const [saving, setSaving] = useState(false);
+    const [downloadAnchor, setDownloadAnchor] = useState<HTMLElement | null>(null);
 
     const handleSaveRenames = async () => {
         if (!transcriptionId || !onSegmentsUpdate) return;
@@ -79,6 +99,29 @@ export default function TranscriptPanel({
         }
     };
 
+    const downloadEnabled = createdAt !== undefined && duration !== undefined;
+
+    const handleDownload = (format: "txt" | "md") => {
+        if (!downloadEnabled) return;
+        const opts = {
+            title: title ?? null,
+            summary: summary ?? null,
+            duration: duration!,
+            createdAt: createdAt!,
+            segments,
+        };
+        const content = format === "txt" ? formatTranscriptAsTxt(opts) : formatTranscriptAsMd(opts);
+        const filename = suggestedFilename(title ?? null, createdAt!, format);
+        const mimeType = format === "txt" ? "text/plain" : "text/markdown";
+        try {
+            downloadAsFile(content, filename, mimeType);
+            toast.success(`Downloaded ${filename}`);
+        } catch {
+            toast.error("Couldn't generate the download.");
+        }
+        setDownloadAnchor(null);
+    };
+
     return (
         <Card sx={{ overflow: "hidden" }}>
             {/* Header */}
@@ -91,17 +134,71 @@ export default function TranscriptPanel({
                     Transcript
                 </Typography>
                 {!isProcessing && segments.length > 0 && (
-                    <Button
-                        onClick={handleCopy}
-                        variant="outlined"
-                        size="small"
-                        startIcon={copied ? <CheckIcon /> : <ContentCopyIcon />}
-                        sx={{ color: copied ? "primary.main" : "text.secondary", flexShrink: 0 }}
-                    >
-                        {copied ? "Copied" : "Copy"}
-                    </Button>
+                    <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+                        <Button
+                            onClick={handleCopy}
+                            variant="outlined"
+                            size="small"
+                            startIcon={copied ? <CheckIcon /> : <ContentCopyIcon />}
+                            sx={{ color: copied ? "primary.main" : "text.secondary" }}
+                        >
+                            {copied ? "Copied" : "Copy"}
+                        </Button>
+                        {downloadEnabled && (
+                            <Button
+                                onClick={(e) => setDownloadAnchor(e.currentTarget)}
+                                variant="outlined"
+                                size="small"
+                                startIcon={<FileDownloadOutlinedIcon />}
+                                endIcon={<ArrowDropDownIcon />}
+                                aria-haspopup="menu"
+                                aria-expanded={Boolean(downloadAnchor)}
+                                aria-controls={downloadAnchor ? "transcript-download-menu" : undefined}
+                                sx={{ color: "text.secondary" }}
+                            >
+                                Download
+                            </Button>
+                        )}
+                    </Stack>
                 )}
             </Stack>
+
+            <Menu
+                id="transcript-download-menu"
+                anchorEl={downloadAnchor}
+                open={Boolean(downloadAnchor)}
+                onClose={() => setDownloadAnchor(null)}
+                anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+                transformOrigin={{ vertical: "top", horizontal: "right" }}
+                slotProps={{ paper: { sx: { minWidth: 260, mt: 0.5, borderRadius: 2 } } }}
+            >
+                <MenuItem onClick={() => handleDownload("txt")} sx={{ py: 1.25 }}>
+                    <ListItemIcon sx={{ color: "text.secondary" }}>
+                        <TextSnippetOutlinedIcon fontSize="small" />
+                    </ListItemIcon>
+                    <ListItemText
+                        primary=".txt"
+                        secondary="Plain text — opens anywhere"
+                        slotProps={{
+                            primary: { sx: { fontWeight: 600, fontSize: 14 } },
+                            secondary: { sx: { fontSize: 11, color: "text.disabled" } },
+                        }}
+                    />
+                </MenuItem>
+                <MenuItem onClick={() => handleDownload("md")} sx={{ py: 1.25 }}>
+                    <ListItemIcon sx={{ color: "text.secondary" }}>
+                        <ArticleOutlinedIcon fontSize="small" />
+                    </ListItemIcon>
+                    <ListItemText
+                        primary=".md"
+                        secondary="Markdown — Notion, GitHub, Slack"
+                        slotProps={{
+                            primary: { sx: { fontWeight: 600, fontSize: 14 } },
+                            secondary: { sx: { fontSize: 11, color: "text.disabled" } },
+                        }}
+                    />
+                </MenuItem>
+            </Menu>
 
             <Box sx={{ p: 2 }}>
                 {isProcessing ? (
