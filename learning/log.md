@@ -46,3 +46,20 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Zod `.refine()` for cross-field invariants + the "silent failure" risk it prevents.** Q5 — didn't attempt; this pattern recurs every time we add structured output, will reinforce naturally.
   - **Feynman SHAPE (analogy → plain-language change → risk-removed close).** Content was there; pattern wasn't. The pattern was explicitly taught after 0.2's Feynman and not applied here. Practice the three-beat structure in Session 1.2.
   - **Calibrated hyperbole.** Claimed "most reliable of all industry standards" — those ARE the industry standards. Use "matches modern best practice" instead. Calibration tells > false confidence.
+
+---
+
+**2026-05-21 · Phase 1.2 — Prompt injection & output safety**
+- Covered: the threat model (system role is statistical not enforced), four attack categories (direct, indirect, jailbreak, data exfiltration), defense-in-depth principle, 9-layer defense stack (1-5 free, 6-9 architectural/costly), the prompt-injection-resistant prompt template, output safety vs prompt-injection (complementary concerns).
+- Built: hardened [summarizeTranscript](../src/lib/ai.ts) with `<transcript>` delimiters, CRITICAL SECURITY RULE in system prompt, sandwich line after few-shot examples, and a third few-shot example demonstrating injection-resistant output. Added [`CHAT_SYSTEM_PROMPT`](../src/app/api/chat/route.ts) to chat endpoint (it had no system prompt at all — naked user input went to the model) with security rules, delimiter discipline, and refusal-to-reveal-instructions clause.
+- **Stuck (well-internalized):**
+  - **Cost-asymmetry framing.** Q4 — got the "alternative to imperfect defense isn't perfect defense, it's no defense" instinct right.
+  - **Direct vs indirect distinction.** Q1, Q2 — correctly identified indirect as Audia's worst risk and why (Deepgram → transcript pipeline).
+  - **String-filtering is insufficient.** Q2 — got the paraphrasing/obfuscation counter quickly.
+- **Fuzzy (needs reinforcement):**
+  - **Full four-category taxonomy.** Q1 — recalled only "direct"; couldn't name jailbreak and data exfiltration. Drill the DIJD memory aid.
+  - **Measurable signals for layer 6/7 escalation.** Q3 — answered "when it goes public" (correct but vague). Senior framing is *measurable triggers*: shape-mismatch rate, ticket volume, architectural change (adding tool-use), threat-profile shift (PII/regulated).
+  - **Architectural least-privilege as primary defense.** Q4 — focused on prompt-level only; missed that the strongest defense is restricting what the model *can do* via architecture, not what we *tell it not to do* via prompts.
+  - **Structural "zero vs one layer" framing.** Q5 — answered "user-facing" (directionally right but secondary). The senior insight: chat pre-1.2 had ZERO layers (no system prompt at all), summarizer had ONE — gap from 0→1 is structurally larger than 1→2.
+  - **Inventing statistics.** Q4 — said "90-95% of attacks can be prevented" — fabricated number. Use qualitative framing in interviews: *"raises cost of attack significantly"* not made-up percentages.
+  - **Feynman SHAPE — third session, still didn't apply organically.** Asked me to model it again. Pattern: analogy → what changed in plain language → risk removed. For Session 2, drill: brainstorm 3 candidate analogies first; pick the one where translation feels natural, not forced.
