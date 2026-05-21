@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# personal interview prep — not part of the project
+/interview-prep/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

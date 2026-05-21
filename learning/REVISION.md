@@ -10,7 +10,7 @@
 
 **Part I — Fundamentals**
 - [§1. How an LLM decides the next token](#1-how-an-llm-decides-the-next-token) ✅ *(Phase 0.1)*
-- §2. The model API surface — sampling params, streaming, cost math *(Phase 0.2 — TBD)*
+- [§2. The model API surface — sampling params, streaming, cost math](#2-the-model-api-surface--sampling-params-streaming-cost-math) ✅ *(Phase 0.2)*
 - §3. Prompt engineering as a discipline *(Phase 1.1 — TBD)*
 - §4. Prompt injection & output safety *(Phase 1.2 — TBD)*
 
@@ -360,7 +360,147 @@ A: "Since the model is stateless, memory has to be implemented by the caller. Th
 ---
 
 ## §2. The model API surface — sampling params, streaming, cost math
-*(Phase 0.2 — TBD)*
+
+### 2.1 Sampling parameters — the production knobs
+
+Every chat-completion API accepts a set of sampling parameters that shape how tokens are chosen from the model's output distribution. They're inference-time only — they don't affect the model's weights, just how we pick a token from its predicted probabilities.
+
+| Param | Range | What it does | Set it when |
+|---|---|---|---|
+| `temperature` | 0–2 | Sharpens/flattens distribution | Always — universal control |
+| `top_p` (nucleus) | 0–1 | Keep smallest token set with cumulative prob ≥ p | Modern default, leave at 0.9 |
+| `top_k` | 1–∞ | Hard top-k filter | Rarely set; legacy from older models |
+| `max_tokens` | 1–∞ | Cap output length | **Always set in production** (prevents runaway cost) |
+| `stop` | string list | Halt generation when substring is produced | Chat — prevents the model from role-playing the user |
+| `frequency_penalty` | 0–2 | Penalize tokens that already appeared (proportional) | Long-form creative writing — anti-repetition |
+| `presence_penalty` | 0–2 | Flat penalty for any token already used | Brainstorming — push toward novel topics |
+| `seed` | int | Fix RNG for reproducible sampling | Evals (Phase 6), debugging |
+
+**The two you'll set on every production call:** `temperature` and `max_tokens`. The rest are situational.
+
+**Practical notes for interviews:**
+
+- **Stop sequences fix prompt leakage.** If a chat model is hallucinating fake `User: ...` turns at the end of its responses, set `stop: ["\nUser:", "\n\nHuman:"]`. Common production fix; interviewers know this.
+- **`seed` is best-effort.** GPU non-determinism (parallel reductions in CUDA aren't deterministic across runs) means even with a fixed seed you may see slightly different outputs. Expect "very close," not bit-identical.
+- **Combining params:** in practice, `temperature` + `top_p` is the universal default. `top_k` was common in older models (GPT-2 era) but has fallen out of favor — nucleus sampling adapts better to varying confidence.
+- **`max_tokens` is output-only.** It does NOT control input length. Context window = input + output combined.
+
+### 2.2 Streaming — the autoregressive loop made visible
+
+**This is not a feature bolted on top of LLMs — it's a direct expression of how they work.**
+
+The model generates tokens one at a time (autoregressive, from §1). You have two choices for the API surface:
+
+- **No streaming:** generate all tokens server-side, buffer them, send the complete response. User sees a blank screen for 5–30 seconds, then a wall of text.
+- **Streaming:** as each token is generated, push it to the client immediately. User sees text appearing at the model's actual generation rate.
+
+**Streaming does NOT make the model faster.** Same tokens generated either way. It changes *perceived latency* — and that perceived latency is the entire difference between "delightful UX" and "feels broken."
+
+#### Three streaming protocols you should be able to name
+
+| Protocol | How it works | Used by |
+|---|---|---|
+| **Server-Sent Events (SSE)** | HTTP/1.1 standard. `data: ...\n\n` framed events. Browser consumes via `EventSource` API | OpenAI, Anthropic |
+| **HTTP chunked / ReadableStream** | Plain HTTP with `Transfer-Encoding: chunked`. Raw bytes per chunk. Lower-level than SSE | Audia's chat endpoint |
+| **WebSockets** | Bidirectional, full-duplex. Used when client needs to interrupt or send mid-stream | Real-time chat with voice/interrupt |
+
+#### What streaming looks like in code
+
+From Audia's [chat route](../src/app/api/chat/route.ts) (simplified):
+
+```ts
+const aiStream = await groq.chat.completions.create({
+    messages, model, stream: true,
+    stream_options: { include_usage: true },
+});
+
+for await (const chunk of aiStream) {
+    const text = chunk.choices[0]?.delta?.content ?? "";
+    if (text) controller.enqueue(encoder.encode(text));
+    if (chunk.usage) usage = chunk.usage;  // last chunk carries usage
+}
+```
+
+`aiStream` is an **async iterator**. Each iteration is "the model has produced more tokens since last time" — `delta.content` is the incremental text. Forward it to the client and the user sees it appear in real time.
+
+**`stream_options: { include_usage: true }`** is the magic flag. Without it, usage data is omitted from streaming responses. With it, the final chunk has `choices: []` and a `usage` object. You must check `chunk.usage` on every iteration because you don't know which chunk is last.
+
+**🎯 Defense talking point — interviewer asks: "How does streaming work?"**
+A: "The model is generating tokens one at a time anyway — streaming just sends each one to the client as it's produced, instead of buffering until done. The provider returns an async iterator; you consume it in a loop and forward each delta to the client over an open HTTP connection (chunked encoding or SSE). It doesn't change cost or generation speed — only perceived latency. Users will tolerate a 20-second response if they see it appearing; they won't tolerate a 3-second blank screen."
+
+### 2.3 Cost math — the formula and why output costs more
+
+The universal formula:
+
+```
+total_cost = (input_tokens × input_rate) + (output_tokens × output_rate)
+```
+
+Rates are quoted as **dollars per million tokens**. Two rates per model — input and output.
+
+#### Why output costs 2–5× input
+
+- **Input** is processed in **one forward pass** — all tokens in parallel. GPU loves this; throughput is high.
+- **Output** is **N forward passes** — one per generated token, serial. GPU is underutilized; throughput drops.
+- Same compute per pass, but output forces serial work. Providers price this throughput hit into the output rate.
+
+**📐 Sample rates (May 2026, USD per 1M tokens):**
+
+| Model | Input | Output | Notes |
+|---|---|---|---|
+| Groq `llama-3.1-8b-instant` | $0.05 | $0.08 | Audia's pick — basically free |
+| Gemini 2.0 Flash | $0.075 | $0.30 | Free tier with rate limits |
+| GPT-4o-mini | $0.15 | $0.60 | OpenAI's cheap tier |
+| Claude Sonnet 4 | $3 | $15 | Strong reasoning, much pricier |
+| Claude Opus 4.7 | $15 | $75 | Frontier model |
+
+#### Audia's economics
+
+A 5-minute meeting transcript ≈ 1,000 tokens. A summary call:
+- Input: 1,000 × $0.05 / 1,000,000 = **$0.00005**
+- Output: 200 × $0.08 / 1,000,000 = **$0.000016**
+- **Total: ~$0.00007 per summary**
+
+At 1,000 summaries/day → $0.07/day. At 1,000,000 summaries/day → $70/day. **Cheap by AI standards.**
+
+#### Three interview-worthy cost implications
+
+1. **Long contexts scale cost linearly with input length.** A 50k-token input is 50× more expensive than 1k input. This is the #1 reason RAG exists — instead of stuffing everything into context, retrieve only what's relevant. Phase 4.
+2. **Streaming doesn't change cost** — only perceived latency. Same token count either way.
+3. **Prompt caching** (Anthropic, OpenAI, recently Groq) — if your prompt prefix is identical across calls (system prompt, retrieved docs), providers cache the KV-state of those tokens and charge ~10× less for re-reads. Real production optimization. Phase 12.
+
+### 2.4 What this means in Audia
+
+We added [src/lib/ai-usage.ts](../src/lib/ai-usage.ts) — a pricing table + cost calculator + structured logger. Every call to Groq now logs:
+
+```
+[ai-usage] summarize model=llama-3.1-8b-instant in=523 out=87 latency=843ms cost=$0.0000095
+```
+
+This instrumentation is what Phase 6 (evals) and Phase 12 (AI Ops) will build on. The cost number is dollars; the latency is wall-clock; the token counts ground tokenization in reality (you can now SEE that "Vreddy" really does cost more than you'd think for foreign names).
+
+**Why this matters for the curriculum:** by Phase 12 we'll have a full observability stack — Langfuse or Helicone style. Today's logger is the seed of that stack. Every production AI system has equivalent telemetry; you'll never ship a customer-facing LLM call without it.
+
+### 2.5 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **Forgetting `stream_options: { include_usage: true }`** — usage data silently omitted from streaming responses. You'll think the SDK is broken. It isn't; you need the flag.
+- **Setting `max_tokens` too low for the task.** A summary truncated at 50 tokens looks like a model bug; it's just `max_tokens` cutoff.
+- **Believing `seed` gives bit-identical reproducibility.** It doesn't, due to GPU non-determinism. Useful for "mostly the same" outputs in evals; not for hash-equality.
+- **Thinking streaming saves money.** It saves perceived latency, nothing else. Cost is identical.
+- **Counting words instead of tokens for cost estimation.** Use a tokenizer (tiktokenizer.vercel.app) or log actual usage. Word count ≠ token count, especially for code, names, and non-English text.
+
+### 2.6 Defense talking points for §2
+
+**🎯 Q: "How would you keep your model spend under control in production?"**
+A: "Four levers, in order of effort: (1) always set `max_tokens` so a runaway call has a known ceiling; (2) measure per-call cost and latency — instrument every call with a structured logger so I can see who's expensive; (3) use prompt caching for stable prefixes — Anthropic and OpenAI both support this and it's a ~10× saving on the cached portion; (4) for retrieval-heavy use cases, switch from 'stuff everything in context' to RAG so input length stops scaling with corpus size."
+
+**🎯 Q: "Why is streaming worth the engineering complexity?"**
+A: "It's not extra complexity — it's actually simpler than buffering, because the model already produces tokens serially. You just forward each delta to the client over a persistent HTTP connection. The win is purely UX: users tolerate a 20-second streaming response but not a 3-second blank screen. For any non-trivial output length, streaming is the default."
+
+**🎯 Q: "What params do you set on every production call and why?"**
+A: "Temperature — controls determinism, set per task (0.1–0.3 for structured output, 0.7+ for creative). Max_tokens — bounds cost ceiling, set to roughly 1.5× the expected output length. Stop sequences — for chat, prevents the model from hallucinating fake user turns. Stream_options.include_usage — so I can log cost per call. Seed — only for evals where I need reproducibility."
 
 ---
 
@@ -372,6 +512,7 @@ A: "Since the model is stateless, memory has to be implemented by the caller. Th
 
 *(Alphabetical. Grows with each session.)*
 
+- **Async iterator** — JavaScript pattern (`for await ... of`) for consuming streams. Each iteration yields one chunk. Used by Groq/OpenAI SDKs to expose streamed responses.
 - **Autoregressive** — a generation process where each output depends on previous outputs. Token n+1 is sampled from a distribution conditioned on tokens 1..n. All chat LLMs are autoregressive.
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
 - **BPE (Byte-Pair Encoding)** — sub-word tokenization algorithm that learns a vocabulary of byte sequences from a corpus by repeatedly merging the most frequent pair of adjacent symbols.
@@ -380,21 +521,32 @@ A: "Since the model is stateless, memory has to be implemented by the caller. Th
 - **d_model** — the dimensionality of token embeddings throughout the network. Llama 3 8B: 4096.
 - **d_k** — the dimensionality of each attention head's key/query vectors. `d_model / num_heads`.
 - **Embedding** — a dense vector representation of a token (or text chunk in RAG contexts). Tokens with similar usage end up with geometrically nearby embeddings.
+- **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
 - **KV cache** — at inference, the previously-computed Key and Value vectors are cached so generating each new token only requires one new attention computation rather than recomputing for the whole sequence.
 - **Logits** — the model's final-layer output before softmax. Unnormalized scores over the vocabulary.
+- **`max_tokens`** — output length cap. Counts only generated tokens, not input. Always set in production to bound cost.
 - **MLP (in transformer)** — the two-layer feedforward block inside each transformer layer. Most of the parameters live here.
 - **Multi-head attention** — running H parallel attention operations with different learned projections, then concatenating the outputs.
 - **Nucleus sampling (top-p)** — keep the smallest set of tokens whose cumulative probability exceeds p, sample from that. p=0.9 is common.
+- **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
+- **Prompt caching** — provider feature where stable prompt prefixes are cached server-side, charging ~10× less for the cached portion on subsequent calls. Real production optimization.
+- **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
+- **Seed** — integer that fixes the RNG used during sampling. Best-effort reproducibility (GPU non-determinism prevents bit-identical guarantees). Useful for evals.
 - **Softmax** — function that converts a vector of real numbers to a probability distribution: `softmax(x_i) = exp(x_i) / Σ exp(x_j)`.
+- **SSE (Server-Sent Events)** — HTTP/1.1 streaming protocol where each event is a `data: ...\n\n` framed chunk. Browser API: `EventSource`. Standard for OpenAI/Anthropic streaming responses.
 - **Stateless** — the model retains no information between API calls. All context must be in the prompt.
-- **Stop token** — a special token (e.g. `<|endoftext|>`) that signals end of generation. The model is trained to emit it at appropriate stopping points.
+- **Stop sequence** — string(s) which, when generated, halt the model. Provider-side mechanism. Use `["\nUser:", "\n\nHuman:"]` for chat to prevent the model from role-playing the user.
+- **Stop token** — a special token (e.g. `<|endoftext|>`) that the model emits when it judges generation complete. Different from a stop *sequence*.
+- **Streaming** — sending each generated token to the client as it's produced. Does not change cost or generation speed — only perceived latency.
+- **`stream_options.include_usage`** — flag required to receive token usage data in streamed responses. Without it, usage is omitted; with it, the final chunk carries a `usage` field.
 - **System message** — the role-tagged prompt segment containing instructions, persona, and constraints. Models are trained to weight system content as operator intent.
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
 - **Top-k sampling** — keep only the k highest-probability tokens, zero the rest, renormalize.
 - **Tokenization** — converting a text string into a sequence of integer token IDs using a fixed vocabulary.
+- **Usage object** — provider response field containing `{ prompt_tokens, completion_tokens, total_tokens }`. Source of truth for billing and instrumentation.
 
 ---
 
