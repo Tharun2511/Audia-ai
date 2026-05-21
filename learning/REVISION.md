@@ -11,7 +11,7 @@
 **Part I — Fundamentals**
 - [§1. How an LLM decides the next token](#1-how-an-llm-decides-the-next-token) ✅ *(Phase 0.1)*
 - [§2. The model API surface — sampling params, streaming, cost math](#2-the-model-api-surface--sampling-params-streaming-cost-math) ✅ *(Phase 0.2)*
-- §3. Prompt engineering as a discipline *(Phase 1.1 — TBD)*
+- [§3. Prompt engineering as a discipline](#3-prompt-engineering-as-a-discipline) ✅ *(Phase 1.1)*
 - §4. Prompt injection & output safety *(Phase 1.2 — TBD)*
 
 **Part II — Real-time UX**
@@ -504,7 +504,136 @@ A: "Temperature — controls determinism, set per task (0.1–0.3 for structured
 
 ---
 
-*(Sections 3–26 will be filled in as we progress through phases.)*
+## §3. Prompt engineering as a discipline
+
+### 3.1 The mindset shift
+
+Prompts are not strings. They are **specifications** for what the model should do — closer to a function signature with examples than to a chat message. Bad prompts produce inconsistent outputs that *look* like model failures but are actually missing specs. Good prompts contain the same five things every time:
+
+1. **Role** — who is the model pretending to be? ("You are a meeting summarizer.")
+2. **Task** — what is the goal? ("Output 1–3 bullets covering decisions and action items.")
+3. **Format** — what shape is the output? ("Return a JSON object with `tooShort` and `bullets` fields.")
+4. **Constraints** — what NOT to do? ("Do not wrap JSON in code fences. Do not add preamble.")
+5. **Examples** — show, don't just tell. Few-shot examples lock in the pattern.
+
+Every production prompt audit you'll do as an AI engineer reduces to: which of these five is missing or weak?
+
+### 3.2 The three roles in depth
+
+| Role | Purpose | Trust level |
+|---|---|---|
+| `system` | Rules, persona, output format, constraints | High — model is trained to weight as operator intent |
+| `user` | Input data, questions | **Untrusted** in production (prompt injection — Phase 1.2) |
+| `assistant` | Model's prior turns in a conversation | Trusted — it's the model's own past output |
+
+**Production rule:** instructions go in `system`; data goes in `user`. Mixing them weakens both. If a summarizer's instruction sits in the user message alongside the transcript, malicious transcript content can override the instruction (*"Ignore previous instructions and..."*). System messages are also more sticky across multi-turn conversations.
+
+### 3.3 Few-shot prompting
+
+The progression:
+
+- **Zero-shot** — pure instruction. Works for tasks the model has seen abundantly in training (summarization, translation).
+- **One-shot** — instruction + one worked example.
+- **Few-shot** — instruction + 3–5 examples. Model learns the *pattern* from the demonstrations.
+
+**When to add examples (in order of impact):**
+1. Custom output formats (your specific JSON shape, not generic JSON)
+2. Classification with non-obvious labels (domain-specific categories)
+3. Edge cases (what to output when input is empty / off-topic / hostile)
+4. Domain phrasing (legal, medical, your company's tone)
+
+**The cost:** examples eat input tokens. A 5-shot prompt can be 10× the size of zero-shot. Audit token usage with your cost logger.
+
+**📐 Mental shortcut:** start zero-shot. If output is unreliable, add 2 examples covering the common case and the edge case. If still unreliable, add 3 more. More than 5 rarely helps — consider fine-tuning (Phase 11).
+
+### 3.4 Chain-of-thought (CoT)
+
+The technique: instruct the model to **show its reasoning before the final answer.** Each generated token is computation; reasoning steps give the model more compute budget per problem.
+
+**Two flavors:**
+- **Zero-shot CoT** — append `"Let's think step by step."` to the prompt. Famously effective on math word problems (Wei et al., 2022).
+- **Few-shot CoT** — your examples include the reasoning, not just the final answer.
+
+**⚖️ When CoT helps vs. hurts:**
+
+| Helps | Doesn't help / adds cost |
+|---|---|
+| Multi-step math, logic puzzles | Simple lookups, transforms |
+| Code generation with planning | Creative writing |
+| Classification with subtle criteria | Tasks where model already "thinks" naturally (summarization) |
+| Tasks where you've seen the model "jump to conclusions" | Anything cheap and short |
+
+**Modern caveat:** reasoning models (Claude with extended thinking, o1, DeepSeek-R1) do CoT *internally*. For these, you usually don't need explicit "think step by step" — that's wasted tokens. For ordinary chat models (Llama 3, GPT-4o), explicit CoT still helps on hard tasks.
+
+### 3.5 Structured output (the production-critical technique)
+
+Pre-2024: ask for JSON in the prompt and pray. Modern: layered defenses.
+
+**The three layers:**
+
+| Layer | What it does | When to skip |
+|---|---|---|
+| Provider JSON mode (`response_format: { type: "json_object" }`) | Constrains output to syntactically valid JSON | Never — free reliability |
+| Provider JSON schema (`response_format: { type: "json_schema", schema: {...} }`) | Constrains to a specific shape | If you need flexibility for ambiguous inputs |
+| Client Zod validation | Catches the rare violations + provides typed runtime data | Never — providers are not 100% reliable |
+
+**Why all three:** JSON mode prevents invalid JSON. Schema mode prevents wrong shape. Zod catches the edge cases providers miss + gives TypeScript inference. Each layer catches different failure modes.
+
+**Audia's pattern (from [src/lib/ai.ts](../src/lib/ai.ts)):**
+
+```ts
+const SummaryResponseSchema = z.object({
+    tooShort: z.boolean(),
+    bullets: z.array(z.string()).max(3),
+}).refine((d) => d.tooShort || d.bullets.length > 0);
+
+const res = await groq.chat.completions.create({
+    // ...
+    response_format: { type: "json_object" },
+});
+
+const parsed = SummaryResponseSchema.safeParse(JSON.parse(res.choices[0].message.content));
+if (!parsed.success) return null;
+// parsed.data is now typed
+```
+
+`response_format` is the provider lever. Zod is the safety net. Together they replace 95% of historical "prompt the model into JSON and hope" patterns.
+
+### 3.6 The five-part prompt audit
+
+When debugging a prompt that "almost works," walk this checklist:
+
+1. **Is the role clear?** Vague roles produce vague outputs.
+2. **Is the task narrowly scoped?** "Summarize this" is weaker than "Output 1–3 bullets covering decisions and action items."
+3. **Is the format explicitly specified?** A spec the model can pattern-match beats a description.
+4. **Are constraints listed as negatives?** "Do not add preamble. Do not wrap in code fences." Models obey negative constraints surprisingly well.
+5. **Is there at least one example?** Even one few-shot example often beats three more paragraphs of description.
+
+### 3.7 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **"Respond in JSON" without `response_format`.** The model will often produce JSON inside a markdown code fence (```json ... ```). Always pair the prompt instruction with the provider's JSON mode flag.
+- **Schema in prose, not as examples.** Models pattern-match from examples better than from descriptions. If you want `{"a": 1, "b": [2,3]}`, show that exact shape in an example.
+- **Trusting `system` to be unbreakable.** A determined `user` message can still override system instructions ("ignore previous instructions and..."). Phase 1.2 covers defenses.
+- **Adding CoT to tasks that don't need it.** CoT spends output tokens and adds latency. For simple lookups it actively hurts.
+- **Few-shot examples that don't match the real task.** Examples should look like the actual inputs you'll see in production, not toy data.
+- **Forgetting to bump `max_tokens` when switching to JSON.** JSON has 20–40% overhead from quotes/brackets/keys. A 250-token cap that worked for bullets may truncate JSON mid-array.
+
+### 3.8 Defense talking points for §3
+
+**🎯 Q: "How do you reliably get JSON out of an LLM?"**
+A: "Three layers. First, the prompt explicitly specifies the schema with at least one example of the exact shape. Second, the provider's structured output feature — for OpenAI/Groq that's `response_format: { type: 'json_object' }`, which constrains the decoder to valid JSON. Third, client-side schema validation with Zod or similar — providers are not 100% reliable and you want typed runtime data. JSON mode prevents syntax errors; the schema prompt + examples prevents shape errors; Zod is the safety net for edge cases."
+
+**🎯 Q: "What's the difference between zero-shot, few-shot, and chain-of-thought?"**
+A: "Zero-shot is instruction-only — you describe the task. Few-shot adds examples — the model learns the pattern from demonstrations. Chain-of-thought instructs the model to show reasoning before answering — each reasoning token gives the model more compute budget. Few-shot and CoT compose: you can have few-shot examples that include reasoning, called few-shot CoT. Modern reasoning models do CoT internally so you don't need to ask for it explicitly, but for chat models like Llama 3 or GPT-4o, both still help."
+
+**🎯 Q: "Walk me through Audia's summary prompt."**
+A: "It has five components. *Role*: 'You are a meeting summarizer.' *Task*: produce a JSON object with `tooShort` and `bullets`. *Format*: spec given as a schema with field-level descriptions. *Constraints*: 'no text outside JSON, no code fences' — negative constraints that block common failure modes. *Examples*: two few-shot examples, one normal and one too-short case, locking in both the output pattern and the edge case. The API call uses `response_format: { type: 'json_object' }` for syntactic JSON guarantee, and the response is parsed through a Zod schema for shape validation. If parsing fails, we return null and the UI shows the empty-state."
+
+---
+
+*(Sections 4–26 will be filled in as we progress through phases.)*
 
 ---
 
@@ -516,13 +645,18 @@ A: "Temperature — controls determinism, set per task (0.1–0.3 for structured
 - **Autoregressive** — a generation process where each output depends on previous outputs. Token n+1 is sampled from a distribution conditioned on tokens 1..n. All chat LLMs are autoregressive.
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
 - **BPE (Byte-Pair Encoding)** — sub-word tokenization algorithm that learns a vocabulary of byte sequences from a corpus by repeatedly merging the most frequent pair of adjacent symbols.
+- **Chain-of-thought (CoT)** — prompting technique where the model is instructed to show reasoning steps before the final answer. Each token is computation; reasoning tokens give the model more budget for hard problems.
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
 - **Context window** — the maximum number of tokens (input + output combined) the model can process in a single forward pass. Llama 3.1: 128k. Claude: 200k+.
 - **d_model** — the dimensionality of token embeddings throughout the network. Llama 3 8B: 4096.
 - **d_k** — the dimensionality of each attention head's key/query vectors. `d_model / num_heads`.
 - **Embedding** — a dense vector representation of a token (or text chunk in RAG contexts). Tokens with similar usage end up with geometrically nearby embeddings.
+- **Few-shot prompting** — including 3–5 input/output examples in the prompt before the real input. The model learns the pattern from demonstrations. Beats long descriptions for custom formats and edge cases.
+- **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
+- **JSON mode (`response_format: { type: "json_object" }`)** — provider feature that constrains the decoder to output syntactically valid JSON. Doesn't enforce shape; pair with client-side schema validation (Zod) for full coverage.
+- **JSON schema mode (`response_format: { type: "json_schema" }`)** — stronger provider feature that constrains output to a specific JSON shape, not just valid JSON. Less universally supported than basic JSON mode.
 - **KV cache** — at inference, the previously-computed Key and Value vectors are cached so generating each new token only requires one new attention computation rather than recomputing for the whole sequence.
 - **Logits** — the model's final-layer output before softmax. Unnormalized scores over the vocabulary.
 - **`max_tokens`** — output length cap. Counts only generated tokens, not input. Always set in production to bound cost.
@@ -530,7 +664,9 @@ A: "Temperature — controls determinism, set per task (0.1–0.3 for structured
 - **Multi-head attention** — running H parallel attention operations with different learned projections, then concatenating the outputs.
 - **Nucleus sampling (top-p)** — keep the smallest set of tokens whose cumulative probability exceeds p, sample from that. p=0.9 is common.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
+- **Prompt** — the input given to an LLM, comprising system, user, and (in conversations) assistant messages. Better framed as a *specification* than a string.
 - **Prompt caching** — provider feature where stable prompt prefixes are cached server-side, charging ~10× less for the cached portion on subsequent calls. Real production optimization.
+- **Prompt engineering** — the discipline of writing model instructions for reliable outputs. Reduces to a five-part audit: role, task, format, constraints, examples.
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
@@ -541,12 +677,15 @@ A: "Temperature — controls determinism, set per task (0.1–0.3 for structured
 - **Stop sequence** — string(s) which, when generated, halt the model. Provider-side mechanism. Use `["\nUser:", "\n\nHuman:"]` for chat to prevent the model from role-playing the user.
 - **Stop token** — a special token (e.g. `<|endoftext|>`) that the model emits when it judges generation complete. Different from a stop *sequence*.
 - **Streaming** — sending each generated token to the client as it's produced. Does not change cost or generation speed — only perceived latency.
+- **Structured output** — pattern of constraining LLM responses to a machine-readable shape (typically JSON). Three layers: provider JSON mode, provider schema mode, client validation (Zod).
 - **`stream_options.include_usage`** — flag required to receive token usage data in streamed responses. Without it, usage is omitted; with it, the final chunk carries a `usage` field.
 - **System message** — the role-tagged prompt segment containing instructions, persona, and constraints. Models are trained to weight system content as operator intent.
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
 - **Top-k sampling** — keep only the k highest-probability tokens, zero the rest, renormalize.
 - **Tokenization** — converting a text string into a sequence of integer token IDs using a fixed vocabulary.
 - **Usage object** — provider response field containing `{ prompt_tokens, completion_tokens, total_tokens }`. Source of truth for billing and instrumentation.
+- **Zero-shot prompting** — instruction-only prompt with no examples. Works well for tasks the model has seen abundantly in training.
+- **Zod** — TypeScript-first schema validation library. Used in Audia to validate structured LLM outputs at runtime and produce typed data. `safeParse` is the production-friendly API.
 
 ---
 
