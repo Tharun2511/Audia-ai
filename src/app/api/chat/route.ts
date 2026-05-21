@@ -1,8 +1,18 @@
+import type { ChatCompletionChunk, ChatCompletionCreateParamsStreaming } from "groq-sdk/resources/chat/completions";
 import { getDatabase } from "@/db/data-source";
 import { Chat } from "@/entity/Chat";
 import { groq } from "@/lib/ai";
 import { computeCost, logUsage } from "@/lib/ai-usage";
 import { getCurrentUser } from "@/lib/dal";
+
+// groq-sdk@1.1.2 omits stream_options on params and `usage` on chunks, but the
+// Groq API supports both (OpenAI-compatible) and emits usage in the final chunk.
+type StreamingCreateParamsWithUsage = ChatCompletionCreateParamsStreaming & {
+    stream_options?: { include_usage?: boolean };
+};
+type ChunkWithUsage = ChatCompletionChunk & {
+    usage?: { prompt_tokens: number; completion_tokens: number };
+};
 
 export async function POST(req: Request) {
     const user = await getCurrentUser();
@@ -21,16 +31,18 @@ export async function POST(req: Request) {
     const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
             try {
-                const aiStream = await groq.chat.completions.create({
+                const params: StreamingCreateParamsWithUsage = {
                     messages: [{ role: "user", content: prompt }],
                     model,
                     stream: true,
                     stream_options: { include_usage: true },
-                });
+                };
+                const aiStream = await groq.chat.completions.create(params);
 
                 let fullResponse = "";
                 let usage: { prompt_tokens: number; completion_tokens: number } | null = null;
-                for await (const chunk of aiStream) {
+                for await (const rawChunk of aiStream) {
+                    const chunk = rawChunk as ChunkWithUsage;
                     const text = chunk.choices[0]?.delta?.content ?? "";
                     if (text) {
                         fullResponse += text;
