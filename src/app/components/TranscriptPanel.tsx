@@ -39,6 +39,17 @@ interface Props {
     summary?: string | null;
     duration?: number;
     createdAt?: string;
+    /**
+     * Index of the segment currently being played. -1 = none. When >= 0 and
+     * onSegmentSeek is also defined, that segment is rendered with a highlight.
+     */
+    activeSegmentIndex?: number;
+    /**
+     * If provided, each segment becomes clickable and clicking calls this with
+     * the segment's start time (in seconds). Lifts the seek into the parent
+     * which owns the audio element.
+     */
+    onSegmentSeek?: (startSeconds: number) => void;
 }
 
 export default function TranscriptPanel({
@@ -50,6 +61,8 @@ export default function TranscriptPanel({
     summary,
     duration,
     createdAt,
+    activeSegmentIndex = -1,
+    onSegmentSeek,
 }: Props) {
     const uniqueSpeakers = [...new Set(segments.map((s) => s.speaker))];
     const colorMap = buildColorMap(uniqueSpeakers);
@@ -301,11 +314,33 @@ export default function TranscriptPanel({
                             {segments.map((seg, i) => (
                                 <Card
                                     key={i}
+                                    onClick={onSegmentSeek ? () => onSegmentSeek(seg.start) : undefined}
+                                    role={onSegmentSeek ? "button" : undefined}
+                                    tabIndex={onSegmentSeek ? 0 : undefined}
+                                    onKeyDown={onSegmentSeek ? (e) => {
+                                        if (e.key === "Enter" || e.key === " ") {
+                                            e.preventDefault();
+                                            onSegmentSeek(seg.start);
+                                        }
+                                    } : undefined}
                                     sx={{
                                         borderRadius: 1.5,
                                         borderLeftStyle: "solid",
-                                        borderLeftWidth: 3,
+                                        borderLeftWidth: i === activeSegmentIndex ? 4 : 3,
                                         borderLeftColor: colorMap[seg.speaker] ?? "text.disabled",
+                                        transition: "background-color 150ms, border-left-width 150ms",
+                                        ...(onSegmentSeek ? {
+                                            cursor: "pointer",
+                                            "&:hover": { bgcolor: "action.hover" },
+                                            "&:focus-visible": {
+                                                outline: "2px solid",
+                                                outlineColor: "primary.main",
+                                                outlineOffset: 2,
+                                            },
+                                        } : {}),
+                                        ...(i === activeSegmentIndex ? {
+                                            bgcolor: "action.selected",
+                                        } : {}),
                                     }}
                                 >
                                     <Box sx={{ px: 2, py: 1.5 }}>
@@ -323,8 +358,9 @@ export default function TranscriptPanel({
                                                     height: 18,
                                                     fontSize: 10,
                                                     fontFamily: "var(--font-geist-mono), monospace",
-                                                    color: "text.disabled",
+                                                    color: i === activeSegmentIndex ? "primary.main" : "text.disabled",
                                                     bgcolor: "action.hover",
+                                                    fontWeight: i === activeSegmentIndex ? 700 : 400,
                                                     "& .MuiChip-label": { px: 0.75 },
                                                 }}
                                             />

@@ -32,6 +32,7 @@ type HistoryRecord = {
     summary: string | null;
     duration: number;
     segments: TranscriptSegment[];
+    audioPathname: string | null;
     createdAt: string;
 };
 
@@ -430,6 +431,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 summary={selectedRecord.summary}
                 duration={selectedRecord.duration}
                 segments={selectedRecord.segments}
+                audioPathname={selectedRecord.audioPathname}
                 createdAt={selectedRecord.createdAt}
                 isJustCompleted={selectedRecord.id === justCompletedId}
                 onTitleSave={(t) => patchRecord(selectedRecord.id, { title: t })}

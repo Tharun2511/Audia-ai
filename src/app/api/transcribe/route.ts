@@ -2,6 +2,7 @@ import { getDatabase } from "@/db/data-source";
 import { Transcription } from "@/entity/Transcription";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { deepgram, summarizeTranscript } from "@/lib/ai";
+import { uploadAudio } from "@/lib/audio-storage";
 import { getCurrentUser } from "@/lib/dal";
 
 type DeepgramWord = {
@@ -68,12 +69,19 @@ export async function POST(req: Request) {
     const arrayBuffer = await audioFile.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    const result = await deepgram.listen.v1.media.transcribeFile(buffer, {
-        model: "nova-2",
-        diarize: true,
-        smart_format: true,
-        punctuate: true,
-    });
+    // Upload and transcribe in parallel: both consume the same buffer, neither
+    // depends on the other. This makes audio persistence essentially free in
+    // latency — the user already waits for Deepgram, and upload finishes in
+    // that same window.
+    const [audioPathname, result] = await Promise.all([
+        uploadAudio(buffer, audioFile.type || "audio/webm"),
+        deepgram.listen.v1.media.transcribeFile(buffer, {
+            model: "nova-2",
+            diarize: true,
+            smart_format: true,
+            punctuate: true,
+        }),
+    ]);
 
     const words = ((result as unknown as { results?: { channels?: { alternatives?: { words?: DeepgramWord[] }[] }[] } })?.results?.channels?.[0]?.alternatives?.[0]?.words ?? []) as DeepgramWord[];
     const segments = parseSegments(words);
@@ -83,8 +91,8 @@ export async function POST(req: Request) {
 
     const db = await getDatabase();
     const repo = db.getRepository(Transcription);
-    const record = repo.create({ duration, segments, userEmail: user.email, summary });
+    const record = repo.create({ duration, segments, userEmail: user.email, summary, audioPathname });
     await repo.save(record);
 
-    return Response.json({ id: record.id, segments, duration, summary });
+    return Response.json({ id: record.id, segments, duration, summary, audioPathname });
 }
