@@ -79,3 +79,25 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Three termination paths (clean close / error / abort) as distinct cases** — Q5 lumped error and abort together. They're different and `finally` exists because of the abort path specifically.
   - **Hedge phrasing in interviews** — Q4 said "a little complexity" which concedes the interviewer's premise. Senior counter: "actually less complex than buffering."
   - **Feynman attempt avoidance (fourth session running).** Asked me to model rather than attempt. The shape won't internalize without trying. Commit to attempting Session 3.1's Feynman *first*, even if bad — then I model after. This is the only fix.
+
+---
+
+**2026-05-23 · Phase 3.1 — Embeddings deep dive**
+- Covered: what an embedding is (learned vector representation of text), the geometry of meaning (position = topic, direction = attribute, distance = dissimilarity), three similarity metrics with full operational math (cosine = angle, dot = same as cosine when normalized, L2 = geometric distance), embedding model selection across providers (OpenAI 3-small/large, Gemini, Cohere v3, sentence-transformers, BGE) with MTEB as the comparison axis, "embed once query many" economics, why switching models means re-embedding the corpus.
+- Built: [src/lib/embeddings.ts](../src/lib/embeddings.ts) (initially text-embedding-004, patched to gemini-embedding-2 after deprecation 404, then patched again to move outputDimensionality to root after `config` body shape rejected), [src/lib/vector-math.ts](../src/lib/vector-math.ts) (dotProduct, norm, cosineSimilarity, l2Distance), [src/app/api/embed-demo/route.ts](../src/app/api/embed-demo/route.ts) — throwaway demo.
+- **Stuck (well-internalized):**
+  - **Cosine formula** — Q1 wrote it cold. Just missed the "why divide by norms" half.
+  - **The math equivalence at norm=1** — Q2 best answer of the session (9/10). Connected "norm=1 in demo" to "dot=cosine in demo" as the same fact.
+  - **Migration risk + cost intuition** — Q3 correctly raised cost/risk; correctly proposed sample-then-decide.
+  - **Dim ≠ quality rebuttal** — Q4 correctly pushed back on "more dim = better."
+  - **"Unrelated text scores ~0.3 not 0"** — Q5 correctly identified empirical range + correct practical threshold floor.
+  - **Feynman attempt finally happened** — first attempt in 5 sessions. Big meta-win even though execution was weak.
+- **Fuzzy (needs reinforcement):**
+  - **"Why divide by norms" in cosine** — Q1 missed; the answer is "normalize for magnitude so we isolate the angle (direction in meaning-space) from length."
+  - **MTEB by name** — Q4 didn't name it. The right reference for "model X vs Y" in interviews is MTEB.
+  - **Dual-column / dual-write migration pattern** — Q3 proposed sequential migration. Senior pattern is parallel embedding columns + shadow retrieval + flip read traffic, not "backup, replace, hope."
+  - **Cost math reflex** — Q3 said migrating 10k transcripts is "huge cost." Actual is ~$1.30 on OpenAI 3-large. Always calculate before claiming expense.
+  - **"Probability distribution" terminology slip in Q5** — embeddings produce real-valued vectors and cosine is a real-valued metric in [−1, +1], NOT a probability. Watch terminology in interviews.
+  - **Top-k + floor as production retrieval pattern** — Q5 mentioned threshold; senior pattern combines top-k with a similarity floor.
+  - **Feynman SHAPE** — analogy was wrong (memory ≠ embeddings), jargon slipped ("our embeddings"), no risk-removed close. Practice: brainstorm 3 analogies and reject the bad ones before writing; ban specific words upfront; end every Feynman with "without this..."
+- **Provider debugging real-world reps:** API hit two model changes in one session — text-embedding-004 deprecation (404 model not found) → gemini-embedding-2 (then `config` body shape rejected → outputDimensionality at root). Pattern reinforced: read the error body, patch one field, retry. Expected on first contact with any new provider API.

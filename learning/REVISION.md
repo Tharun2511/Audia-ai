@@ -18,7 +18,7 @@
 - [§5. Streaming patterns: SSE, ReadableStream, AbortController](#5-streaming-patterns-sse-readablestream-abortcontroller) ✅ *(Phase 2)*
 
 **Part III — Retrieval (RAG)**
-- §6. Embeddings: vector spaces, cosine, model choice *(Phase 3.1 — TBD)*
+- [§6. Embeddings: vector spaces, cosine, model choice](#6-embeddings-vector-spaces-cosine-model-choice) ✅ *(Phase 3.1)*
 - §7. Chunking strategies *(Phase 3.2 — TBD)*
 - §8. pgvector + indexing (IVFFlat vs HNSW) *(Phase 3.3 — TBD)*
 - §9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle *(Phase 4.1 — TBD)*
@@ -926,6 +926,152 @@ A: "SSE is HTTP chunked streaming with extra framing — `data: <payload>\n\n` p
 
 ---
 
+## §6. Embeddings: vector spaces, cosine, model choice
+
+### 6.1 What an embedding is
+
+**🎯 Embedding**
+
+> **Definition:** A dense, fixed-dimensional vector representation of text produced by a learned neural model, such that geometric closeness in the vector space approximates semantic closeness between inputs.
+
+A neural network trained on billions of text pairs maps any input string to a fixed-size array of floats — typically 384, 768, 1024, 1536, or 3072 dimensions.
+
+```ts
+embed("the cat sat on the mat")   →  [0.024, -0.117, ...]   // 768 floats
+embed("a feline rested on a rug") →  [0.021, -0.114, ...]   // very close vector
+embed("interest rates rose 2%")   →  [-0.083, 0.211, ...]   // far away vector
+```
+
+**The headline:** *the closeness of two vectors approximates the closeness of meaning between two texts.* That's the whole foundation of RAG. Same idea as the per-token embeddings from §1, but here the embedded unit is *a whole sentence or chunk*, not a single token.
+
+**Two non-negotiable properties:**
+
+1. **Embeddings are dense.** Every dimension is a meaningful float. The dimensions are not human-interpretable — the *geometry* matters, not any individual axis.
+2. **Model is fixed at query time.** Once you've embedded your corpus with model X, every future query must also use X. Different models produce vectors in *incompatible spaces*. Mixing them is a category error.
+
+### 6.2 The geometry of meaning
+
+Imagine the 768-dimensional space where every sentence lives at some specific point. The geometry encodes:
+
+- **Position = topic.** Sentences about cooking cluster together; sentences about finance cluster elsewhere.
+- **Directions = attributes.** The vector from `"king"` to `"queen"` is roughly the same as `"man"` to `"woman"`. Famous result: `king − man + woman ≈ queen`. Translations: `"Paris" − "France" + "Germany" ≈ "Berlin"`. The model encodes "gender" or "capital-of" as a *direction*, not a single dimension.
+- **Distance = dissimilarity.** Two sentences with different meanings are far apart.
+
+RAG retrieval (Phase 4) reduces to: **embed the user's question and find the chunks whose vectors are nearest to it in this space.** That's the entire retrieval mechanism.
+
+### 6.3 Similarity metrics — the math you'll write
+
+#### Cosine similarity (default for text)
+
+**🎯 Cosine similarity**
+
+> **Definition:** A similarity metric for vectors equal to the dot product divided by the product of the magnitudes — `cos(θ) = (A·B)/(‖A‖·‖B‖)`. Measures the angle between vectors, ignoring magnitude. Range: [−1, +1].
+
+```
+            A · B           Σᵢ aᵢbᵢ
+cos(θ) = ─────────── = ───────────────────────
+         ‖A‖ ‖B‖      √(Σᵢ aᵢ²) · √(Σᵢ bᵢ²)
+```
+
+1 = same direction, 0 = perpendicular, −1 = opposite. For modern text embedding models, real-world values cluster in **[0.2, 0.9]**.
+
+**Why cosine wins for text:** measures *angle*, ignoring magnitude. Sentence length affects vector magnitude in some models; cosine cancels that out. You're asking *"do these point in the same direction in meaning-space?"* — independent of length.
+
+#### Dot product (when vectors are unit-normalized)
+
+**🎯 Dot product**
+
+> **Definition:** The sum of element-wise products of two vectors of equal length: `A·B = Σᵢ aᵢbᵢ`. For unit-normalized vectors, dot product equals cosine similarity.
+
+```
+A · B = Σᵢ aᵢ · bᵢ
+```
+
+**If both vectors are unit-normalized (`‖A‖ = ‖B‖ = 1`), dot product equals cosine similarity** — same number, less computation. Modern embedding APIs (including Gemini's `text-embedding-004`) return pre-normalized vectors, so production code often uses dot product directly. Audia's [demo route](../src/app/api/embed-demo/route.ts) verifies this with `norm(v)` checks — every vector reports `1.0000` and `dot` equals `cosine` in the output.
+
+#### L2 (Euclidean) distance
+
+**🎯 L2 (Euclidean) distance**
+
+> **Definition:** Geometric distance between two vectors in n-dimensional space: `L2(A,B) = √(Σᵢ (aᵢ−bᵢ)²)`. Range: [0, +∞); 0 means identical vectors.
+
+```
+L2(A, B) = √(Σᵢ (aᵢ − bᵢ)²)
+```
+
+0 = identical, larger = more different. Inverse direction from cosine.
+
+**When to use L2:** vectors that AREN'T unit-normalized. For unit-normalized vectors, cosine and L2 produce the same *ranking* (they're monotonically related), so cosine is still the modern default.
+
+**Quick rule:** cosine for text, L2 for image / non-normalized vectors.
+
+### 6.4 Embedding model selection — the production decision
+
+| Provider / Model | Dim | Cost | Notes |
+|---|---|---|---|
+| **OpenAI `text-embedding-3-small`** | 1536 | $0.02/1M tokens | Industry default; high MTEB; **not free** |
+| **OpenAI `text-embedding-3-large`** | 3072 | $0.13/1M | Higher quality, 4× cost. Diminishing returns |
+| **Gemini `text-embedding-004`** | 768 | Free (rate-limited) | **Audia's pick.** Generous free tier, normalized output |
+| **Cohere `embed-v3`** | 1024 | $0.10/1M | Strong multilingual; task-specialized variants |
+| **sentence-transformers `all-MiniLM-L6-v2`** | 384 | Free (local) | Tiny, fast, lower quality |
+| **BGE / GTE** (HuggingFace) | 384–1024 | Free | Best open-weight; on MTEB top-20 |
+
+**Three decision axes:**
+
+1. **Dimensions.** Higher = more nuance, more storage cost. 768 is the modern sweet spot. 1536 if quality demands it; 384 for tight budgets. **Dim is NOT a linear quality indicator** — a well-trained 384-dim model beats a poorly-trained 3072-dim model.
+2. **Cost.** Embedding is mostly a *one-time* expense at ingest. Query embedding is per-search.
+3. **Quality.** Use [MTEB](https://huggingface.co/spaces/mteb/leaderboard) — ranks models on real retrieval/classification tasks. Don't pick by vibes.
+
+### 6.5 The economics — embed once, query many
+
+```
+Ingest:  for each chunk c in corpus:   v_c = embed(c.text)   ──→ store
+Query:   for each user question q:     v_q = embed(q.text)
+                                       retrieve top-k chunks by similarity(v_q, v_c)
+```
+
+**Corpus is embedded once.** Add doc = embed once. Query = embed once per question.
+
+**Implications:**
+- **Ingest cost amortizes.** $200 to embed 10M tokens on OpenAI, reused across millions of queries.
+- **Query embedding adds latency.** 50–200ms per question — budget for it in Phase 4.
+- **Switching embedding models = re-embedding the entire corpus.** Plan migrations carefully.
+
+This pattern is the cost model of every RAG system.
+
+### 6.6 What this means in Audia
+
+Today's commit adds [src/lib/embeddings.ts](../src/lib/embeddings.ts) (the `embed()` function calling Gemini's `text-embedding-004`), [src/lib/vector-math.ts](../src/lib/vector-math.ts) (dotProduct, norm, cosineSimilarity, l2Distance — the math you'll see in pgvector SQL by Phase 3.3), and a throwaway demo route at [src/app/api/embed-demo/route.ts](../src/app/api/embed-demo/route.ts). Running the demo shows pre-normalized vectors (all norm = 1.0), cosine equals dot product (because of normalization), and the geometry of meaning ranks semantically-related sentence pairs highest.
+
+This is the **foundation**. Phase 3.2 covers *how to split transcripts into chunks worth embedding*. Phase 3.3 stores vectors in pgvector on Neon. Phase 4 plugs retrieval into the chat endpoint, finally giving Audia the ability to answer "what did we decide about pricing?" using its actual transcripts instead of guessing.
+
+### 6.7 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **Mixing embedding models.** Vectors from different models live in incompatible spaces. Cosine similarity between them is meaningless. Pick one model per corpus and stick with it (or re-embed everything when changing).
+- **Not normalizing when you should.** Some models return un-normalized vectors. Dot product on un-normalized vectors is biased by magnitude, not angle — use cosine explicitly or normalize first.
+- **Embedding the wrong thing.** Embed semantically-meaningful chunks, not random splits. Phase 3.2 will hit this hard.
+- **Treating low similarity as "no match".** Modern embedding spaces are dense; "unrelated" still scores ~0.3. **Useful similarity range is roughly 0.3–0.95**, not 0–1. Set thresholds empirically per corpus, never absolute.
+- **Picking embedding model by dimension count.** Quality is multi-factorial — MTEB beats dim count.
+- **Re-embedding on every query unnecessarily.** Cache query embeddings if the same questions repeat; embed corpus *once* and persist.
+
+### 6.8 Defense talking points for §6
+
+**🎯 Q: "What's an embedding and how does it enable RAG?"**
+A: "An embedding is a learned vector representation — a neural network maps any input text to a fixed-size array of floats (typically 768 or 1536 dims), with the property that semantically similar texts produce nearby vectors in the space. RAG exploits this geometry: at ingest, chunk the corpus and embed each chunk, storing the vectors. At query time, embed the question and use a similarity metric — cosine for text, dot product if vectors are unit-normalized — to find the top-k nearest chunks. Those chunks become the context the LLM sees alongside the question. Embedding turns 'search by exact keyword match' into 'search by meaning.'"
+
+**🎯 Q: "Cosine vs dot product vs L2 — when do you use which?"**
+A: "Cosine measures angle, ignoring vector magnitude — universal default for text because sentence length shouldn't bias similarity. If vectors are unit-normalized (which modern APIs like Gemini's text-embedding-004 give you by default), dot product equals cosine and is faster to compute. L2 measures geometric distance; for unit-normalized vectors it produces the same ranking as cosine. Rule of thumb: cosine for text, L2 when working with non-normalized vectors like some image embeddings."
+
+**🎯 Q: "How would you pick an embedding model for production?"**
+A: "Three axes. Quality — I'd check MTEB rankings on the task type relevant to my corpus, since dim count isn't a linear quality signal. Cost — for a 10M-token corpus, OpenAI 3-small is ~$200 one-time, free options like Gemini's text-embedding-004 or open-weight BGE are zero. Operational — query latency, rate limits, provider stability. For Audia's learning context I went with Gemini for the free tier and 768-dim sweet spot. In production for English-only RAG I'd default to OpenAI text-embedding-3-small until cost forces a switch; for multilingual I'd use Cohere embed-v3 or multilingual-e5."
+
+**🎯 Q: "What happens if I change embedding models on an existing RAG system?"**
+A: "You re-embed the entire corpus, because vectors from different models live in incompatible spaces — cross-model cosine similarity is meaningless. This makes embedding-model selection strategic, not casual. Production pattern: version the storage layer (column per model version or separate tables), migrate during low-traffic windows, have a rollback plan."
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -938,6 +1084,7 @@ A: "SSE is HTTP chunked streaming with extra framing — `data: <payload>\n\n` p
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
 - **BPE (Byte-Pair Encoding)** — sub-word tokenization algorithm that learns a vocabulary of byte sequences from a corpus by repeatedly merging the most frequent pair of adjacent symbols.
 - **Chain-of-thought (CoT)** — prompting technique where the model is instructed to show reasoning steps before the final answer. Each token is computation; reasoning tokens give the model more budget for hard problems.
+- **Cosine similarity** — `(A·B) / (‖A‖·‖B‖)`. Measures angle between two vectors, ignoring magnitude. Range [−1, +1]. The default text-embedding similarity metric.
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
 - **Classifier prompt** — a cheap pre-screening LLM call that classifies user input as injection-attempt or benign before the main call runs. One of the higher-cost defense-in-depth layers.
 - **Content moderation API** — provider-side classifier (OpenAI's moderation, Anthropic's prompt-shield) that flags harmful or adversarial input. Imperfect coverage, but useful as one layer in a stack.
@@ -948,12 +1095,18 @@ A: "SSE is HTTP chunked streaming with extra framing — `data: <payload>\n\n` p
 - **Defense-in-depth** — security principle of layering multiple imperfect defenses so an attacker has to bypass all of them simultaneously. Standard approach for prompt injection.
 - **Delimiters (in prompts)** — explicit tags or fences wrapped around user content (e.g. `<user_input>...</user_input>`) so the model can clearly distinguish data from instructions. Cheap defense layer.
 - **Direct injection** — prompt injection where the attacker is the user themselves, typing malicious instructions directly into your app.
+- **Dot product** — `Σᵢ aᵢ·bᵢ`. For unit-normalized vectors equals cosine similarity; cheaper to compute. Default similarity metric when working with already-normalized embeddings.
+- **Embedding (sentence/text)** — learned vector representation of a piece of text. Geometric closeness in the vector space approximates semantic closeness. Foundation of RAG.
+- **Embedding dimensions (dim)** — the fixed length of vectors produced by an embedding model. Common: 384, 768, 1536, 3072. Higher is not linearly better; quality is multi-factorial.
 - **Embedding** — a dense vector representation of a token (or text chunk in RAG contexts). Tokens with similar usage end up with geometrically nearby embeddings.
 - **Few-shot prompting** — including 3–5 input/output examples in the prompt before the real input. The model learns the pattern from demonstrations. Beats long descriptions for custom formats and edge cases.
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
+- **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
+- **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
+- **Norm (vector norm, L2 norm, magnitude)** — `‖A‖ = √(Σᵢ aᵢ²)`. Length of the vector. Unit-normalized vectors have norm = 1.0.
 - **Jailbreak** — a prompt injection variant aimed at bypassing the model's safety training (roleplay tricks, DAN-style prompts).
 - **JSON mode (`response_format: { type: "json_object" }`)** — provider feature that constrains the decoder to output syntactically valid JSON. Doesn't enforce shape; pair with client-side schema validation (Zod) for full coverage.
 - **JSON schema mode (`response_format: { type: "json_schema" }`)** — stronger provider feature that constrains output to a specific JSON shape, not just valid JSON. Less universally supported than basic JSON mode.

@@ -12,6 +12,18 @@ Tharun is a JS fullstack dev growing into an AI engineer by progressively replac
 For every concept, work through this order — do not skip steps:
 
 1. **Theory first.** What problem does it solve? Intuition before formalism. Math only as deep as he needs to debug it later. If a concept has a famous failure mode (e.g. "lost in the middle"), name it and show why it happens.
+
+**For every new concept introduced — ADD a crisp definition, KEEP the rich content:**
+
+```
+**🎯 Concept name**
+
+> **Definition:** [Crisp, ~20-30 words, dictionary-style. Includes any defining formula inline. Recitable cold in 10 seconds.]
+
+[All the rich content — intuition prose, comparison tables, code examples, economics, math derivations, when-to-use trade-offs, common pitfalls, defense talking points. Keep all of this.]
+```
+
+The definition is what he says in the first 10 seconds of an interview answer; the rich content is what lets him defend it under follow-ups. **Add definitions where they're missing; never strip exposition to make room.** Memory-tracked in `feedback_definition_format.md`.
 2. **Trade-offs and alternatives.** Hosted vs local, framework vs primitives, provider A vs B. Recommend one with a one-line "why" — but list the others so he can override.
 3. **Wait for direction before coding.** He likes to pick the path. Once he picks, execute fully (auto mode).
 4. **Implement inside Audia.** Real edits to real files. Pgvector on the existing Neon DB beats spinning up Pinecone. Reuse [src/lib/ai.ts](src/lib/ai.ts), [src/entity/](src/entity/), [src/app/api/](src/app/api/).
