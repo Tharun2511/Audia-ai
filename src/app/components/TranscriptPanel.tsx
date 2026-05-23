@@ -18,8 +18,10 @@ import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CheckIcon from "@mui/icons-material/Check";
 import EditIcon from "@mui/icons-material/Edit";
+import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import FileDownloadOutlinedIcon from "@mui/icons-material/FileDownloadOutlined";
 import TextSnippetOutlinedIcon from "@mui/icons-material/TextSnippetOutlined";
+import IconButton from "@mui/material/IconButton";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import {
     downloadAsFile,
@@ -74,6 +76,64 @@ export default function TranscriptPanel({
     );
     const [saving, setSaving] = useState(false);
     const [downloadAnchor, setDownloadAnchor] = useState<HTMLElement | null>(null);
+
+    /*
+     * Per-segment text editing state. Only one segment can be in edit mode
+     * at a time — multiple in-progress edits would create ambiguous save
+     * semantics and a more complex commit flow.
+     *
+     *   editingIndex   index of the segment currently being edited; null = none
+     *   editingText    the draft text shown in the TextField
+     *   editingSaving  true while the PATCH is in flight
+     */
+    const [editingIndex, setEditingIndex] = useState<number | null>(null);
+    const [editingText, setEditingText] = useState("");
+    const [editingSaving, setEditingSaving] = useState(false);
+
+    const startEdit = (i: number) => {
+        setEditingIndex(i);
+        setEditingText(segments[i].text);
+    };
+
+    const cancelEdit = () => {
+        setEditingIndex(null);
+        setEditingText("");
+    };
+
+    const saveEdit = async () => {
+        if (editingIndex === null || !transcriptionId || !onSegmentsUpdate) return;
+        const trimmed = editingText.trim();
+        // If the user wiped the field and saved, treat as "no change" rather
+        // than persisting an empty segment — empty bubbles look broken.
+        if (trimmed.length === 0) {
+            cancelEdit();
+            return;
+        }
+        // No-op if text didn't change.
+        if (trimmed === segments[editingIndex].text) {
+            cancelEdit();
+            return;
+        }
+        setEditingSaving(true);
+        try {
+            const res = await fetch(`/api/transcriptions/${transcriptionId}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    segmentTextEdits: { [editingIndex]: trimmed },
+                }),
+            });
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            const { segments: updated } = await res.json();
+            onSegmentsUpdate(updated);
+            toast.success("Segment updated");
+            cancelEdit();
+        } catch {
+            toast.error("Couldn't save changes. Try again.");
+        } finally {
+            setEditingSaving(false);
+        }
+    };
 
     const handleSaveRenames = async () => {
         if (!transcriptionId || !onSegmentsUpdate) return;
@@ -311,16 +371,23 @@ export default function TranscriptPanel({
 
                         {/* Conversation bubbles */}
                         <Stack spacing={1.5}>
-                            {segments.map((seg, i) => (
+                            {segments.map((seg, i) => {
+                                const isEditing = editingIndex === i;
+                                const canEdit = Boolean(transcriptionId && onSegmentsUpdate);
+                                // While editing this segment, suppress the
+                                // card-level click-to-seek so the user doesn't
+                                // accidentally jump audio while typing.
+                                const cardSeekable = onSegmentSeek && !isEditing;
+                                return (
                                 <Card
                                     key={i}
-                                    onClick={onSegmentSeek ? () => onSegmentSeek(seg.start) : undefined}
-                                    role={onSegmentSeek ? "button" : undefined}
-                                    tabIndex={onSegmentSeek ? 0 : undefined}
-                                    onKeyDown={onSegmentSeek ? (e) => {
+                                    onClick={cardSeekable ? () => onSegmentSeek!(seg.start) : undefined}
+                                    role={cardSeekable ? "button" : undefined}
+                                    tabIndex={cardSeekable ? 0 : undefined}
+                                    onKeyDown={cardSeekable ? (e) => {
                                         if (e.key === "Enter" || e.key === " ") {
                                             e.preventDefault();
-                                            onSegmentSeek(seg.start);
+                                            onSegmentSeek!(seg.start);
                                         }
                                     } : undefined}
                                     sx={{
@@ -329,7 +396,7 @@ export default function TranscriptPanel({
                                         borderLeftWidth: i === activeSegmentIndex ? 4 : 3,
                                         borderLeftColor: colorMap[seg.speaker] ?? "text.disabled",
                                         transition: "background-color 150ms, border-left-width 150ms",
-                                        ...(onSegmentSeek ? {
+                                        ...(cardSeekable ? {
                                             cursor: "pointer",
                                             "&:hover": { bgcolor: "action.hover" },
                                             "&:focus-visible": {
@@ -338,39 +405,117 @@ export default function TranscriptPanel({
                                                 outlineOffset: 2,
                                             },
                                         } : {}),
-                                        ...(i === activeSegmentIndex ? {
+                                        ...(i === activeSegmentIndex && !isEditing ? {
                                             bgcolor: "action.selected",
                                         } : {}),
                                     }}
                                 >
                                     <Box sx={{ px: 2, py: 1.5 }}>
-                                        <Stack direction="row" spacing={1.25} sx={{ alignItems: "center", mb: 0.75 }}>
-                                            <Typography
-                                                variant="caption"
-                                                sx={{ fontWeight: 700, color: colorMap[seg.speaker] ?? "text.secondary" }}
-                                            >
-                                                {seg.speaker}
-                                            </Typography>
-                                            <Chip
-                                                label={formatDuration(seg.start)}
-                                                size="small"
-                                                sx={{
-                                                    height: 18,
-                                                    fontSize: 10,
-                                                    fontFamily: "var(--font-geist-mono), monospace",
-                                                    color: i === activeSegmentIndex ? "primary.main" : "text.disabled",
-                                                    bgcolor: "action.hover",
-                                                    fontWeight: i === activeSegmentIndex ? 700 : 400,
-                                                    "& .MuiChip-label": { px: 0.75 },
-                                                }}
-                                            />
+                                        <Stack
+                                            direction="row"
+                                            sx={{ alignItems: "center", justifyContent: "space-between", mb: 0.75 }}
+                                        >
+                                            <Stack direction="row" spacing={1.25} sx={{ alignItems: "center" }}>
+                                                <Typography
+                                                    variant="caption"
+                                                    sx={{ fontWeight: 700, color: colorMap[seg.speaker] ?? "text.secondary" }}
+                                                >
+                                                    {seg.speaker}
+                                                </Typography>
+                                                <Chip
+                                                    label={formatDuration(seg.start)}
+                                                    size="small"
+                                                    sx={{
+                                                        height: 18,
+                                                        fontSize: 10,
+                                                        fontFamily: "var(--font-geist-mono), monospace",
+                                                        color: i === activeSegmentIndex ? "primary.main" : "text.disabled",
+                                                        bgcolor: "action.hover",
+                                                        fontWeight: i === activeSegmentIndex ? 700 : 400,
+                                                        "& .MuiChip-label": { px: 0.75 },
+                                                    }}
+                                                />
+                                            </Stack>
+                                            {/*
+                                             * Edit affordance — subtle by default (low opacity), brightens
+                                             * on row-hover for desktop discoverability; always visible on
+                                             * touch via `@media (hover: none)`. stopPropagation prevents
+                                             * the card's seek handler from firing on click.
+                                             */}
+                                            {canEdit && !isEditing && (
+                                                <IconButton
+                                                    onClick={(e) => { e.stopPropagation(); startEdit(i); }}
+                                                    size="small"
+                                                    aria-label="Edit segment text"
+                                                    sx={{
+                                                        color: "text.disabled",
+                                                        opacity: 0.35,
+                                                        transition: "opacity 150ms, color 150ms",
+                                                        ".MuiCard-root:hover &": { opacity: 1 },
+                                                        "@media (hover: none)": { opacity: 1 },
+                                                        "&:hover": { color: "primary.main" },
+                                                    }}
+                                                >
+                                                    <EditOutlinedIcon sx={{ fontSize: 14 }} />
+                                                </IconButton>
+                                            )}
                                         </Stack>
-                                        <Typography variant="body2" sx={{ color: "text.primary", lineHeight: 1.65 }}>
-                                            {seg.text}
-                                        </Typography>
+                                        {isEditing ? (
+                                            <Stack spacing={1} onClick={(e) => e.stopPropagation()}>
+                                                <TextField
+                                                    value={editingText}
+                                                    onChange={(e) => setEditingText(e.target.value)}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === "Escape") {
+                                                            e.preventDefault();
+                                                            cancelEdit();
+                                                        } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                                                            e.preventDefault();
+                                                            saveEdit();
+                                                        }
+                                                    }}
+                                                    autoFocus
+                                                    multiline
+                                                    minRows={2}
+                                                    fullWidth
+                                                    size="small"
+                                                    disabled={editingSaving}
+                                                />
+                                                <Stack direction="row" spacing={1}>
+                                                    <Button
+                                                        onClick={saveEdit}
+                                                        disabled={editingSaving}
+                                                        variant="contained"
+                                                        size="small"
+                                                        startIcon={editingSaving ? <CircularProgress size={12} sx={{ color: "inherit" }} /> : null}
+                                                    >
+                                                        {editingSaving ? "Saving…" : "Save"}
+                                                    </Button>
+                                                    <Button
+                                                        onClick={cancelEdit}
+                                                        disabled={editingSaving}
+                                                        size="small"
+                                                        sx={{ color: "text.secondary" }}
+                                                    >
+                                                        Cancel
+                                                    </Button>
+                                                    <Typography
+                                                        variant="caption"
+                                                        sx={{ color: "text.disabled", alignSelf: "center", fontSize: 10 }}
+                                                    >
+                                                        ⌘+Enter to save · Esc to cancel
+                                                    </Typography>
+                                                </Stack>
+                                            </Stack>
+                                        ) : (
+                                            <Typography variant="body2" sx={{ color: "text.primary", lineHeight: 1.65 }}>
+                                                {seg.text}
+                                            </Typography>
+                                        )}
                                     </Box>
                                 </Card>
-                            ))}
+                                );
+                            })}
                         </Stack>
                     </>
                 )}
