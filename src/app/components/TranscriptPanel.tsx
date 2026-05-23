@@ -79,6 +79,8 @@ export default function TranscriptPanel({
             const { segments: updated } = await res.json();
             onSegmentsUpdate(updated);
             setShowRenamer(false);
+            const renamedCount = Object.keys(speakerMap).length;
+            toast.success(renamedCount === 1 ? "Speaker renamed" : `${renamedCount} speakers renamed`);
         } catch {
             toast.error("Couldn't rename speakers. Try again.");
         } finally {

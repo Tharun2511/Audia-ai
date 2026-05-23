@@ -102,6 +102,68 @@ export default function HomeClient({ userEmail, userName }: Props) {
     }, [history, searchQuery]);
     const isFiltering = searchQuery.trim().length > 0;
 
+    /* ---------- Delete with Undo ----------
+     * Optimistic remove + 5s window to undo before the server-side delete
+     * actually fires. If the user navigates away in the window, we flush
+     * pending deletes so the UI on next visit isn't out of sync with the DB.
+     */
+    const pendingDeletesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+    const sortByDateDesc = useCallback((records: HistoryRecord[]): HistoryRecord[] => {
+        return [...records].sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+    }, []);
+
+    const requestDelete = useCallback((id: string) => {
+        const record = history.find((r) => r.id === id);
+        if (!record) return;
+
+        setHistory((prev) => prev.filter((r) => r.id !== id));
+        if (selectedId === id) setSelectedId(null);
+
+        const commit = async () => {
+            pendingDeletesRef.current.delete(id);
+            try {
+                const res = await fetch(`/api/transcriptions/${id}`, { method: "DELETE" });
+                if (!res.ok) throw new Error();
+            } catch {
+                setHistory((prev) => sortByDateDesc([record, ...prev]));
+                toast.error(`Couldn't delete "${record.title ?? "Untitled session"}".`);
+            }
+        };
+
+        const timer = setTimeout(commit, 5000);
+        pendingDeletesRef.current.set(id, timer);
+
+        toast.success(`Deleted "${record.title ?? "Untitled session"}"`, {
+            duration: 5000,
+            action: {
+                label: "Undo",
+                onClick: () => {
+                    const t = pendingDeletesRef.current.get(id);
+                    if (!t) return; // Already committed — no-op
+                    clearTimeout(t);
+                    pendingDeletesRef.current.delete(id);
+                    setHistory((prev) => sortByDateDesc([record, ...prev]));
+                },
+            },
+        });
+    }, [history, selectedId, sortByDateDesc]);
+
+    useEffect(() => {
+        const pending = pendingDeletesRef.current;
+        return () => {
+            // On unmount (logout, route change), flush pending deletes so the
+            // server eventually matches what the user saw on screen.
+            pending.forEach((timer, id) => {
+                clearTimeout(timer);
+                fetch(`/api/transcriptions/${id}`, { method: "DELETE" }).catch(() => { });
+            });
+            pending.clear();
+        };
+    }, []);
+
     const patchRecord = useCallback((id: string, patch: Partial<HistoryRecord>) => {
         setHistory((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
     }, []);
@@ -337,10 +399,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
                                 record={record}
                                 selected={record.id === selectedId}
                                 onSelect={(id) => { setSelectedId(id); setDrawerOpen(false); }}
-                                onDelete={(id) => {
-                                    setHistory((prev) => prev.filter((r) => r.id !== id));
-                                    if (selectedId === id) setSelectedId(null);
-                                }}
+                                onDelete={requestDelete}
                             />
                         ))}
                     </List>

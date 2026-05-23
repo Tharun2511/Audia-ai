@@ -1,6 +1,4 @@
 "use client";
-import { useState } from "react";
-import { toast } from "sonner";
 import Box from "@mui/material/Box";
 import IconButton from "@mui/material/IconButton";
 import ListItemButton from "@mui/material/ListItemButton";
@@ -39,21 +37,12 @@ function relativeTime(iso: string): string {
 }
 
 export default function SessionListItem({ record, selected, onSelect, onDelete }: Props) {
-    const [deleting, setDeleting] = useState(false);
     const speakers = [...new Set(record.segments.map((s) => s.speaker))];
     const colorMap = buildColorMap(speakers);
 
-    const handleDelete = async (e: React.MouseEvent) => {
+    const handleDelete = (e: React.MouseEvent) => {
         e.stopPropagation();
-        setDeleting(true);
-        try {
-            const res = await fetch(`/api/transcriptions/${record.id}`, { method: "DELETE" });
-            if (!res.ok) throw new Error(`Server returned ${res.status}`);
-            onDelete(record.id);
-        } catch {
-            toast.error("Couldn't delete this transcript. Try again.");
-            setDeleting(false);
-        }
+        onDelete(record.id);
     };
 
     return (
@@ -114,13 +103,15 @@ export default function SessionListItem({ record, selected, onSelect, onDelete }
                 <span>
                     <IconButton
                         onClick={handleDelete}
-                        disabled={deleting}
                         size="small"
                         sx={{
                             color: "text.disabled",
                             opacity: 0,
                             transition: "opacity 150ms",
                             ".MuiListItemButton-root:hover &": { opacity: 1 },
+                            // Touch devices have no hover state — keep the delete
+                            // button visible so it's actually reachable on mobile.
+                            "@media (hover: none)": { opacity: 1 },
                             "&:hover": { color: "error.main", bgcolor: "rgba(239,68,68,0.08)" },
                         }}
                         aria-label="Delete transcript"
