@@ -11,6 +11,7 @@ import Typography from "@mui/material/Typography";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutlined";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SendIcon from "@mui/icons-material/Send";
+import StopIcon from "@mui/icons-material/Stop";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { formatDuration } from "./utils";
 
@@ -45,6 +46,11 @@ export default function ChatPanel({ segments }: Props) {
     const [loading, setLoading] = useState(false);
     const bottomRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
+    const abortControllerRef = useRef<AbortController | null>(null);
+
+    const stop = () => {
+        abortControllerRef.current?.abort();
+    };
 
     useEffect(() => {
         if (messages.length > 0) {
@@ -68,9 +74,13 @@ export default function ChatPanel({ segments }: Props) {
         ]);
         setLoading(true);
 
+        const ctrl = new AbortController();
+        abortControllerRef.current = ctrl;
+
         try {
             const res = await fetch("/api/chat", {
                 method: "POST",
+                signal: ctrl.signal,
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ prompt: buildPrompt(segments, question) }),
             });
@@ -90,15 +100,20 @@ export default function ChatPanel({ segments }: Props) {
                     prev.map((m, i) => (i === prev.length - 1 ? { ...m, content: snap } : m))
                 );
             }
-        } catch {
-            setMessages((prev) =>
-                prev.map((m, i) =>
-                    i === prev.length - 1
-                        ? { ...m, content: "Something went wrong. Please try again.", streaming: false }
-                        : m
-                )
-            );
+        } catch (err) {
+            const wasAborted = err instanceof Error && err.name === "AbortError";
+            if (!wasAborted) {
+                setMessages((prev) =>
+                    prev.map((m, i) =>
+                        i === prev.length - 1
+                            ? { ...m, content: "Something went wrong. Please try again.", streaming: false }
+                            : m
+                    )
+                );
+            }
+            // On abort, leave the partial content as-is — the user stopped on purpose.
         } finally {
+            abortControllerRef.current = null;
             setMessages((prev) =>
                 prev.map((m, i) => (i === prev.length - 1 ? { ...m, streaming: false } : m))
             );
@@ -276,29 +291,45 @@ export default function ChatPanel({ segments }: Props) {
                                     send(input);
                                 }
                             }}
-                            placeholder={noTranscript ? "Record or upload a session first…" : "Ask anything about this transcript…"}
-                            disabled={loading || noTranscript}
+                            placeholder={noTranscript ? "Record or upload a session first…" : loading ? "Streaming response… press stop or wait" : "Ask anything about this transcript…"}
+                            disabled={noTranscript}
                             size="small"
                             fullWidth
                             slotProps={{
                                 input: {
                                     endAdornment: (
                                         <InputAdornment position="end">
-                                            <IconButton
-                                                onClick={() => send(input)}
-                                                disabled={!input.trim() || loading || noTranscript}
-                                                size="small"
-                                                edge="end"
-                                                sx={{
-                                                    bgcolor: "info.main",
-                                                    color: "info.contrastText",
-                                                    "&:hover": { bgcolor: "info.dark" },
-                                                    "&.Mui-disabled": { bgcolor: "action.disabledBackground", color: "action.disabled" },
-                                                }}
-                                                aria-label="Send"
-                                            >
-                                                <SendIcon sx={{ fontSize: 16 }} />
-                                            </IconButton>
+                                            {loading ? (
+                                                <IconButton
+                                                    onClick={stop}
+                                                    size="small"
+                                                    edge="end"
+                                                    sx={{
+                                                        bgcolor: "error.main",
+                                                        color: "error.contrastText",
+                                                        "&:hover": { bgcolor: "error.dark" },
+                                                    }}
+                                                    aria-label="Stop"
+                                                >
+                                                    <StopIcon sx={{ fontSize: 16 }} />
+                                                </IconButton>
+                                            ) : (
+                                                <IconButton
+                                                    onClick={() => send(input)}
+                                                    disabled={!input.trim() || noTranscript}
+                                                    size="small"
+                                                    edge="end"
+                                                    sx={{
+                                                        bgcolor: "info.main",
+                                                        color: "info.contrastText",
+                                                        "&:hover": { bgcolor: "info.dark" },
+                                                        "&.Mui-disabled": { bgcolor: "action.disabledBackground", color: "action.disabled" },
+                                                    }}
+                                                    aria-label="Send"
+                                                >
+                                                    <SendIcon sx={{ fontSize: 16 }} />
+                                                </IconButton>
+                                            )}
                                         </InputAdornment>
                                     ),
                                 },

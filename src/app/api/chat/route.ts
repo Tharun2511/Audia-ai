@@ -43,26 +43,35 @@ export async function POST(req: Request) {
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
-            try {
-                const params: StreamingCreateParamsWithUsage = {
-                    messages: [
-                        { role: "system", content: CHAT_SYSTEM_PROMPT },
-                        { role: "user", content: `<user_input>\n${prompt}\n</user_input>` },
-                    ],
-                    model,
-                    stream: true,
-                    stream_options: { include_usage: true },
-                };
-                const aiStream = await groq.chat.completions.create(params);
+            const params: StreamingCreateParamsWithUsage = {
+                messages: [
+                    { role: "system", content: CHAT_SYSTEM_PROMPT },
+                    { role: "user", content: `<user_input>\n${prompt}\n</user_input>` },
+                ],
+                model,
+                stream: true,
+                stream_options: { include_usage: true },
+            };
 
-                let fullResponse = "";
-                let usage: { prompt_tokens: number; completion_tokens: number } | null = null;
+            let fullResponse = "";
+            let usage: { prompt_tokens: number; completion_tokens: number } | null = null;
+            let streamErr: unknown = null;
+
+            try {
+                const aiStream = await groq.chat.completions.create(params, { signal: req.signal });
+
                 for await (const rawChunk of aiStream) {
+                    if (req.signal.aborted) break;
                     const chunk = rawChunk as ChunkWithUsage;
                     const text = chunk.choices[0]?.delta?.content ?? "";
                     if (text) {
                         fullResponse += text;
-                        controller.enqueue(encoder.encode(text));
+                        try {
+                            controller.enqueue(encoder.encode(text));
+                        } catch {
+                            // controller closed (client disconnected) — stop reading upstream
+                            break;
+                        }
                     }
                     if (chunk.usage) {
                         usage = {
@@ -71,13 +80,25 @@ export async function POST(req: Request) {
                         };
                     }
                 }
-
-                chatRecord.response = fullResponse;
-                await chatRepo.save(chatRecord);
+            } catch (err) {
+                if (!(err instanceof Error && err.name === "AbortError") && !req.signal.aborted) {
+                    streamErr = err;
+                    console.warn("[chat] stream error", err);
+                }
+            } finally {
+                // Always persist whatever we accumulated — full response on clean close,
+                // partial response on abort or error. Wrap in try so failure here doesn't
+                // mask the stream's own error.
+                try {
+                    chatRecord.response = fullResponse;
+                    await chatRepo.save(chatRecord);
+                } catch (saveErr) {
+                    console.warn("[chat] failed to persist response", saveErr);
+                }
 
                 if (usage) {
                     logUsage({
-                        label: "chat",
+                        label: req.signal.aborted ? "chat-aborted" : "chat",
                         model,
                         promptTokens: usage.prompt_tokens,
                         completionTokens: usage.completion_tokens,
@@ -85,11 +106,13 @@ export async function POST(req: Request) {
                         cost: computeCost(model, usage.prompt_tokens, usage.completion_tokens),
                     });
                 }
-            } catch (err) {
-                controller.error(err);
-                return;
+
+                if (streamErr) {
+                    try { controller.error(streamErr); } catch {}
+                } else {
+                    try { controller.close(); } catch {}
+                }
             }
-            controller.close();
         },
     });
 
