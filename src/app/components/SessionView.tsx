@@ -88,6 +88,55 @@ export default function SessionView({
         return () => { cancelled = true; };
     }, [audioPathname, fetchSignedUrl]);
 
+    /*
+     * Global keyboard shortcuts — wired only when audio is actually loaded.
+     *
+     *   Space        play / pause
+     *   ArrowLeft    seek -5s
+     *   ArrowRight   seek +5s
+     *
+     * The "isInteractiveTarget" check is the critical safety: ignore keys
+     * when the user is typing in any input, textarea, button, link, or
+     * contenteditable. Without this, pressing Space in the chat input would
+     * pause audio mid-typing. BUTTON is included so focused buttons handle
+     * their own Space natively (avoids double-toggle on the play button).
+     */
+    useEffect(() => {
+        if (!signedAudioUrl) return;
+
+        const isInteractiveTarget = (target: EventTarget | null): boolean => {
+            if (!(target instanceof HTMLElement)) return false;
+            const tag = target.tagName;
+            return (
+                tag === "INPUT" ||
+                tag === "TEXTAREA" ||
+                tag === "BUTTON" ||
+                tag === "A" ||
+                target.isContentEditable
+            );
+        };
+
+        const handler = (e: KeyboardEvent) => {
+            if (isInteractiveTarget(e.target)) return;
+            const audio = audioRef.current;
+            if (!audio) return;
+
+            if (e.code === "Space") {
+                e.preventDefault();
+                if (audio.paused) audio.play().catch(() => { });
+                else audio.pause();
+            } else if (e.key === "ArrowLeft") {
+                e.preventDefault();
+                audio.currentTime = Math.max(0, audio.currentTime - 5);
+            } else if (e.key === "ArrowRight") {
+                e.preventDefault();
+                audio.currentTime = Math.min(duration, audio.currentTime + 5);
+            }
+        };
+        window.addEventListener("keydown", handler);
+        return () => window.removeEventListener("keydown", handler);
+    }, [signedAudioUrl, duration]);
+
     // Recomputes ~4x/sec while audio plays, but the rendered child only
     // re-renders when the *index* changes (typically once per segment), not on
     // every timeupdate tick.
