@@ -20,6 +20,7 @@ import { logout } from "@/app/actions/auth";
 import { BrandLogo } from "./components/BrandLogo";
 import SessionListItem from "./components/SessionListItem";
 import SessionView from "./components/SessionView";
+import SidebarSearch from "./components/SidebarSearch";
 import ThemeToggle from "./components/ThemeToggle";
 import { ReadyState, RecordingState, ProcessingState } from "./components/MainPaneStates";
 
@@ -51,6 +52,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [justCompletedId, setJustCompletedId] = useState<string | null>(null);
     const [drawerOpen, setDrawerOpen] = useState(false);
+    const [searchQuery, setSearchQuery] = useState("");
 
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const chunksRef = useRef<Blob[]>([]);
@@ -83,6 +85,22 @@ export default function HomeClient({ userEmail, userName }: Props) {
         () => history.find((r) => r.id === selectedId) ?? null,
         [history, selectedId]
     );
+
+    /* ---------- Search ---------- */
+    const filteredHistory = useMemo(() => {
+        const q = searchQuery.trim().toLowerCase();
+        if (!q) return history;
+        return history.filter((r) => {
+            if (r.title?.toLowerCase().includes(q)) return true;
+            if (r.summary?.toLowerCase().includes(q)) return true;
+            return r.segments.some(
+                (s) =>
+                    s.speaker.toLowerCase().includes(q) ||
+                    s.text.toLowerCase().includes(q)
+            );
+        });
+    }, [history, searchQuery]);
+    const isFiltering = searchQuery.trim().length > 0;
 
     const patchRecord = useCallback((id: string, patch: Partial<HistoryRecord>) => {
         setHistory((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
@@ -278,10 +296,15 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 </Typography>
                 {historyLoaded && (
                     <Typography variant="caption" sx={{ fontSize: 10, color: "text.disabled" }}>
-                        {history.length}
+                        {isFiltering ? `${filteredHistory.length} of ${history.length}` : history.length}
                     </Typography>
                 )}
             </Stack>
+            {historyLoaded && history.length > 0 && (
+                <Box sx={{ px: 1.5, pb: 1, flexShrink: 0 }}>
+                    <SidebarSearch value={searchQuery} onChange={setSearchQuery} />
+                </Box>
+            )}
             <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", px: 1.5, pb: 2 }}>
                 {historyLoading && history.length === 0 ? (
                     <Stack sx={{ alignItems: "center", py: 4 }}>
@@ -297,9 +320,18 @@ export default function HomeClient({ userEmail, userName }: Props) {
                             No sessions yet.
                         </Typography>
                     </Box>
+                ) : filteredHistory.length === 0 ? (
+                    <Stack spacing={1.25} sx={{ px: 1, py: 3, alignItems: "center", textAlign: "center" }}>
+                        <Typography variant="caption" sx={{ color: "text.disabled" }}>
+                            No sessions match &ldquo;{searchQuery.trim()}&rdquo;
+                        </Typography>
+                        <Button onClick={() => setSearchQuery("")} size="small" variant="text" sx={{ fontSize: 11, minHeight: 0, py: 0.5 }}>
+                            Clear search
+                        </Button>
+                    </Stack>
                 ) : (
                     <List disablePadding sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
-                        {history.map((record) => (
+                        {filteredHistory.map((record) => (
                             <SessionListItem
                                 key={record.id}
                                 record={record}
