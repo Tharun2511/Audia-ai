@@ -63,3 +63,19 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Structural "zero vs one layer" framing.** Q5 — answered "user-facing" (directionally right but secondary). The senior insight: chat pre-1.2 had ZERO layers (no system prompt at all), summarizer had ONE — gap from 0→1 is structurally larger than 1→2.
   - **Inventing statistics.** Q4 — said "90-95% of attacks can be prevented" — fabricated number. Use qualitative framing in interviews: *"raises cost of attack significantly"* not made-up percentages.
   - **Feynman SHAPE — third session, still didn't apply organically.** Asked me to model it again. Pattern: analogy → what changed in plain language → risk removed. For Session 2, drill: brainstorm 3 candidate analogies first; pick the one where translation feels natural, not forced.
+
+---
+
+**2026-05-23 · Phase 2.1 — Streaming UX: cancellation, partial-save, lifecycle**
+- Covered: full 7-step streaming lifecycle (request → connect → upstream call → TTFT → loop → close OR abort), protocol comparison (SSE / ReadableStream / WebSockets / Vercel AI SDK and when each), `AbortController` deep dive (signal propagation, AbortError differentiation, already-aborted behavior), the "abort as first-class control flow" pattern, partial-state persistence in `finally`, forwarding cancellation upstream to stop the token meter, the stop-button UX convention, micro-patterns (typing indicator, streaming cursor, unblocked input, optimistic empty message, auto-scroll).
+- Built: server-side restructure of [chat/route.ts](../src/app/api/chat/route.ts) with try/catch/finally, `req.signal` forwarded to Groq SDK, `controller.enqueue` race-protected, AbortError filtering, `chat-aborted` log label for observability. Client-side [ChatPanel.tsx](../src/app/components/ChatPanel.tsx): `abortControllerRef`, `stop()` function, conditional Send/Stop button render with destructive red, AbortError differentiation (leave partial content visible), unblocked TextField during streaming.
+- **Stuck (well-internalized):**
+  - **TTFT terminology graduated to active recall** — used "time to first token" naturally in Q4 (was on fuzzy list from 0.2 and Q1 today). Compounds matter.
+  - **"What we're NOT doing" framing** — Q3 used this structure unprompted; matches the senior pattern called out in the protocols deep-dive.
+  - **Diagnostic methodology (check client first, then server)** — Q2 used systematic localization. Good debugging instinct.
+- **Fuzzy (needs reinforcement):**
+  - **Step 7 of the streaming lifecycle (clean close OR abort)** — Q1, omitted the load-bearing termination branch. This is the whole point of the session. Drill: the lifecycle has SEVEN steps; the 7th is the load-bearing one.
+  - **Forwarding `signal: req.signal` as the specific line** — Q2 had right diagnosis but didn't name the specific line of code. Practice "narrow to the line, not just the layer."
+  - **Three termination paths (clean close / error / abort) as distinct cases** — Q5 lumped error and abort together. They're different and `finally` exists because of the abort path specifically.
+  - **Hedge phrasing in interviews** — Q4 said "a little complexity" which concedes the interviewer's premise. Senior counter: "actually less complex than buffering."
+  - **Feynman attempt avoidance (fourth session running).** Asked me to model rather than attempt. The shape won't internalize without trying. Commit to attempting Session 3.1's Feynman *first*, even if bad — then I model after. This is the only fix.

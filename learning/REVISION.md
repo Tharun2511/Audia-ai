@@ -15,7 +15,7 @@
 - [§4. Prompt injection & output safety](#4-prompt-injection--output-safety) ✅ *(Phase 1.2)*
 
 **Part II — Real-time UX**
-- §5. Streaming patterns: SSE, ReadableStream, AbortController *(Phase 2 — TBD)*
+- [§5. Streaming patterns: SSE, ReadableStream, AbortController](#5-streaming-patterns-sse-readablestream-abortcontroller) ✅ *(Phase 2)*
 
 **Part III — Retrieval (RAG)**
 - §6. Embeddings: vector spaces, cosine, model choice *(Phase 3.1 — TBD)*
@@ -767,7 +767,162 @@ A: "Before today, the chat endpoint had zero defenses — user prompt went direc
 
 ---
 
-*(Sections 5–26 will be filled in as we progress through phases.)*
+## §5. Streaming patterns: SSE, ReadableStream, AbortController
+
+### 5.1 The mental model
+
+Streaming is not a feature bolted on top of LLMs — it's a direct expression of how they work (autoregressive, one token at a time, see §1). The engineering question is **how do we deliver that token-by-token output to the client without buffering, while handling the full lifecycle including cancellation and errors gracefully?**
+
+The full request lifecycle, beat by beat:
+
+```
+[1] Client creates AbortController, fetch() sent
+[2] Server receives, allocates ReadableStream
+[3] Server initiates upstream call (Groq) with abort signal forwarded
+[4] Groq starts producing tokens
+[5] First chunk arrives at server → enqueued → reaches client (TTFT)
+[6] Loop: chunks arrive, server enqueues, client reads, UI re-renders
+[7] Either: clean close (model emitted stop token) OR abort (client cancelled, network died)
+```
+
+**The whole architecture pivots on [7].** Naive implementations handle the clean-close path and silently lose data on abort. Production code treats abort as **first-class control flow**, not an exception.
+
+### 5.2 Protocol comparison
+
+| Protocol | Direction | Use when |
+|---|---|---|
+| **SSE (Server-Sent Events)** | Server → client only | Pub/sub feeds, model streaming. Standard for OpenAI/Anthropic. Browser API: `EventSource`. |
+| **HTTP chunked / ReadableStream** | Server → client only | Low-level, framework-agnostic, no SSE framing overhead. **Audia's choice.** |
+| **WebSockets** | Bidirectional, full-duplex | Mid-stream user interrupts, voice mode, multi-user collab |
+| **Vercel AI SDK** | Library wrapping the above | Production Next.js apps wanting `useChat`, message threading, tool-call handling out of the box |
+
+**For interviews:** name the protocol your app uses and *why you chose it over the alternatives*. Audia's answer: "ReadableStream over SSE because we don't need SSE's named-event framing; over WebSockets because we don't need bidirectional. Vercel AI SDK would work but we built primitives-first to understand what it abstracts."
+
+### 5.3 AbortController — the universal cancellation primitive
+
+`AbortController` is the modern JS cancellation pattern. One controller has one `signal` (an `AbortSignal`). The signal can be passed to any async API that accepts it:
+
+```ts
+const ctrl = new AbortController();
+fetch(url, { signal: ctrl.signal });               // pass to fetch
+groq.chat.completions.create(p, { signal });        // forward upstream
+someAsync({ signal });                              // any compliant API
+ctrl.abort();                                       // triggers all of them
+```
+
+**Three properties to memorize:**
+
+1. **Signals propagate.** Forward `signal` through every async layer. One abort call cascades: client fetch → server `req.signal` → SDK call upstream. End-to-end cancellation in one click.
+2. **Aborting throws `AbortError`.** Always catch and distinguish `err.name === "AbortError"` from real errors. Aborts are *expected*, not failures.
+3. **Already-aborted signals fail immediately.** Useful for early-exit patterns and reusing controllers.
+
+### 5.4 The first-class abort pattern
+
+Treat abort as a normal control flow, not an exception. The shape on both sides:
+
+**Server:**
+```ts
+let fullResponse = "";
+let usage = null;
+try {
+    const aiStream = await provider.create(params, { signal: req.signal });
+    for await (const chunk of aiStream) {
+        if (req.signal.aborted) break;
+        try { controller.enqueue(...); } catch { break; }  // client closed during enqueue
+        // accumulate fullResponse, capture usage
+    }
+} catch (err) {
+    if (!(err instanceof Error && err.name === "AbortError")) console.warn(err);
+} finally {
+    record.response = fullResponse;          // ALWAYS persist what we have
+    await save(record);
+    if (usage) logUsage({ label: req.signal.aborted ? "chat-aborted" : "chat", ... });
+    controller.close();
+}
+```
+
+**Client:**
+```ts
+const ctrl = new AbortController();
+try {
+    const res = await fetch(url, { signal: ctrl.signal, ... });
+    const reader = res.body.getReader();
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // decode + setState
+    }
+} catch (err) {
+    if (err instanceof Error && err.name === "AbortError") return; // expected, leave partial
+    showError();
+} finally {
+    setLoading(false);
+}
+```
+
+### 5.5 Partial-state persistence — three benefits
+
+When the client aborts, you've already burned tokens for the partial response. Saving it costs essentially nothing and buys:
+
+1. **Cost-accounting accuracy.** The usage logger still records what was actually generated.
+2. **Resume-ability.** Even without resume implemented, the partial is available when you want to (Phase 5 conversation memory).
+3. **Observability.** A spike in saved-but-partial responses is a real signal — "users are aborting a lot, why?" Maybe latency, maybe UX.
+
+The `finally` block is the *only* place that guarantees this. Naive "save after the loop" loses everything on abort.
+
+### 5.6 Forwarding cancellation upstream — stop the meter
+
+If the client aborts but the server keeps reading from the LLM stream, **you're still paying for tokens nobody will see.**
+
+```ts
+const aiStream = await groq.chat.completions.create(params, { signal: req.signal });
+```
+
+The provider SDK propagates the abort to its own underlying connection. **Difference between hobbyist streaming code and production streaming code.** Audia now does this.
+
+### 5.7 The "stop button" UX pattern
+
+The send button morphs into a stop button while streaming. Conventions across ChatGPT, Claude, and Gemini:
+
+- **Same position** in the input bar — users don't hunt for it
+- **Destructive color** (red / error palette) to signal "this cancels work"
+- **Clicking it stops the entire pipeline** — partial content remains visible, no error toast
+
+The pattern works because users have learned the affordance from those products. Don't reinvent it.
+
+### 5.8 Other UX micro-patterns worth knowing
+
+| Pattern | What it does | When to add |
+|---|---|---|
+| **Typing indicator** (3-dot blink before first token) | Reassures user the request landed and is being processed | TTFT > ~300ms |
+| **Streaming cursor** (blinking vertical bar at end of streamed text) | Visually distinguishes "still streaming" from "done" | Any streaming UI |
+| **Unblocking input during stream** | User can compose next message while current one streams | Multi-turn chats |
+| **Optimistic empty message** | Insert blank assistant message immediately on submit | Always — avoids layout jump when first token arrives |
+| **Auto-scroll to bottom on new tokens** | Keeps the latest text visible during long responses | Always — but respect user scroll-up (don't fight them) |
+
+Audia has the first four (the auto-scroll respect is a Phase 12 polish item).
+
+### 5.9 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **`save()` outside `finally`.** Loses partial response on abort. Always put persistence in `finally`.
+- **Forgetting to forward the signal to the upstream LLM call.** Client aborts, server keeps reading, you keep paying. Production bug class.
+- **Treating `AbortError` as a real error.** Shows users a "something went wrong" when they intentionally stopped. Differentiate.
+- **Disabling the input field during streaming.** Users can't compose next message; flow breaks. Just check `loading` inside the submit handler instead.
+- **Buffering chunks before re-rendering.** Negates the whole point of streaming. Re-render on each `reader.read()` result.
+- **Using SSE when ReadableStream would do.** SSE adds `data:`/`\n\n` framing overhead with no benefit for server→client-only single-stream cases.
+
+### 5.10 Defense talking points for §5
+
+**🎯 Q: "How does cancellation work end-to-end in your streaming chat?"**
+A: "One AbortController on the client. Its signal is passed to `fetch`, which gives the request an `AbortSignal`. On the server, that becomes `req.signal`. We forward `req.signal` to the Groq SDK as the `signal` option, so a single `.abort()` call on the client cascades: client fetch rejects with AbortError, HTTP connection closes, server's `req.signal.aborted` becomes true, the SDK cancels its upstream call to Groq, Groq stops generating. The server's `finally` block then persists whatever response accumulated and logs usage with a `chat-aborted` label for observability."
+
+**🎯 Q: "Why is streaming worth the engineering complexity?"**
+A: "It's actually *less* complex than buffering once you adopt the abort-as-control-flow pattern. The model produces tokens serially regardless; streaming just forwards each one over a persistent HTTP connection. The win is purely UX — time to first token drops from full response duration to maybe 200ms, and users tolerate a 20-second streaming response but not a 3-second blank screen. For any non-trivial output length, streaming is the default."
+
+**🎯 Q: "What's the difference between SSE and HTTP chunked streaming for LLM responses?"**
+A: "SSE is HTTP chunked streaming with extra framing — `data: <payload>\n\n` per event, the browser exposes `EventSource` for it, supports auto-reconnect. Raw HTTP chunked is just bytes. For single-direction LLM token streams with a custom client, raw chunked is simpler and saves a few bytes per chunk. SSE wins when you want named event types, server-sent reconnection, or the browser EventSource ergonomics. OpenAI uses SSE; Audia uses raw chunked. Functionally equivalent for our needs."
 
 ---
 
@@ -775,6 +930,9 @@ A: "Before today, the chat endpoint had zero defenses — user prompt went direc
 
 *(Alphabetical. Grows with each session.)*
 
+- **AbortController** — modern JS cancellation primitive. One controller has one `signal`; pass the signal to any async API (fetch, SDK calls). Calling `.abort()` cascades to all consumers.
+- **AbortError** — the exception thrown when an aborted signal is observed. Expected, not a failure — distinguish from real errors in catch blocks.
+- **Abort-as-control-flow** — design pattern of treating cancellation as a normal code path with its own handling, not as an exceptional error.
 - **Async iterator** — JavaScript pattern (`for await ... of`) for consuming streams. Each iteration yields one chunk. Used by Groq/OpenAI SDKs to expose streamed responses.
 - **Autoregressive** — a generation process where each output depends on previous outputs. Token n+1 is sampled from a distribution conditioned on tokens 1..n. All chat LLMs are autoregressive.
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
@@ -822,6 +980,7 @@ A: "Before today, the chat endpoint had zero defenses — user prompt went direc
 - **Stop sequence** — string(s) which, when generated, halt the model. Provider-side mechanism. Use `["\nUser:", "\n\nHuman:"]` for chat to prevent the model from role-playing the user.
 - **Stop token** — a special token (e.g. `<|endoftext|>`) that the model emits when it judges generation complete. Different from a stop *sequence*.
 - **Sandwich pattern** — prompt engineering technique where critical instructions are restated AFTER the user input. Defense against the model "forgetting" early instructions over long contexts.
+- **Stop button pattern** — UX convention where the send button morphs into a destructive-colored stop button while streaming. Same position in the input bar; standard across ChatGPT/Claude/Gemini.
 - **Streaming** — sending each generated token to the client as it's produced. Does not change cost or generation speed — only perceived latency.
 - **Structured output** — pattern of constraining LLM responses to a machine-readable shape (typically JSON). Three layers: provider JSON mode, provider schema mode, client validation (Zod).
 - **`stream_options.include_usage`** — flag required to receive token usage data in streamed responses. Without it, usage is omitted; with it, the final chunk carries a `usage` field.
@@ -829,6 +988,8 @@ A: "Before today, the chat endpoint had zero defenses — user prompt went direc
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
 - **Top-k sampling** — keep only the k highest-probability tokens, zero the rest, renormalize.
 - **Tokenization** — converting a text string into a sequence of integer token IDs using a fixed vocabulary.
+- **Time to first token (TTFT)** — wall-clock latency from request sent to first response token rendered. Target < 500ms for good UX. The main metric streaming optimizes.
+- **Tokens per second (TPS)** — sustained generation throughput after first token. Groq ~500, OpenAI GPT-4 ~50, Claude Sonnet ~80.
 - **Usage object** — provider response field containing `{ prompt_tokens, completion_tokens, total_tokens }`. Source of truth for billing and instrumentation.
 - **Zero-shot prompting** — instruction-only prompt with no examples. Works well for tasks the model has seen abundantly in training.
 - **Zod** — TypeScript-first schema validation library. Used in Audia to validate structured LLM outputs at runtime and produce typed data. `safeParse` is the production-friendly API.
