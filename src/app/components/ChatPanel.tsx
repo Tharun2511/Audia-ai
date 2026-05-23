@@ -13,7 +13,6 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SendIcon from "@mui/icons-material/Send";
 import StopIcon from "@mui/icons-material/Stop";
 import type { TranscriptSegment } from "@/entity/Transcription";
-import { formatDuration } from "./utils";
 
 type Message = {
     role: "user" | "assistant";
@@ -30,13 +29,6 @@ const QUICK_PROMPTS = [
 
 interface Props {
     segments: TranscriptSegment[];
-}
-
-function buildPrompt(segments: TranscriptSegment[], question: string): string {
-    const transcript = segments
-        .map((s) => `${s.speaker} (${formatDuration(s.start)}): ${s.text}`)
-        .join("\n");
-    return `You are a helpful assistant analyzing a conversation transcript. Answer the question concisely and clearly based only on what's in the transcript.\n\nTranscript:\n${transcript}\n\nQuestion: ${question}`;
 }
 
 export default function ChatPanel({ segments }: Props) {
@@ -82,7 +74,10 @@ export default function ChatPanel({ segments }: Props) {
                 method: "POST",
                 signal: ctrl.signal,
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt: buildPrompt(segments, question) }),
+                // Send the user's question and the reference transcript separately.
+                // The server applies the security sandwich (tags each piece with
+                // its own delimiter so the model can distinguish question from data).
+                body: JSON.stringify({ question, transcriptSegments: segments }),
             });
 
             if (!res.body) throw new Error("No stream");
