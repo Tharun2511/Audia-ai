@@ -118,3 +118,25 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Terminology precision.** Q4 said "user numbers" (meant speaker labels), Q5 said "semantic meaning bonded" (meant bounded). Voice-transcription noise but the underlying vocab needs to lock — say "speaker labels" and "semantically bounded" explicitly.
   - **Feynman SHAPE — banned-word discipline.** Used "chunk" 4 times despite explicit banned-word list. Analogy (bucket of water) mismatched the concept (chunking is about many small containers, not one with a size limit). "Three reasons" promise unfulfilled. Risk-removed close buried. Practice: write the banned-word list above the draft + test the analogy against the banned-word list before writing.
   - **Citation strength on lost-in-the-middle.** Q3 named the concept; can level up to "Liu et al. 2023" in the future for paper-citation credibility.
+
+---
+
+**2026-05-25 · Phase 3.3 — pgvector setup on Neon**
+- Covered: what pgvector is (Postgres extension; 4 distance operators; 2 index types), distance operators in depth (`<->` L2, `<#>` negative inner product, `<=>` cosine distance, `<+>` L1), index trade-off (IVFFlat needs data before build; HNSW incremental + better but heavier), storage math (768-dim ≈ 3 KB per vector), the TypeORM + pgvector friction and the ALTER-TABLE-after-sync workaround, KNN query template with ownership filter, "no premature indexing" principle.
+- Built: [src/entity/TranscriptChunk.ts](../src/entity/TranscriptChunk.ts), `ensurePgvector()` in [src/db/data-source.ts](../src/db/data-source.ts), [src/lib/chunks.ts](../src/lib/chunks.ts) (saveChunkWithEmbedding + findSimilarChunks), chunking+embedding wired into [transcribe pipeline](../src/app/api/transcribe/route.ts), [search-demo route](../src/app/api/search-demo/route.ts), removed throwaway embed-demo from 3.1.
+- **Phase 3 milestone:** End-to-end vector pipeline working. Record a session → chunks created → embeddings stored. Search via `/api/search-demo?q=` returns top-k chunks ranked by cosine. Foundation complete for Phase 4 (wire retrieval into chat).
+- **Stuck (well-internalized):**
+  - **Pgvector operators by name** — Q1 recalled all four (`<->`, `<#>`, `<=>`, `<+>`) cold.
+  - **Premature indexing instinct** — Q3 best-of-session 8/10. Got both sides cleanly: HNSW's value AND why it's premature at <10k vectors (memory + insert speed + no perceptible query gain).
+  - **Pinecone-vs-pgvector pushback** — Q4 8/10 reached the "hybrid lexical + semantic via SQL joins" argument unprompted; that's senior-level.
+  - **Ownership-filter security/perf duality** — Q2 right placement (WHERE before ORDER BY), right concept.
+  - **Feynman trajectory** — 3.1 (3/10) → 3.2 (4/10) → 3.3 (6.5/10). First banned-word-clean run; analogy actually fit the concept; all three beats present.
+- **Fuzzy (needs reinforcement):**
+  - **Distance vs similarity terminology.** Q1 called `<=>` "cosine similarity" — it's cosine *distance* (1 − cos θ), range [0, 2]. The operator returns distance because ORDER BY ascending wants smallest = most similar. Memorize: pgvector ops return distances.
+  - **L2 range** — Q1 said -inf to inf; correct is [0, ∞). Distances are non-negative by definition.
+  - **L1/Manhattan description** — Q1 named it but didn't say what it measures (sum of absolute differences). Round out the answer when listing all four.
+  - **Concrete numbers when answering vs vibes.** Q4 said "external overhead of infrastructure" instead of "$70/month." Always quote dollar amounts when comparing managed vs self-hosted.
+  - **Codebase-walkthrough questions.** Q5 4/10 — only walked the new Phase 3.3 portion; missed the existing 7-step pipeline (Deepgram, audio upload, summary, transcription save) and cited zero files. Drill: re-read `transcribe/route.ts` end-to-end once per phase.
+  - **Measurable-trigger phrasing.** When pushing back on premature optimization or default-tool choices, name the *measurable* trigger ("p95 latency above X", "corpus past Y vectors") not vibes ("when we grow").
+  - **Feynman: opener.** Don't lead with "we built an important feature." Lead with the analogy.
+  - **Feynman: risk-removed sharpness.** "Might not get correct book" → name the actual consequence (slow, expensive, fails past 30min).

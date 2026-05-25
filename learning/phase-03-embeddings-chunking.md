@@ -84,3 +84,52 @@ Chunking splits a source document into smaller, embeddable units. It's forced by
 - Greg Kamradt, *"5 Levels of Text Splitting"* — YouTube, 40 min, hands-on
 - Liu et al., *"Lost in the Middle"* — arxiv.org/abs/2307.03172, the paper that named the failure mode
 - LangChain text splitters docs — industry taxonomy
+
+---
+
+## Session 3.3 — pgvector setup on Neon
+
+**Built in Audia:**
+- [src/entity/TranscriptChunk.ts](../src/entity/TranscriptChunk.ts) — entity for chunks (no embedding column, since TypeORM synchronize can't handle pgvector's vector type)
+- [src/db/data-source.ts](../src/db/data-source.ts) — `ensurePgvector()` runs once per process: `CREATE EXTENSION IF NOT EXISTS vector` + `ALTER TABLE transcript_chunk ADD COLUMN IF NOT EXISTS embedding vector(768)`. Both idempotent via `IF NOT EXISTS`.
+- [src/lib/chunks.ts](../src/lib/chunks.ts) — `saveChunkWithEmbedding()` (TypeORM repo for the row, raw UPDATE for the vector column) + `findSimilarChunks()` (raw SELECT with `embedding <=> $1::vector` cosine distance, ownership filter, optional transcript scoping)
+- Wired into [src/app/api/transcribe/route.ts](../src/app/api/transcribe/route.ts) — after the Transcription is saved, transcript is chunked, embeddings generated in parallel via `Promise.all`, chunks persisted with embeddings. Wrapped in try/catch so embedding failures don't block transcription save.
+- [src/app/api/search-demo/route.ts](../src/app/api/search-demo/route.ts) — `GET /api/search-demo?q=<question>&k=5&transcript=<uuid>` returns top-k chunks ranked by cosine similarity. End-to-end RAG retrieval, working live.
+- Removed throwaway [embed-demo](../src/app/api/embed-demo) route from 3.1.
+
+### Concept summary
+
+pgvector adds vector storage and similarity search to Postgres via a single `CREATE EXTENSION vector;`. It exposes four distance operators — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1) — and two ANN index types — IVFFlat (cluster-based, fast build, needs data first) and HNSW (graph-based, slower build, better queries). For Audia today: no index, sequential scan, `<=>` operator, cosine distance. TypeORM's `synchronize: true` doesn't understand the `vector(N)` type, so we work around it by adding the embedding column via raw SQL after sync and reading/writing it via raw queries. The result: every new transcript produces chunks with 768-dim embeddings stored in Postgres, queryable by cosine distance via SQL.
+
+### 5 most-likely interview questions
+
+1. **Q: Why did you choose pgvector over Pinecone or Weaviate?**
+   A: Three reasons. Operational simplicity — no new infra, no separate auth, no cross-store consistency to manage; pgvector lives in the same Postgres I already run with the same backups and connection pool. Cost — pgvector is free on Neon; Pinecone starts around $70/month for production. Capability fit — pgvector handles up to hundreds of millions of vectors fine; Audia's projected scale is well under that. At hundreds of millions+ I'd revisit dedicated stores.
+
+2. **Q: How does cosine similarity work in your pgvector queries?**
+   A: pgvector's `<=>` operator computes cosine distance (`1 - cos(θ)`), range [0, 2], smaller = more similar. We use it twice — in SELECT to return the distance and in ORDER BY to rank: `ORDER BY embedding <=> $1::vector LIMIT 5`. The query embedding is passed as a string literal `'[0.1, 0.2, ...]'` and cast to vector with `$1::vector`. Convert to similarity in app code as `1 - distance` if you want to display.
+
+3. **Q: Why didn't you build an index immediately?**
+   A: Premature indexing has real cost — vector indexes consume memory (HNSW especially, 1.5-3× the raw vectors), slow inserts, and don't pay off until corpus is large enough that sequential scan is too slow. At Audia's <10k vectors, sequential scan completes in single-digit milliseconds; an index would have no perceptible win and would slow every insert. I'll add HNSW in Phase 12 when growth forces it, triggered by measured query latency.
+
+4. **Q: IVFFlat vs HNSW — when do you use which?**
+   A: Both are ANN indexes. IVFFlat clusters via k-means into N lists; queries probe closest lists. Fast build, low memory, but requires data present (k-means needs vectors). HNSW is a multi-layer graph; queries walk top-down greedily. Slower build, higher memory, best query speed and recall, grows incrementally. New apps default to HNSW because incremental build is friendlier; IVFFlat suits batch-loaded read-heavy workloads where build-once cost amortizes.
+
+5. **Q: TypeORM's synchronize doesn't understand the vector type. How did you handle it?**
+   A: Pragmatic workaround. Entity declared without the embedding column, so synchronize creates the table normally. After init, `ensurePgvector()` runs `CREATE EXTENSION IF NOT EXISTS vector` + `ALTER TABLE ... ADD COLUMN IF NOT EXISTS embedding vector(768)`. Both idempotent via `IF NOT EXISTS`. Reads/writes to the embedding column use raw SQL; everything else uses the repository. Real fix is migrations — that's a deferred infrastructure item. This pattern is common until teams adopt them.
+
+### Gotchas
+
+- **Forgetting the ownership filter on KNN.** `WHERE "userEmail" = $X` is security AND performance — without it, cross-tenant leakage plus a slower scan.
+- **Building IVFFlat on an empty table.** Bad cluster centers → bad index. Backfill first, or use HNSW.
+- **Using `<#>` on un-normalized vectors.** `<#>` ranks by inner product which is biased by magnitude. Use `<=>` (cosine) or normalize first.
+- **Premature indexing.** Don't add HNSW or IVFFlat at <10k vectors — pure overhead.
+- **Mixing embedding dimensions.** `vector(768)` columns reject 1536-dim vectors. Adding a column for a new model requires migration.
+- **`ALTER TABLE ADD COLUMN vector(N)` without `IF NOT EXISTS`** crashes on the second boot. Always guard.
+
+### Go-deeper resources
+
+- pgvector GitHub README — github.com/pgvector/pgvector
+- Neon docs on pgvector — neon.tech/docs/extensions/pgvector
+- Supabase blog, *"pgvector v0.5: Faster semantic search with HNSW"*
+- Malkov & Yashunin (2018), *"Efficient and robust approximate nearest neighbor search using HNSW graphs"* — the original HNSW paper

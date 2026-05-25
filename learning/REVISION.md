@@ -20,7 +20,7 @@
 **Part III — Retrieval (RAG)**
 - [§6. Embeddings: vector spaces, cosine, model choice](#6-embeddings-vector-spaces-cosine-model-choice) ✅ *(Phase 3.1)*
 - [§7. Chunking strategies](#7-chunking-strategies) ✅ *(Phase 3.2)*
-- §8. pgvector + indexing (IVFFlat vs HNSW) *(Phase 3.3 — TBD)*
+- [§8. pgvector + indexing (IVFFlat vs HNSW)](#8-pgvector--indexing-ivfflat-vs-hnsw) ✅ *(Phase 3.3)*
 - §9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle *(Phase 4.1 — TBD)*
 - §10. Generation with retrieval: templates, citations, hallucination control *(Phase 4.2 — TBD)*
 
@@ -1213,6 +1213,134 @@ A: "I'd build a golden set of typical user questions paired with the answers the
 
 ---
 
+## §8. pgvector + indexing (IVFFlat vs HNSW)
+
+### 8.1 What pgvector is
+
+**🎯 pgvector**
+
+> **Definition:** A Postgres extension that adds a native `vector(N)` column type, four distance operators (`<->`, `<#>`, `<=>`, `<+>`), and approximate-nearest-neighbor indexing (IVFFlat, HNSW). Turns Postgres into a vector database without new infrastructure.
+
+In one sentence: **pgvector turns Postgres into a vector database** without new infra. Familiar SQL, ACID transactions, joins against your existing tables, same DB you're already running. Trade-off vs. dedicated vector DBs (Pinecone, Weaviate, Qdrant) is at extreme scale — pgvector handles millions of vectors fine; past hundreds of millions, dedicated stores' purpose-built indexing wins.
+
+**For Audia (10k transcripts × 10 chunks = ~100k-1M vectors), pgvector is right all the way through.** Compare with dedicated vector DBs in Phase 12 (AI Ops).
+
+### 8.2 Distance operators
+
+| Operator | Meaning | Output range | When to use |
+|---|---|---|---|
+| `a <-> b` | **L2 (Euclidean) distance** | [0, ∞) | Non-normalized vectors; identical-vs-different ranking |
+| `a <#> b` | **Negative inner product** | (-∞, ∞) | Unit-normalized vectors; faster than cosine |
+| `a <=> b` | **Cosine distance** (`1 - cos similarity`) | [0, 2] | Default for text embeddings — magnitude-agnostic |
+| `a <+> b` | **L1 (Manhattan) distance** | [0, ∞) | Rarely used; sparse/categorical vectors |
+
+**Why `<#>` returns negative inner product:** pgvector's ORDER BY sorts ascending. To make "most similar" = "smallest value," inner product (where bigger = more similar) gets negated.
+
+**Audia's default: `<=>`** (cosine distance). Gemini's `text-embedding-2` returns unit-normalized vectors, so `<#>` would be slightly faster with the same ranking — but `<=>` is more readable and the perf gap is negligible at our scale.
+
+### 8.3 Vector indexing — IVFFlat vs HNSW
+
+**🎯 IVFFlat**
+
+> **Definition:** Inverted-file index that clusters vectors into N "lists" via k-means; queries probe only the closest lists. Build is fast, recall is good, build requires data already present.
+
+**🎯 HNSW**
+
+> **Definition:** Hierarchical Navigable Small World — a multi-layer graph where each layer is a sparser version of the one below; queries walk top-down via greedy traversal. Slower build, faster queries, higher recall.
+
+| | IVFFlat | HNSW |
+|---|---|---|
+| Build time | Fast | Slow (10-100×) |
+| Memory | Low | High (~1.5-3× of vectors) |
+| Query speed | Good | Best |
+| Recall@k | Good | Excellent |
+| Requires data before build | **Yes** | No (incremental) |
+
+**IVFFlat's "needs data before build" gotcha:** k-means clustering needs vectors to cluster against. Building IVFFlat on an empty table produces a bad index. Production pattern: backfill all data, *then* build IVFFlat. Or skip IVFFlat entirely and use HNSW from day one.
+
+**Audia today: no index yet.** At <10k vectors a sequential scan is fast enough (sub-second). Premature indexing is its own anti-pattern — wasted memory, slower writes, no perceptible query gain at small scale. We'll add HNSW in Phase 12 when corpus growth forces it.
+
+### 8.4 Storage math
+
+**🎯 Vector storage cost**
+
+> **Definition:** Each `vector(N)` row costs roughly `N × 4 bytes` (32-bit floats) plus Postgres row overhead (~28 bytes). A 768-dim vector is ~3 KB on disk uncompressed.
+
+**Audia's math:**
+- 1 chunk × 768 dim × 4 bytes ≈ **3 KB per chunk**
+- 10 chunks per transcript × 3 KB ≈ **30 KB per transcript**
+- 10,000 transcripts × 30 KB ≈ **300 MB total**
+
+300 MB easily fits Neon's free 3 GB tier. At 10× scale (100k transcripts → 3 GB) we'd compress with `halfvec` (pgvector v0.6+, 16-bit floats, 2× smaller).
+
+### 8.5 The TypeORM + pgvector friction (and the workaround)
+
+**🎯 The synchronize/pgvector workaround**
+
+> **Definition:** TypeORM's `synchronize: true` doesn't understand pgvector's `vector` type. Pragmatic fix: declare the entity *without* the embedding column, let synchronize create the table normally, then `ALTER TABLE ... ADD COLUMN IF NOT EXISTS embedding vector(N)` via raw SQL after init. Read/write the column via raw queries; use the repository for everything else.
+
+This is hacky but pragmatic. Real fix is adopting migrations (your 2.8 roadmap item, deferred). Audia's `ensurePgvector()` function in [data-source.ts](../src/db/data-source.ts) runs once per process to:
+1. `CREATE EXTENSION IF NOT EXISTS vector;`
+2. `ALTER TABLE transcript_chunk ADD COLUMN IF NOT EXISTS embedding vector(768);`
+
+The `IF NOT EXISTS` guards make this idempotent — safe to run on every process boot.
+
+### 8.6 The KNN query pattern
+
+**🎯 KNN search (k-nearest neighbors)**
+
+> **Definition:** Retrieval pattern that finds the k vectors most similar to a query vector. In pgvector: `ORDER BY column <=> query::vector LIMIT k`. The operator decides which similarity metric (cosine, L2, inner product) gets used.
+
+Audia's search query template (from [src/lib/chunks.ts](../src/lib/chunks.ts)):
+
+```sql
+SELECT id, text, "segmentIndices", speakers, "startTime", "endTime",
+       (embedding <=> $1::vector) AS distance
+FROM transcript_chunk
+WHERE "userEmail" = $2
+ORDER BY embedding <=> $1::vector
+LIMIT $3;
+```
+
+**Three things to internalize:**
+
+1. The `<=>` operator appears twice — in SELECT (to return the distance) and ORDER BY (to sort). pgvector doesn't auto-compute it in ORDER BY based on SELECT.
+2. **`$1::vector`** — explicit cast from string. pgvector vectors are passed as strings like `'[0.1,0.2,...]'` and cast to vector type.
+3. **`WHERE "userEmail" = $2`** — ownership filter applied *before* the KNN sort. Without it, you'd KNN across all users' chunks, which is both a security bug and a perf disaster.
+
+### 8.7 What this means in Audia
+
+Today's commit adds [src/entity/TranscriptChunk.ts](../src/entity/TranscriptChunk.ts) (entity without embedding column), updates [src/db/data-source.ts](../src/db/data-source.ts) with `ensurePgvector()`, adds [src/lib/chunks.ts](../src/lib/chunks.ts) (`saveChunkWithEmbedding` + `findSimilarChunks`), wires chunking + embedding into the [transcribe pipeline](../src/app/api/transcribe/route.ts), and ships a [search-demo route](../src/app/api/search-demo/route.ts) that takes `?q=` and returns top-k chunks.
+
+End of Phase 3 milestone: **every new transcript creates chunks with embeddings stored in Postgres, queryable by cosine distance via SQL.** Phase 4 wires this into the chat endpoint, finally completing the RAG loop.
+
+### 8.8 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **Forgetting the ownership filter on KNN queries.** `WHERE "userEmail" = $X` is security + perf. Without it, cross-tenant leakage AND a slower scan.
+- **Building IVFFlat on an empty table.** Bad cluster centers → bad index. Backfill data first OR skip IVFFlat for HNSW.
+- **Storing un-normalized vectors and using `<#>` operator.** `<#>` is for unit-normalized; on un-normalized data it ranks by magnitude, not direction. Mismatch leads to nonsense rankings.
+- **Premature indexing.** At <10k vectors a sequential scan is fine. Adding an index too early costs memory and slows writes for no query gain.
+- **Mixing embedding dimensions.** `vector(768)` columns don't accept 1536-dim vectors. Adding a column for a new model = new migration.
+- **`ALTER TABLE ADD COLUMN vector(N)` without `IF NOT EXISTS`.** Crashes the second time it runs. Always guard.
+
+### 8.9 Defense talking points for §8
+
+**🎯 Q: "Why did you choose pgvector over Pinecone or Weaviate?"**
+A: "Three reasons. Operational simplicity — no new infrastructure, no separate auth, no cross-store consistency to manage; pgvector lives in the same Postgres I'm already running, with the same backups and the same connection pool. Cost — pgvector is free on Neon's tier; Pinecone starts at ~$70/month for production usage. Capability fit — pgvector handles up to hundreds of millions of vectors fine, and Audia's projected scale is well under that. At hundreds of millions+ I'd revisit dedicated stores for their purpose-built indexing and operational tooling. Phase 12 of my curriculum compares them properly."
+
+**🎯 Q: "How does cosine similarity work in your pgvector queries?"**
+A: "pgvector's `<=>` operator computes cosine *distance* — `1 - cos(θ)` — between two vectors, range [0, 2], smaller means more similar. We use it both in SELECT to return the distance and in ORDER BY to rank, like `ORDER BY embedding <=> $1::vector LIMIT 5`. The query embedding gets passed as a string literal `'[0.1, 0.2, ...]'` and cast to vector type with `$1::vector`. We then convert to similarity in app code as `1 - distance` if we want to display."
+
+**🎯 Q: "Why didn't you build an index immediately?"**
+A: "Premature indexing has real cost — vector indexes consume memory (HNSW especially, 1.5-3× the raw vectors), slow inserts, and don't pay off until corpus size makes sequential scan too slow. At Audia's <10k vectors, sequential scan completes in single-digit milliseconds; the index would have no perceptible win and would slow every insert. I'll add HNSW in Phase 12 when growth forces it, with the measured query-latency curve as the trigger."
+
+**🎯 Q: "What's the difference between IVFFlat and HNSW?"**
+A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via k-means into N lists; queries probe only the closest lists. Build is fast; recall is good; but it requires data already present because k-means needs vectors to cluster. HNSW is a multi-layer graph where each layer is sparser; queries walk top-down greedily. Build is slow, memory is higher, but query speed and recall are best, and it can grow incrementally without rebuilds. For new applications I'd default to HNSW because the incremental build pattern is friendlier; IVFFlat makes sense for batch-loaded read-heavy workloads where the build-once cost is amortized."
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -1249,7 +1377,9 @@ A: "I'd build a golden set of typical user questions paired with the answers the
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
+- **HNSW (Hierarchical Navigable Small World)** — graph-based vector index. Multi-layer graph; queries walk top-down via greedy traversal. Slower build than IVFFlat; faster queries, higher recall, incremental.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
+- **IVFFlat** — inverted-file vector index. Clusters vectors via k-means into N lists; queries probe closest lists. Fast build, low memory, good recall — but requires data present before build.
 - **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
 - **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
@@ -1262,8 +1392,11 @@ A: "I'd build a golden set of typical user questions paired with the answers the
 - **`max_tokens`** — output length cap. Counts only generated tokens, not input. Always set in production to bound cost.
 - **MLP (in transformer)** — the two-layer feedforward block inside each transformer layer. Most of the parameters live here.
 - **Multi-head attention** — running H parallel attention operations with different learned projections, then concatenating the outputs.
+- **KNN search (k-nearest neighbors)** — retrieval pattern that finds the k vectors most similar to a query vector. In pgvector: `ORDER BY column <=> query::vector LIMIT k`. The operator decides the similarity metric.
 - **Nucleus sampling (top-p)** — keep the smallest set of tokens whose cumulative probability exceeds p, sample from that. p=0.9 is common.
 - **OWASP Top 10 for LLMs** — canonical security reference for LLM applications (genai.owasp.org). Bookmark for interviews.
+- **pgvector** — Postgres extension adding a native `vector(N)` column type, four distance operators (`<->`, `<#>`, `<=>`, `<+>`), and ANN indexing (IVFFlat, HNSW). Turns Postgres into a vector DB without new infrastructure.
+- **pgvector operators** — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1 / Manhattan). Smaller value = more similar in ORDER BY. Cosine is the default for text embeddings.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
 - **Principle of least privilege** — security principle that the model should have access only to what it strictly needs. The strongest defense against agentic injection attacks — if the model *can't* take a dangerous action, no injection can make it.
 - **Prompt** — the input given to an LLM, comprising system, user, and (in conversations) assistant messages. Better framed as a *specification* than a string.
@@ -1285,6 +1418,7 @@ A: "I'd build a golden set of typical user questions paired with the answers the
 - **Sentence-based chunking** — splitting on sentence boundaries (periods, NLP-detected), grouping N sentences per chunk. Good for prose; inconsistent chunk sizes.
 - **Stop button pattern** — UX convention where the send button morphs into a destructive-colored stop button while streaming. Same position in the input bar; standard across ChatGPT/Claude/Gemini.
 - **Streaming** — sending each generated token to the client as it's produced. Does not change cost or generation speed — only perceived latency.
+- **Synchronize/pgvector workaround** — TypeORM's `synchronize: true` doesn't understand pgvector's `vector(N)` type. Workaround: declare entity without the embedding column, let synchronize create the table, then ALTER TABLE ADD COLUMN via raw SQL. Idempotent with `IF NOT EXISTS`.
 - **Structured output** — pattern of constraining LLM responses to a machine-readable shape (typically JSON). Three layers: provider JSON mode, provider schema mode, client validation (Zod).
 - **`stream_options.include_usage`** — flag required to receive token usage data in streamed responses. Without it, usage is omitted; with it, the final chunk carries a `usage` field.
 - **System message** — the role-tagged prompt segment containing instructions, persona, and constraints. Models are trained to weight system content as operator intent.
@@ -1294,6 +1428,7 @@ A: "I'd build a golden set of typical user questions paired with the answers the
 - **Time to first token (TTFT)** — wall-clock latency from request sent to first response token rendered. Target < 500ms for good UX. The main metric streaming optimizes.
 - **Tokens per second (TPS)** — sustained generation throughput after first token. Groq ~500, OpenAI GPT-4 ~50, Claude Sonnet ~80.
 - **Usage object** — provider response field containing `{ prompt_tokens, completion_tokens, total_tokens }`. Source of truth for billing and instrumentation.
+- **Vector storage cost** — each `vector(N)` row costs roughly `N × 4 bytes` (32-bit floats) plus row overhead. 768-dim ≈ 3 KB. Compressible to half with `halfvec` (pgvector v0.6+).
 - **Zero-shot prompting** — instruction-only prompt with no examples. Works well for tasks the model has seen abundantly in training.
 - **Zod** — TypeScript-first schema validation library. Used in Audia to validate structured LLM outputs at runtime and produce typed data. `safeParse` is the production-friendly API.
 
