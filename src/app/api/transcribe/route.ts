@@ -3,7 +3,10 @@ import { Transcription } from "@/entity/Transcription";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { deepgram, summarizeTranscript } from "@/lib/ai";
 import { uploadAudio } from "@/lib/audio-storage";
+import { chunkTranscript } from "@/lib/chunking";
+import { saveChunkWithEmbedding } from "@/lib/chunks";
 import { getCurrentUser } from "@/lib/dal";
+import { embed } from "@/lib/embeddings";
 
 type DeepgramWord = {
     word: string;
@@ -93,6 +96,22 @@ export async function POST(req: Request) {
     const repo = db.getRepository(Transcription);
     const record = repo.create({ duration, segments, userEmail: user.email, summary, audioPathname });
     await repo.save(record);
+
+    // Chunk + embed + persist. Parallel embed calls keep latency bounded by the
+    // slowest single call, not the sum. If embedding fails, log and continue —
+    // the transcription itself already saved; chunks can be backfilled later.
+    try {
+        const chunks = chunkTranscript(segments);
+        const embeddings = await Promise.all(chunks.map((c) => embed(c.text)));
+        await Promise.all(
+            chunks.map((chunk, i) =>
+                saveChunkWithEmbedding(chunk, record.id, user.email, i, embeddings[i]),
+            ),
+        );
+        console.log(`[transcribe] saved ${chunks.length} chunks for ${record.id}`);
+    } catch (err) {
+        console.warn(`[transcribe] chunk+embed failed for ${record.id}`, err);
+    }
 
     return Response.json({ id: record.id, segments, duration, summary, audioPathname });
 }
