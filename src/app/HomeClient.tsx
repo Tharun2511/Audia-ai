@@ -55,6 +55,17 @@ export default function HomeClient({ userEmail, userName }: Props) {
     const [drawerOpen, setDrawerOpen] = useState(false);
     const [searchQuery, setSearchQuery] = useState("");
 
+    /*
+     * The "Just completed" chip is a confetti moment — fresh after recording.
+     * Clear it after 10s so it doesn't linger as stale signal if the user
+     * keeps the session open. Also clears if they navigate elsewhere and back.
+     */
+    useEffect(() => {
+        if (!justCompletedId) return;
+        const t = setTimeout(() => setJustCompletedId(null), 10_000);
+        return () => clearTimeout(t);
+    }, [justCompletedId]);
+
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const chunksRef = useRef<Blob[]>([]);
     const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -378,11 +389,14 @@ export default function HomeClient({ userEmail, userName }: Props) {
                         </Box>
                     </Stack>
                 ) : history.length === 0 ? (
-                    <Box sx={{ px: 1, py: 3, textAlign: "center" }}>
-                        <Typography variant="caption" sx={{ color: "text.disabled" }}>
-                            No sessions yet.
+                    <Stack spacing={0.75} sx={{ px: 2, py: 3, textAlign: "center", alignItems: "center" }}>
+                        <Typography variant="body2" sx={{ color: "text.secondary", fontWeight: 500 }}>
+                            No sessions yet
                         </Typography>
-                    </Box>
+                        <Typography variant="caption" sx={{ color: "text.disabled", lineHeight: 1.5 }}>
+                            Record a conversation or upload an audio file to get started.
+                        </Typography>
+                    </Stack>
                 ) : filteredHistory.length === 0 ? (
                     <Stack spacing={1.25} sx={{ px: 1, py: 3, alignItems: "center", textAlign: "center" }}>
                         <Typography variant="caption" sx={{ color: "text.disabled" }}>

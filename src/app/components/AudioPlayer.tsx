@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Box from "@mui/material/Box";
 import Card from "@mui/material/Card";
 import CircularProgress from "@mui/material/CircularProgress";
@@ -50,6 +50,11 @@ export default function AudioPlayer({
     const [speedIndex, setSpeedIndex] = useState(0);
     const playbackRate = PLAYBACK_SPEEDS[speedIndex];
 
+    // Drag-to-seek state. trackRef points at the progress bar's bounding box
+    // so global mousemove/touchmove can compute position relative to it.
+    const [dragging, setDragging] = useState(false);
+    const trackRef = useRef<HTMLDivElement>(null);
+
     const togglePlay = () => {
         const audio = audioRef.current;
         if (!audio) return;
@@ -65,13 +70,46 @@ export default function AudioPlayer({
         }
     };
 
-    const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    /**
+     * Computes a new playback time from a pointer X coordinate relative to the
+     * progress bar's bounding box, and applies it to the audio element. Shared
+     * by initial click-down and drag-move.
+     */
+    const seekFromClientX = useCallback((clientX: number) => {
+        const track = trackRef.current;
         const audio = audioRef.current;
-        if (!audio || durationSeconds <= 0) return;
-        const rect = e.currentTarget.getBoundingClientRect();
-        const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        if (!track || !audio || durationSeconds <= 0) return;
+        const rect = track.getBoundingClientRect();
+        const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
         audio.currentTime = pct * durationSeconds;
         setEnded(false);
+    }, [audioRef, durationSeconds]);
+
+    // Global mouse/touch listeners while dragging — so the user can move
+    // the cursor outside the bar's bounds and still scrub. Standard pattern
+    // for any draggable slider.
+    useEffect(() => {
+        if (!dragging) return;
+        const handleMove = (e: MouseEvent | TouchEvent) => {
+            const clientX = "touches" in e ? e.touches[0]?.clientX : e.clientX;
+            if (typeof clientX === "number") seekFromClientX(clientX);
+        };
+        const handleUp = () => setDragging(false);
+        window.addEventListener("mousemove", handleMove);
+        window.addEventListener("mouseup", handleUp);
+        window.addEventListener("touchmove", handleMove);
+        window.addEventListener("touchend", handleUp);
+        return () => {
+            window.removeEventListener("mousemove", handleMove);
+            window.removeEventListener("mouseup", handleUp);
+            window.removeEventListener("touchmove", handleMove);
+            window.removeEventListener("touchend", handleUp);
+        };
+    }, [dragging, seekFromClientX]);
+
+    const startDrag = (clientX: number) => {
+        seekFromClientX(clientX); // First contact = jump-and-grab
+        setDragging(true);
     };
 
     const cycleSpeed = () => {
@@ -136,9 +174,19 @@ export default function AudioPlayer({
                     {ended ? <ReplayIcon /> : playing ? <PauseIcon /> : <PlayArrowIcon />}
                 </IconButton>
 
-                {/* Progress bar — clickable, grows on hover for affordance. */}
+                {/*
+                 * Progress bar — interactive in three ways:
+                 *   click anywhere   → seeks
+                 *   click + drag     → scrubs continuously
+                 *   keyboard left/right (when audio focused) → ±5s (in parent)
+                 *
+                 * Grows on hover/drag so the affordance is obvious. The thumb
+                 * circle gives visual anchor during scrubbing.
+                 */}
                 <Box
-                    onClick={handleSeek}
+                    ref={trackRef}
+                    onMouseDown={(e) => { e.preventDefault(); startDrag(e.clientX); }}
+                    onTouchStart={(e) => { startDrag(e.touches[0].clientX); }}
                     role="slider"
                     aria-label="Playback progress"
                     aria-valuemin={0}
@@ -146,14 +194,22 @@ export default function AudioPlayer({
                     aria-valuenow={Math.round(currentTime)}
                     sx={{
                         flex: 1,
-                        height: 6,
+                        height: dragging ? 8 : 6,
                         bgcolor: "divider",
                         borderRadius: 999,
                         cursor: "pointer",
                         position: "relative",
-                        overflow: "hidden",
+                        // overflow visible so the thumb can poke above/below
+                        // the track without clipping
                         transition: "height 120ms",
                         "&:hover": { height: 8 },
+                        // Bigger touch target on mobile — vertical padding adds
+                        // hittable area without changing the visual height
+                        "&::before": {
+                            content: '""',
+                            position: "absolute",
+                            inset: "-8px 0",
+                        },
                     }}
                 >
                     <Box
@@ -164,9 +220,31 @@ export default function AudioPlayer({
                             bottom: 0,
                             width: `${progressPct}%`,
                             bgcolor: "primary.main",
-                            // Linear transition keeps the fill smooth despite the
-                            // 4Hz updates from timeupdate.
-                            transition: "width 250ms linear",
+                            borderRadius: 999,
+                            // Suppress transitions while dragging so the fill
+                            // tracks the cursor exactly; resume smooth fill
+                            // for natural playback at 4Hz timeupdate.
+                            transition: dragging ? "none" : "width 250ms linear",
+                        }}
+                    />
+                    {/* Drag thumb — visible on hover/drag, invisible at rest. */}
+                    <Box
+                        sx={{
+                            position: "absolute",
+                            top: "50%",
+                            left: `${progressPct}%`,
+                            transform: "translate(-50%, -50%)",
+                            width: 14,
+                            height: 14,
+                            borderRadius: "50%",
+                            bgcolor: "primary.main",
+                            boxShadow: "0 0 0 4px rgba(109, 40, 217, 0.16)",
+                            opacity: dragging ? 1 : 0,
+                            transition: dragging
+                                ? "opacity 120ms, left 0ms"
+                                : "opacity 120ms, left 250ms linear",
+                            pointerEvents: "none",
+                            ".MuiCard-root:hover &": { opacity: 1 },
                         }}
                     />
                 </Box>

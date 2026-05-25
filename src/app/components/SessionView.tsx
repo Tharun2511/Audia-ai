@@ -1,5 +1,6 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import Box from "@mui/material/Box";
 import Chip from "@mui/material/Chip";
 import Stack from "@mui/material/Stack";
@@ -205,6 +206,13 @@ export default function SessionView({
                         position: "sticky",
                         top: { xs: 56, lg: 12 },
                         zIndex: 2,
+                        // Permanent soft shadow — looks fine in-flow, gives
+                        // crisp separation from content scrolling beneath when
+                        // docked. Avoids needing IntersectionObserver for a
+                        // "stuck" state.
+                        "& > .MuiCard-root": {
+                            boxShadow: "0 6px 20px -8px rgba(15, 23, 42, 0.18)",
+                        },
                     }}
                 >
                     <AudioPlayer
@@ -215,12 +223,17 @@ export default function SessionView({
                         audioRef={audioRef}
                         onError={async () => {
                             // The signed URL likely expired (1h TTL). Retry once
-                            // with a fresh URL; if that also fails, give up so we
-                            // don't loop forever on a genuinely broken blob.
-                            if (audioRetryRef.current) return;
+                            // with a fresh URL; if that also fails, surface a
+                            // toast so the user understands why audio went silent
+                            // instead of staring at a frozen player.
+                            if (audioRetryRef.current) {
+                                toast.error("Audio playback failed. Try refreshing the page.");
+                                return;
+                            }
                             audioRetryRef.current = true;
                             const fresh = await fetchSignedUrl();
                             if (fresh) setSignedAudioUrl(fresh);
+                            else toast.error("Audio playback failed. Try refreshing the page.");
                         }}
                     />
                 </Box>
@@ -239,7 +252,10 @@ export default function SessionView({
                 onSegmentSeek={signedAudioUrl ? seekTo : undefined}
             />
 
-            {segments.length > 0 && <ChatPanel segments={segments} />}
+            {/* key={id} resets ChatPanel's internal message state when switching
+                sessions — prevents conversation about session A from leaking
+                into session B's chat panel. */}
+            {segments.length > 0 && <ChatPanel key={id} segments={segments} />}
         </Stack>
     );
 }

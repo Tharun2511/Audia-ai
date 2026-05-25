@@ -395,7 +395,7 @@ export default function TranscriptPanel({
                                         borderLeftStyle: "solid",
                                         borderLeftWidth: i === activeSegmentIndex ? 4 : 3,
                                         borderLeftColor: colorMap[seg.speaker] ?? "text.disabled",
-                                        transition: "background-color 150ms, border-left-width 150ms",
+                                        transition: "background-color 150ms, border-left-width 150ms, box-shadow 150ms",
                                         ...(cardSeekable ? {
                                             cursor: "pointer",
                                             "&:hover": { bgcolor: "action.hover" },
@@ -407,6 +407,13 @@ export default function TranscriptPanel({
                                         } : {}),
                                         ...(i === activeSegmentIndex && !isEditing ? {
                                             bgcolor: "action.selected",
+                                        } : {}),
+                                        ...(isEditing ? {
+                                            // Primary-colored ring overlays the speaker color
+                                            // — speaker identity is preserved on the left bar,
+                                            // edit context is signaled by the outer ring.
+                                            boxShadow: (theme) => `0 0 0 2px ${theme.vars?.palette?.primary?.main ?? theme.palette.primary.main}`,
+                                            bgcolor: "background.paper",
                                         } : {}),
                                     }}
                                 >

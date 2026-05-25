@@ -100,6 +100,7 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
             component="button"
             type="button"
             onClick={(e: React.MouseEvent) => { e.stopPropagation(); setEditing(true); }}
+            aria-label={initialTitle ? `Rename "${initialTitle}"` : "Name this session"}
             sx={{
                 bgcolor: "transparent",
                 border: 0,
@@ -110,7 +111,13 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
                 gap: variant === "title" ? 1.25 : 0.75,
                 textAlign: "left",
                 color: "inherit",
-                "&:hover .edit-pencil": { color: "primary.light" },
+                "&:hover .edit-pencil": { color: "primary.main", opacity: 1 },
+                "&:focus-visible": {
+                    outline: "2px solid",
+                    outlineColor: "primary.main",
+                    outlineOffset: 4,
+                    borderRadius: 4,
+                },
             }}
         >
             <Typography
@@ -124,7 +131,21 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
             >
                 {initialTitle ?? fallback}
             </Typography>
-            <EditIcon className="edit-pencil" sx={{ fontSize: style.iconSize, color: "transparent", transition: "color 150ms" }} />
+            {/*
+             * Pencil is subtly visible by default (35% opacity), brightens on
+             * row-hover for desktop, and is always visible on touch devices
+             * via @media (hover: none). Discovery without clutter.
+             */}
+            <EditIcon
+                className="edit-pencil"
+                sx={{
+                    fontSize: style.iconSize,
+                    color: "text.disabled",
+                    opacity: 0.35,
+                    transition: "opacity 150ms, color 150ms",
+                    "@media (hover: none)": { opacity: 1 },
+                }}
+            />
         </Box>
     );
 }
