@@ -1,6 +1,4 @@
 import type { ChatCompletionChunk, ChatCompletionCreateParamsStreaming } from "groq-sdk/resources/chat/completions";
-import { getDatabase } from "@/db/data-source";
-import { Chat } from "@/entity/Chat";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import { formatDuration } from "@/app/components/utils";
 import { groq } from "@/lib/ai";
@@ -65,13 +63,6 @@ export async function POST(req: Request) {
 
     const userMessage = buildUserMessage(question, body.transcriptSegments);
 
-    const db = await getDatabase();
-    const chatRepo = db.getRepository(Chat);
-    // Persist the raw question (not the assembled prompt) — that's the user's
-    // actual intent; reconstructing the wrapped message is trivial.
-    const chatRecord = chatRepo.create({ prompt: question, response: "" });
-    await chatRepo.save(chatRecord);
-
     const model = "llama-3.1-8b-instant";
     const start = Date.now();
     const encoder = new TextEncoder();
@@ -87,7 +78,6 @@ export async function POST(req: Request) {
                 stream_options: { include_usage: true },
             };
 
-            let fullResponse = "";
             let usage: { prompt_tokens: number; completion_tokens: number } | null = null;
             let streamErr: unknown = null;
 
@@ -99,7 +89,6 @@ export async function POST(req: Request) {
                     const chunk = rawChunk as ChunkWithUsage;
                     const text = chunk.choices[0]?.delta?.content ?? "";
                     if (text) {
-                        fullResponse += text;
                         try {
                             controller.enqueue(encoder.encode(text));
                         } catch {
@@ -120,16 +109,6 @@ export async function POST(req: Request) {
                     console.warn("[chat] stream error", err);
                 }
             } finally {
-                // Always persist whatever we accumulated — full response on clean close,
-                // partial response on abort or error. Wrap in try so failure here doesn't
-                // mask the stream's own error.
-                try {
-                    chatRecord.response = fullResponse;
-                    await chatRepo.save(chatRecord);
-                } catch (saveErr) {
-                    console.warn("[chat] failed to persist response", saveErr);
-                }
-
                 if (usage) {
                     logUsage({
                         label: req.signal.aborted ? "chat-aborted" : "chat",

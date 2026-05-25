@@ -1,18 +1,17 @@
 import "reflect-metadata";
 import { DataSource } from "typeorm";
-import { Chat } from "../entity/Chat";
 import { Transcription } from "../entity/Transcription";
 import { User } from "../entity/User";
 
 export const AppDataSource = new DataSource({
     type: "postgres",
-    url: process.env.DATABASE_URL || process.env.DATABSE_URL,
+    url: process.env.DATABASE_URL,
     ssl: {
         rejectUnauthorized: false // Required for Neon
     },
     synchronize: true,
     logging: false,
-    entities: [Chat, Transcription, User],
+    entities: [Transcription, User],
 });
 
 // This helper prevents Next.js from creating too many connections during development

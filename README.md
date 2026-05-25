@@ -107,12 +107,12 @@ All endpoints **require an authenticated session**. Unauthenticated requests get
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/transcribe` | Receives audio (multipart), transcribes via Deepgram, generates summary via Groq, saves to the session user's history |
-| `GET` | `/api/transcriptions` | Returns the last 20 sessions for the authenticated user |
-| `PATCH` | `/api/transcriptions/:id` | Update title and/or rename speakers (only on sessions owned by the caller) |
-| `POST` | `/api/transcriptions/:id/summary` | Regenerate the summary on demand |
+| `POST` | `/api/transcribe` | Receives audio (multipart), uploads to Vercel Blob (private), transcribes via Deepgram, generates summary via Groq, saves to the session user's history |
+| `GET` | `/api/transcriptions` | Returns all sessions for the authenticated user (ordered newest-first) |
+| `PATCH` | `/api/transcriptions/:id` | Update title, rename speakers, or edit segment text (only on sessions owned by the caller) |
 | `DELETE` | `/api/transcriptions/:id` | Delete a session |
-| `POST` | `/api/chat` | Groq streaming chat (LLaMA 3.1) — body: `{ prompt: string }`, response: `text/plain` stream |
+| `GET` | `/api/transcriptions/:id/audio-url` | Issue a short-lived signed URL for playing back the session audio |
+| `POST` | `/api/chat` | Groq streaming chat — body: `{ question: string, transcriptSegments?: TranscriptSegment[] }`, response: `text/plain` stream |
 
 Authentication is handled via **Server Actions**, not REST endpoints:
 
@@ -170,13 +170,14 @@ cp .env.example .env
 ```
 
 ```env
-DATABSE_URL=postgresql://<user>:<password>@<host>/neondb?sslmode=require&channel_binding=require
+DATABASE_URL=postgresql://<user>:<password>@<host>/neondb?sslmode=require&channel_binding=require
 DEEPGRAM_API_KEY=your_deepgram_api_key
 GROQ_API_KEY=your_groq_api_key
 SESSION_SECRET=<a 32-byte base64 string>
+BLOB_READ_WRITE_TOKEN=<from Vercel dashboard → Storage → Blob>
 ```
 
-> **Note:** the database variable is `DATABSE_URL` (typo preserved from the original setup) — use exactly this spelling, or set `DATABASE_URL` instead; the data source reads either.
+> **Note:** `BLOB_READ_WRITE_TOKEN` enables audio persistence + playback. Without it, transcripts still save but audio is discarded.
 
 Generate a session secret:
 
@@ -211,10 +212,11 @@ On first record, the browser will prompt for mic access — click **Allow**. If 
 
 | Key | Value |
 |---|---|
-| `DATABSE_URL` | Neon connection string |
+| `DATABASE_URL` | Neon connection string |
 | `DEEPGRAM_API_KEY` | Deepgram API key |
 | `GROQ_API_KEY` | Groq API key |
 | `SESSION_SECRET` | A **fresh** 32-byte base64 string (do not reuse the local one) |
+| `BLOB_READ_WRITE_TOKEN` | Auto-injected when you connect a Vercel Blob store to the project |
 
 4. Deploy — Vercel auto-detects Next.js, no build config needed.
 
