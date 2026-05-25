@@ -101,3 +101,20 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Top-k + floor as production retrieval pattern** — Q5 mentioned threshold; senior pattern combines top-k with a similarity floor.
   - **Feynman SHAPE** — analogy was wrong (memory ≠ embeddings), jargon slipped ("our embeddings"), no risk-removed close. Practice: brainstorm 3 analogies and reject the bad ones before writing; ban specific words upfront; end every Feynman with "without this..."
 - **Provider debugging real-world reps:** API hit two model changes in one session — text-embedding-004 deprecation (404 model not found) → gemini-embedding-2 (then `config` body shape rejected → outputDimensionality at root). Pattern reinforced: read the error body, patch one field, retry. Expected on first contact with any new provider API.
+
+---
+
+**2026-05-25 · Phase 3.2 — Chunking strategies**
+- Covered: why chunking exists (context window limits + retrieval granularity + cost per query), four canonical strategies with definitions (fixed-window, sentence-based, recursive, semantic), the chunk size central trade-off (small = precise / no context; large = self-contained / wasteful), chunk overlap (10-20%) and why it prevents boundary-straddling failures, "lost in the middle" preview (Liu et al. 2023) and its chunking implication (favor smaller well-targeted chunks).
+- Built: [src/lib/chunking.ts](../src/lib/chunking.ts) — segment-grouped fixed-window chunker respecting Deepgram's TranscriptSegment boundaries with configurable `targetChars` (default 1200 ≈ 300 tokens) and `overlapSegments` (default 1). Returns chunks with rich metadata (segmentIndices, speakers, startTime/endTime, charCount). [src/app/api/chunk-demo/route.ts](../src/app/api/chunk-demo/route.ts) — query-param-driven demo (`?target=400&overlap=1`) for live trade-off comparison on a 10-segment sample.
+- **Stuck (well-internalized):**
+  - **Four-strategy taxonomy by name** — Q1 recalled all four (fixed/sentence/recursive/semantic) cold. Cold-recall of taxonomies is rare and credible in interviews.
+  - **Lost in the middle named unprompted** — Q3 used the term as the core pushback to "more context = better." Best argument of the quiz.
+  - **Unified "Deepgram gave us structure" insight** — Q4 and Q5 both reasoned from the same underlying point (input is already segmented; recursive's boundary-finding job is redundant; character-overlap would re-break what segments fixed). He didn't explicitly state this unifier but the reasoning showed it.
+  - **Overlap as the fix for boundary-straddling failures** — Q2 diagnosed correctly without prompting.
+  - **Feynman attempted (second session running).** Pattern reinforcement.
+- **Fuzzy (needs reinforcement):**
+  - **Numeric calibration on "starting value" questions.** Q2 diagnosed overlap as missing but didn't propose a starting value (10-20% / `overlapSegments: 1`). Half-answers signal "concept known, ship not done." Drill: always pair diagnosis with calibration.
+  - **Terminology precision.** Q4 said "user numbers" (meant speaker labels), Q5 said "semantic meaning bonded" (meant bounded). Voice-transcription noise but the underlying vocab needs to lock — say "speaker labels" and "semantically bounded" explicitly.
+  - **Feynman SHAPE — banned-word discipline.** Used "chunk" 4 times despite explicit banned-word list. Analogy (bucket of water) mismatched the concept (chunking is about many small containers, not one with a size limit). "Three reasons" promise unfulfilled. Risk-removed close buried. Practice: write the banned-word list above the draft + test the analogy against the banned-word list before writing.
+  - **Citation strength on lost-in-the-middle.** Q3 named the concept; can level up to "Liu et al. 2023" in the future for paper-citation credibility.

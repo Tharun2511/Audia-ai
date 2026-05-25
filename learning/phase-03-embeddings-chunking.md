@@ -41,3 +41,46 @@ An embedding is a learned vector representation of text — a neural net trained
 - Jay Alammar, [*"The Illustrated Word2Vec"*](https://jalammar.github.io/illustrated-word2vec/) — foundational intuition
 - [MTEB leaderboard](https://huggingface.co/spaces/mteb/leaderboard) — go-to comparison for embedding models
 - Cohere blog on embeddings — strong production framing
+
+---
+
+## Session 3.2 — Chunking strategies
+
+**Built in Audia:** [src/lib/chunking.ts](../src/lib/chunking.ts) — `chunkTranscript(segments, { targetChars, overlapSegments })` that walks Deepgram's `TranscriptSegment[]`, groups into segment-bounded chunks of target size, and emits chunks with `text`, `segmentIndices`, `speakers`, `startTime`, `endTime`, `charCount`. Demo route [src/app/api/chunk-demo/route.ts](../src/app/api/chunk-demo/route.ts) accepts `?target=` and `?overlap=` query params so you can compare strategies live on a 10-segment sample.
+
+### Concept summary
+
+Chunking splits a source document into smaller, embeddable units. It's forced by three things: context window limits, retrieval granularity (whole-doc retrieval returns mostly noise), and per-query cost. Four canonical strategies — fixed-window (simplest, ignores boundaries), sentence-based (good for prose, inconsistent sizes), recursive (industry default — split at largest natural boundary), and semantic (embed-driven, highest quality, highest cost). Chunk size is the central trade-off: small chunks retrieve precisely but lose context; large chunks are self-contained but waste budget. Overlap (10-20% of chunk size) prevents context loss at boundaries. Tune chunk size empirically via recall@k on a golden set (Phase 6).
+
+### 5 most-likely interview questions
+
+1. **Q: Walk me through how you'd chunk a meeting transcript for RAG.**
+   A: Meeting transcripts have natural boundaries from ASR output — segments with speaker, text, and timestamp from Deepgram/Whisper. I'd use a segment-grouped fixed-window strategy: walk the segments, accumulate until target character count (~1200 chars ≈ 300 tokens for conversational), then finalize and start the next chunk with one segment of overlap. Each chunk carries metadata — source transcription ID, segment indices, speakers, time range — so we can cite, filter, or re-rank later. Tune target size via Phase 6 evals.
+
+2. **Q: Recursive vs semantic chunking — when do you use which?**
+   A: Recursive is the industry default — cheap, fast, respects natural boundaries (paragraphs → sentences → words) by splitting at the largest one that keeps chunks under target. Semantic chunking embeds every sentence and creates boundaries where adjacent sentences have low cosine similarity (topic shift). Semantic is higher quality but ~100× more expensive at ingest. Start with recursive for any general RAG; escalate to semantic only for high-stakes (legal, medical) or after measuring recursive's retrieval recall is too low.
+
+3. **Q: What's chunk overlap and why does it matter?**
+   A: A portion of text (typically 10-20% of chunk size) at the start of each chunk duplicates the end of the previous chunk. Without it, ideas straddling a boundary get split — a question about "why March 15?" might retrieve the chunk with the date OR the chunk with the rationale, but not one with both. Cost is duplicated text = more storage and compute per query. Trade-off worth it for conversational/prose data; less critical for code.
+
+4. **Q: How would you tune chunk size in production?**
+   A: Build a golden set of typical user questions paired with the answer chunks they should retrieve (Phase 6 eval discipline). Run retrieval at multiple chunk sizes — 200, 400, 600, 1000 tokens — measure recall@k. Plot recall vs chunk size; pick the knee. Measure latency and storage in parallel. Tune again every few months as corpus and queries shift.
+
+5. **Q: What's "lost in the middle" and how does it affect chunking?**
+   A: Empirical finding (Liu et al. 2023) that LLMs pay disproportionately more attention to content at the beginning and end of long contexts, neglecting the middle. It's more a retrieval-ordering problem than a chunking problem — but it informs design: smaller, well-targeted chunks are more robust because you can position the most-relevant ones at the prompt edges. With one 5,000-token chunk you can't recover from middle-position decay; with five 1,000-token chunks you can rank carefully.
+
+### Gotchas
+
+- **Defaulting to fixed-window on prose.** Splits sentences mid-thought. Use recursive.
+- **No overlap on conversational data.** Boundary-straddling questions fail.
+- **Embedding chunks before deciding chunk strategy.** You'll re-embed when you tune. Decide strategy + measure first.
+- **Treating chunk size as a one-time decision.** It's a hyperparameter — re-tune as corpus and query patterns evolve.
+- **Forgetting metadata.** A chunk vector without source ID / position / timestamp is useless for citations and impossible to re-rank.
+- **Chunking before normalizing whitespace.** `"  Hello.\n\n\nWorld"` and `"Hello. World"` shouldn't produce different chunks.
+
+### Go-deeper resources
+
+- Pinecone, [*"Chunking Strategies for LLM Applications"*](https://www.pinecone.io/learn/chunking-strategies/) — canonical reference
+- Greg Kamradt, *"5 Levels of Text Splitting"* — YouTube, 40 min, hands-on
+- Liu et al., *"Lost in the Middle"* — arxiv.org/abs/2307.03172, the paper that named the failure mode
+- LangChain text splitters docs — industry taxonomy

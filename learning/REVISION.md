@@ -19,7 +19,7 @@
 
 **Part III — Retrieval (RAG)**
 - [§6. Embeddings: vector spaces, cosine, model choice](#6-embeddings-vector-spaces-cosine-model-choice) ✅ *(Phase 3.1)*
-- §7. Chunking strategies *(Phase 3.2 — TBD)*
+- [§7. Chunking strategies](#7-chunking-strategies) ✅ *(Phase 3.2)*
 - §8. pgvector + indexing (IVFFlat vs HNSW) *(Phase 3.3 — TBD)*
 - §9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle *(Phase 4.1 — TBD)*
 - §10. Generation with retrieval: templates, citations, hallucination control *(Phase 4.2 — TBD)*
@@ -1072,6 +1072,147 @@ A: "You re-embed the entire corpus, because vectors from different models live i
 
 ---
 
+## §7. Chunking strategies
+
+### 7.1 Why chunking exists
+
+**🎯 Chunking**
+
+> **Definition:** The process of splitting a source document into smaller, independently-embeddable units (chunks), such that each chunk is small enough to be precisely retrievable but large enough to be self-contained.
+
+**🎯 Chunk**
+
+> **Definition:** A contiguous unit of text from a source document, paired with metadata (source ID, position, speakers/timestamps), embedded as a single vector and retrieved as a single unit.
+
+Three forcing functions, all compounding:
+
+1. **Context window limits.** Even Claude's 200k context can't fit every meeting transcript on a 10-meeting corpus, let alone 10,000. And large contexts trigger **lost-in-the-middle** behavior — models pay less attention to content buried in long prompts.
+2. **Retrieval granularity.** If your "chunk" is an entire 30-minute transcript, retrieval returns the whole thing — mostly noise. You want each chunk small enough that returned content is mostly relevant signal.
+3. **Cost per query.** Every token sent to the model is paid. Sending 50k retrieved tokens when 2k would answer the question is paying for noise.
+
+### 7.2 The four canonical strategies
+
+**🎯 Fixed-window chunking**
+
+> **Definition:** Splitting text into chunks of a fixed character or token length, regardless of semantic structure. Simplest strategy; ignores sentence/paragraph boundaries.
+
+*When to use:* Quick prototypes. Uniform documents (code, logs).
+*Failure mode:* Splits sentences and ideas mid-thought.
+
+**🎯 Sentence-based chunking**
+
+> **Definition:** Splitting on sentence boundaries (periods, line breaks, NLP-detected sentence ends), grouping N sentences per chunk.
+
+*When to use:* Prose documents, articles.
+*Failure mode:* Sentences vary wildly in length — chunk sizes become inconsistent and hard to budget for.
+
+**🎯 Recursive chunking**
+
+> **Definition:** A strategy that tries to split at the largest semantic boundary first (paragraphs), recursively falling back to smaller boundaries (sentences, then words) until each chunk fits within a target size. Industry default.
+
+*When to use:* General-purpose text. LangChain's `RecursiveCharacterTextSplitter` does this — most production RAG systems start here.
+*Failure mode:* Can still split topic boundaries if a topic spans multiple paragraphs.
+
+**🎯 Semantic chunking**
+
+> **Definition:** Embedding-based chunking that scans text sentence-by-sentence and creates a new chunk wherever the embedding distance between consecutive sentences exceeds a threshold — i.e., the topic shifted.
+
+*When to use:* High-stakes applications, conversational transcripts with topic shifts, when retrieval quality matters more than ingest cost.
+*Failure mode:* Expensive (embed every sentence to decide boundaries), slow. Often overkill.
+
+| Strategy | Cost at ingest | Boundary quality | Use when |
+|---|---|---|---|
+| Fixed-window | Cheapest | Worst | Quick prototypes, uniform data |
+| Sentence-based | Cheap | Good for prose | Articles, blog posts |
+| Recursive | Cheap | Good general-purpose | Industry default — start here |
+| Semantic | Expensive | Best | High-stakes, retrieval quality > ingest cost |
+
+**For Audia:** transcripts arrive as `TranscriptSegment[]` with speaker turns + timestamps already as boundaries from Deepgram. We don't detect boundaries — we use them. Audia's chunker is a **segment-grouped fixed-window** strategy: walk segments, accumulate until target size, finalize.
+
+### 7.3 Chunk size — the central trade-off
+
+**🎯 Chunk size**
+
+> **Definition:** The target length of each chunk, measured in tokens or characters. Determines the trade-off between retrieval precision and chunk-level semantic completeness.
+
+| Smaller chunks (~100-200 tokens) | Larger chunks (~500-1000 tokens) |
+|---|---|
+| ✅ Retrieval is **precise** — returned chunk is mostly relevant | ❌ Returned chunk has more noise |
+| ❌ Chunks lose **context** — "she said yes" with no antecedent | ✅ Each chunk is self-contained |
+| ✅ Cheap per-chunk in context budget | ❌ Top-k chunks fill more budget |
+| ❌ More chunks → more storage, more index entries | ✅ Fewer chunks, faster index |
+
+**Common starting points:**
+- **General RAG (articles, docs):** 500 tokens with 50-token overlap
+- **Code/structured:** 200-400 tokens, no overlap
+- **Conversational transcripts (Audia):** 200-400 tokens with 1-segment overlap
+- **Dense reference (legal, medical):** 1000+ tokens
+
+**No universal right answer.** Tune via recall@k measurement against a golden set (Phase 6).
+
+### 7.4 Overlap — preventing context loss at boundaries
+
+**🎯 Chunk overlap**
+
+> **Definition:** A small portion of text (typically 10-20% of chunk size) included at the start of each chunk that duplicates the end of the previous chunk. Prevents loss of context for ideas that span chunk boundaries.
+
+Without overlap, a critical phrase straddling a boundary becomes incomplete in both chunks:
+
+```
+Chunk 1: "...we decided to launch on March 15"
+Chunk 2: "...because marketing was ready and engineering deprioritized analytics"
+```
+
+A user asking *"why was March 15 chosen?"* might retrieve either, but neither alone answers. With overlap:
+
+```
+Chunk 1: "...we decided to launch on March 15"
+Chunk 2: "we decided to launch on March 15, because marketing was ready..."
+```
+
+Chunk 2 has both decision and rationale. Cost: duplicated text = more storage + more compute per query.
+
+### 7.5 Lost in the middle (preview for Phase 4)
+
+**🎯 Lost in the middle**
+
+> **Definition:** Empirically observed LLM failure mode where models pay disproportionately more attention to content at the beginning and end of long contexts, neglecting content in the middle. From Liu et al. 2023.
+
+This is a **retrieval-ordering** problem, not a chunking problem per se. But it informs chunking design: **smaller, well-targeted chunks are more robust to lost-in-the-middle than fewer large chunks.** If your single retrieved chunk is 5,000 tokens, position-within-chunk matters; if you've split into 5 × 1,000-token chunks, you can position the most-relevant ones at the prompt edges. Phase 4 covers reranking + ordering strategies.
+
+### 7.6 What this means in Audia
+
+Today's commit adds [src/lib/chunking.ts](../src/lib/chunking.ts) — `chunkTranscript(segments, { targetChars, overlapSegments })` that respects Deepgram's segment boundaries (never splits an utterance mid-speaker) and emits chunks with metadata: `text`, `segmentIndices`, `speakers`, `startTime`, `endTime`, `charCount`. The [chunk-demo route](../src/app/api/chunk-demo/route.ts) accepts `?target=` and `?overlap=` query params so you can feel the trade-offs live on a 10-segment sample transcript.
+
+Phase 3.3 will store these chunks (plus their embeddings) in pgvector on Neon. Phase 4 will wire them into retrieval.
+
+### 7.7 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **Defaulting to fixed-window on prose.** Splits sentences mid-thought. Use recursive instead.
+- **No overlap on conversational data.** Boundary-straddling questions fail to retrieve coherent answers.
+- **Embedding chunks before deciding chunk strategy.** You'll re-embed when you tune. Decide strategy + measure recall@k *before* corpus-scale ingest.
+- **Treating chunk size as a one-time decision.** It's a hyperparameter you re-tune as your corpus and query patterns evolve.
+- **Forgetting metadata.** A chunk vector with no `source_id` / `position` / `timestamp` is useless for citations (Phase 4.2) and impossible to re-rank.
+- **Chunking before normalizing whitespace.** `"  Hello.\n\n\nWorld"` and `"Hello. World"` shouldn't produce different chunks. Normalize first.
+
+### 7.8 Defense talking points for §7
+
+**🎯 Q: "Walk me through how you'd chunk a meeting transcript for a RAG system."**
+A: "Meeting transcripts have natural boundaries from the ASR output — segments with speaker, text, and timestamp from Deepgram or Whisper. I'd use a *segment-grouped fixed-window* strategy: walk the segments, accumulate until I hit a target character count (~1200 chars ≈ 300 tokens for conversational), then finalize and start the next chunk with one segment of overlap to preserve coherence. Each chunk carries metadata — source transcription ID, segment indices, speakers present, time range, char count — so we can later cite, filter, or re-rank. I'd tune the target size on a golden set in Phase 6 once we have real retrieval-quality data."
+
+**🎯 Q: "When would you use recursive chunking vs semantic chunking?"**
+A: "Recursive is the industry default — cheap, fast, respects natural boundaries (paragraphs → sentences → words) by splitting at the largest one that keeps chunks under target size. Semantic chunking embeds every sentence and creates boundaries where adjacent sentences have low cosine similarity — i.e., when the topic shifts. Semantic is better quality but 100× more expensive at ingest because you embed every sentence. I'd start with recursive for any general RAG, escalate to semantic only for high-stakes use cases (legal, medical) or after measuring that recursive's retrieval recall is too low."
+
+**🎯 Q: "What's chunk overlap and why does it matter?"**
+A: "Overlap is a portion of text (typically 10-20% of chunk size) included at the start of each chunk that duplicates the end of the previous chunk. Without it, ideas that straddle a chunk boundary get split — a question about 'why March 15?' might retrieve the chunk with the date or the chunk with the rationale, but not one chunk that has both. The cost is duplicated text = more storage and more compute per query. The trade-off is usually worth it for conversational and prose data; less critical for code or structured documents where boundaries are semantic."
+
+**🎯 Q: "How would you tune chunk size in production?"**
+A: "I'd build a golden set of typical user questions paired with the answers they should retrieve (this is Phase 6 — eval discipline). Then I'd run retrieval at multiple chunk sizes — 200, 400, 600, 1000 tokens — and measure recall@k on the golden set. Plot recall vs. chunk size; pick the size at the knee. In parallel measure latency and storage. The right size is rarely the smallest or largest — usually a balance. Tune again every few months as the corpus or query patterns shift."
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -1084,6 +1225,10 @@ A: "You re-embed the entire corpus, because vectors from different models live i
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
 - **BPE (Byte-Pair Encoding)** — sub-word tokenization algorithm that learns a vocabulary of byte sequences from a corpus by repeatedly merging the most frequent pair of adjacent symbols.
 - **Chain-of-thought (CoT)** — prompting technique where the model is instructed to show reasoning steps before the final answer. Each token is computation; reasoning tokens give the model more budget for hard problems.
+- **Chunk** — a contiguous unit of text paired with metadata (source ID, position, timestamps), embedded as one vector and retrieved as one unit.
+- **Chunking** — splitting a source document into smaller embeddable units, balancing retrieval precision (small chunks) against semantic completeness (large chunks).
+- **Chunk overlap** — portion of text (typically 10-20% of chunk size) duplicated at the start of each chunk from the end of the previous chunk. Preserves coherence for ideas spanning boundaries.
+- **Chunk size** — target chunk length in tokens or characters. Hyperparameter; tune via recall@k measurement on a golden set.
 - **Cosine similarity** — `(A·B) / (‖A‖·‖B‖)`. Measures angle between two vectors, ignoring magnitude. Range [−1, +1]. The default text-embedding similarity metric.
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
 - **Classifier prompt** — a cheap pre-screening LLM call that classifies user input as injection-attempt or benign before the main call runs. One of the higher-cost defense-in-depth layers.
@@ -1098,6 +1243,7 @@ A: "You re-embed the entire corpus, because vectors from different models live i
 - **Dot product** — `Σᵢ aᵢ·bᵢ`. For unit-normalized vectors equals cosine similarity; cheaper to compute. Default similarity metric when working with already-normalized embeddings.
 - **Embedding (sentence/text)** — learned vector representation of a piece of text. Geometric closeness in the vector space approximates semantic closeness. Foundation of RAG.
 - **Embedding dimensions (dim)** — the fixed length of vectors produced by an embedding model. Common: 384, 768, 1536, 3072. Higher is not linearly better; quality is multi-factorial.
+- **Fixed-window chunking** — splitting text by character or token count regardless of semantic structure. Simplest; ignores sentence boundaries. Best for uniform data (code, logs).
 - **Embedding** — a dense vector representation of a token (or text chunk in RAG contexts). Tokens with similar usage end up with geometrically nearby embeddings.
 - **Few-shot prompting** — including 3–5 input/output examples in the prompt before the real input. The model learns the pattern from demonstrations. Beats long descriptions for custom formats and edge cases.
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
@@ -1105,6 +1251,7 @@ A: "You re-embed the entire corpus, because vectors from different models live i
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
 - **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
+- **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
 - **Norm (vector norm, L2 norm, magnitude)** — `‖A‖ = √(Σᵢ aᵢ²)`. Length of the vector. Unit-normalized vectors have norm = 1.0.
 - **Jailbreak** — a prompt injection variant aimed at bypassing the model's safety training (roleplay tricks, DAN-style prompts).
@@ -1123,6 +1270,7 @@ A: "You re-embed the entire corpus, because vectors from different models live i
 - **Prompt caching** — provider feature where stable prompt prefixes are cached server-side, charging ~10× less for the cached portion on subsequent calls. Real production optimization.
 - **Prompt engineering** — the discipline of writing model instructions for reliable outputs. Reduces to a five-part audit: role, task, format, constraints, examples.
 - **Prompt injection** — user-controlled input containing content designed to override the model's system instructions. Cannot be prevented absolutely; defended via layered defenses.
+- **Recursive chunking** — strategy that splits at the largest semantic boundary first (paragraphs), recursively falling back to smaller boundaries (sentences, words) until chunks fit target size. Industry default; what LangChain's `RecursiveCharacterTextSplitter` does.
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
@@ -1133,6 +1281,8 @@ A: "You re-embed the entire corpus, because vectors from different models live i
 - **Stop sequence** — string(s) which, when generated, halt the model. Provider-side mechanism. Use `["\nUser:", "\n\nHuman:"]` for chat to prevent the model from role-playing the user.
 - **Stop token** — a special token (e.g. `<|endoftext|>`) that the model emits when it judges generation complete. Different from a stop *sequence*.
 - **Sandwich pattern** — prompt engineering technique where critical instructions are restated AFTER the user input. Defense against the model "forgetting" early instructions over long contexts.
+- **Semantic chunking** — embedding-based chunking that creates boundaries where adjacent sentences' embeddings diverge — i.e., the topic shifts. Highest quality, highest cost; embed every sentence to decide boundaries.
+- **Sentence-based chunking** — splitting on sentence boundaries (periods, NLP-detected), grouping N sentences per chunk. Good for prose; inconsistent chunk sizes.
 - **Stop button pattern** — UX convention where the send button morphs into a destructive-colored stop button while streaming. Same position in the input bar; standard across ChatGPT/Claude/Gemini.
 - **Streaming** — sending each generated token to the client as it's produced. Does not change cost or generation speed — only perceived latency.
 - **Structured output** — pattern of constraining LLM responses to a machine-readable shape (typically JSON). Three layers: provider JSON mode, provider schema mode, client validation (Zod).
