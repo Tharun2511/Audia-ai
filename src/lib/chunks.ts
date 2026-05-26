@@ -1,6 +1,6 @@
 import "server-only";
+import { randomUUID } from "crypto";
 import { getDatabase } from "@/db/data-source";
-import { TranscriptChunk } from "@/entity/TranscriptChunk";
 import type { TranscriptChunk as TranscriptChunkData } from "@/lib/chunking";
 
 /**
@@ -12,8 +12,35 @@ function toVectorLiteral(vec: number[]): string {
 }
 
 /**
- * Persist one chunk + its embedding. Uses TypeORM for the row, raw SQL for
- * the vector column (TypeORM doesn't know the vector type).
+ * Defensive guard against bad embedding values. NaN / Infinity / wrong-length
+ * vectors silently corrupt pgvector inserts in some cases — fail loudly at the
+ * boundary so the caller's try/catch logs a clear message instead of leaving
+ * NULL-embedding orphan rows.
+ */
+function validateEmbedding(vec: number[], expectedDim: number): void {
+    if (!Array.isArray(vec)) throw new Error("embedding is not an array");
+    if (vec.length !== expectedDim) {
+        throw new Error(`embedding dim mismatch: got ${vec.length}, expected ${expectedDim}`);
+    }
+    for (let i = 0; i < vec.length; i++) {
+        if (!Number.isFinite(vec[i])) {
+            throw new Error(`embedding[${i}] is not finite: ${vec[i]}`);
+        }
+    }
+}
+
+/**
+ * Persist one chunk + its embedding in a SINGLE atomic INSERT. This replaces
+ * the earlier two-step pattern (`repo.save` then raw `UPDATE`) which produced
+ * NULL-embedding orphans whenever the UPDATE failed after the row was already
+ * written. Now: one statement, either both columns land or neither does.
+ *
+ * Why we hand-write the INSERT instead of using the TypeORM repo:
+ *   - TypeORM doesn't know the `vector` type (Phase 3.3's whole workaround)
+ *   - Including the `embedding::vector` cast inline keeps the write atomic
+ *   - We give up `@CreateDateColumn` auto-population — set NOW() explicitly
+ *   - JSON-encoding `segmentIndices` and `speakers` matches what TypeORM does
+ *     for `simple-json` columns under the hood (it serializes to a text column)
  */
 export async function saveChunkWithEmbedding(
     chunk: TranscriptChunkData,
@@ -21,29 +48,36 @@ export async function saveChunkWithEmbedding(
     userEmail: string,
     chunkIndex: number,
     embedding: number[],
-): Promise<TranscriptChunk> {
+): Promise<{ id: string }> {
+    validateEmbedding(embedding, 768);
+
     const db = await getDatabase();
-    const repo = db.getRepository(TranscriptChunk);
+    const embeddingLiteral = toVectorLiteral(embedding);
 
-    const row = repo.create({
-        transcriptionId,
-        userEmail,
-        chunkIndex,
-        text: chunk.text,
-        segmentIndices: chunk.segmentIndices,
-        speakers: chunk.speakers,
-        startTime: chunk.startTime,
-        endTime: chunk.endTime,
-        charCount: chunk.charCount,
-    });
-    const saved = await repo.save(row);
+    const id = randomUUID();
+    await db.query(
+        `INSERT INTO transcript_chunk
+            (id, "transcriptionId", "userEmail", "chunkIndex", text,
+             "segmentIndices", speakers, "startTime", "endTime", "charCount",
+             embedding, "createdAt")
+         VALUES
+            ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, NOW())`,
+        [
+            id,
+            transcriptionId,
+            userEmail,
+            chunkIndex,
+            chunk.text,
+            JSON.stringify(chunk.segmentIndices),
+            JSON.stringify(chunk.speakers),
+            chunk.startTime,
+            chunk.endTime,
+            chunk.charCount,
+            embeddingLiteral,
+        ],
+    );
 
-    await db.query(`UPDATE transcript_chunk SET embedding = $1::vector WHERE id = $2`, [
-        toVectorLiteral(embedding),
-        saved.id,
-    ]);
-
-    return saved;
+    return { id };
 }
 
 export type SimilarChunkResult = {
@@ -113,8 +147,8 @@ export async function findSimilarChunks(
             transcriptionId: r.transcriptionId,
             chunkIndex: r.chunkIndex,
             text: r.text,
-            segmentIndices: r.segmentIndices,
-            speakers: r.speakers,
+            segmentIndices: parseJsonColumn<number[]>(r.segmentIndices, []),
+            speakers: parseJsonColumn<string[]>(r.speakers, []),
             startTime: r.startTime,
             endTime: r.endTime,
             distance,
@@ -129,6 +163,26 @@ export async function findSimilarChunks(
  */
 function parseVector(s: string): number[] {
     return s.slice(1, -1).split(",").map(Number);
+}
+
+/**
+ * TypeORM's `simple-json` column type stores JSON-encoded strings in a `text`
+ * column. When read via the repository, TypeORM auto-deserializes back to the
+ * original shape. When read via raw SQL (db.query), the driver returns the raw
+ * string — `'["User1"]'`, not `["User1"]`. We parse defensively so callers can
+ * always treat the field as the declared TS type.
+ *
+ * Some drivers/columns may auto-parse (e.g. jsonb), so we handle both cases.
+ */
+function parseJsonColumn<T>(value: unknown, fallback: T): T {
+    if (typeof value === "string") {
+        try {
+            return JSON.parse(value) as T;
+        } catch {
+            return fallback;
+        }
+    }
+    return (value as T) ?? fallback;
 }
 
 export type CandidateChunk = SimilarChunkResult & {
@@ -191,8 +245,8 @@ export async function findCandidateChunks(
             transcriptionId: r.transcriptionId,
             chunkIndex: r.chunkIndex,
             text: r.text,
-            segmentIndices: r.segmentIndices,
-            speakers: r.speakers,
+            segmentIndices: parseJsonColumn<number[]>(r.segmentIndices, []),
+            speakers: parseJsonColumn<string[]>(r.speakers, []),
             startTime: r.startTime,
             endTime: r.endTime,
             distance,
