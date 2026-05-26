@@ -8,16 +8,29 @@ import InputAdornment from "@mui/material/InputAdornment";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
+import Tooltip from "@mui/material/Tooltip";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutlined";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SendIcon from "@mui/icons-material/Send";
 import StopIcon from "@mui/icons-material/Stop";
 import type { TranscriptSegment } from "@/entity/Transcription";
+import { formatDuration } from "./utils";
+
+type Citation = {
+    n: number;                  // 1-indexed chunk number (matches [N] in answer text)
+    chunkId: string;
+    transcriptionId: string;
+    speakers: string[];
+    startTime: number;
+    endTime: number;
+    preview: string;
+};
 
 type Message = {
     role: "user" | "assistant";
     content: string;
     streaming?: boolean;
+    citations?: Citation[];
 };
 
 const QUICK_PROMPTS = [
@@ -28,10 +41,12 @@ const QUICK_PROMPTS = [
 ];
 
 interface Props {
+    transcriptionId: string;
     segments: TranscriptSegment[];
+    onCitationClick?: (startTime: number) => void;
 }
 
-export default function ChatPanel({ segments }: Props) {
+export default function ChatPanel({ transcriptionId, segments, onCitationClick }: Props) {
     const [open, setOpen] = useState(false);
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
@@ -74,13 +89,23 @@ export default function ChatPanel({ segments }: Props) {
                 method: "POST",
                 signal: ctrl.signal,
                 headers: { "Content-Type": "application/json" },
-                // Send the user's question and the reference transcript separately.
-                // The server applies the security sandwich (tags each piece with
-                // its own delimiter so the model can distinguish question from data).
-                body: JSON.stringify({ question, transcriptSegments: segments }),
+                // RAG protocol: client sends only a reference (transcriptionId) +
+                // the question. Server does retrieval, selects relevant chunks,
+                // and includes them in the prompt. No more "ship the whole
+                // transcript" pattern — scales to long meetings.
+                body: JSON.stringify({ question, transcriptionId }),
             });
 
             if (!res.body) throw new Error("No stream");
+
+            // Citations come back in a response header before the stream body.
+            // Parse once; attach to the assistant message so the renderer can
+            // turn [N] markers into clickable chips.
+            const citationsRaw = res.headers.get("X-Citations");
+            const citations: Citation[] = citationsRaw ? JSON.parse(citationsRaw) : [];
+            setMessages((prev) =>
+                prev.map((m, i) => (i === prev.length - 1 ? { ...m, citations } : m))
+            );
 
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
@@ -118,6 +143,76 @@ export default function ChatPanel({ segments }: Props) {
 
     const questionCount = messages.filter((m) => m.role === "user").length;
     const noTranscript = segments.length === 0;
+
+    /**
+     * Renders streamed text with [N] markers replaced by clickable citation
+     * chips. Unknown N (citation hallucinated by the model, or markers from a
+     * partial stream where the next chunk is still arriving) render as plain
+     * "[N]" text so nothing breaks.
+     */
+    const renderWithCitations = (text: string, citations?: Citation[]) => {
+        if (!citations || citations.length === 0) {
+            return <Box component="span" sx={{ whiteSpace: "pre-wrap" }}>{text}</Box>;
+        }
+        const byNumber = new Map(citations.map((c) => [c.n, c]));
+        // Split on [N] markers while KEEPING the markers as separate tokens.
+        const parts = text.split(/(\[\d+\])/g);
+        return (
+            <Box component="span" sx={{ whiteSpace: "pre-wrap" }}>
+                {parts.map((part, idx) => {
+                    const m = part.match(/^\[(\d+)\]$/);
+                    if (!m) return <span key={idx}>{part}</span>;
+                    const n = Number(m[1]);
+                    const cite = byNumber.get(n);
+                    if (!cite) return <span key={idx}>{part}</span>;
+                    const speakerLabel = cite.speakers.join(", ");
+                    const timeLabel = formatDuration(cite.startTime);
+                    return (
+                        <Tooltip
+                            key={idx}
+                            arrow
+                            title={
+                                <Box sx={{ p: 0.5 }}>
+                                    <Box sx={{ fontWeight: 600, fontSize: 11, opacity: 0.8 }}>
+                                        {speakerLabel} · {timeLabel}
+                                    </Box>
+                                    <Box sx={{ fontSize: 12, mt: 0.5 }}>
+                                        {cite.preview}{cite.preview.length >= 140 ? "…" : ""}
+                                    </Box>
+                                </Box>
+                            }
+                        >
+                            <Box
+                                component="span"
+                                onClick={() => onCitationClick?.(cite.startTime)}
+                                sx={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    minWidth: 18,
+                                    height: 18,
+                                    px: 0.5,
+                                    mx: 0.25,
+                                    borderRadius: 1,
+                                    fontSize: 11,
+                                    fontWeight: 600,
+                                    lineHeight: 1,
+                                    bgcolor: "info.main",
+                                    color: "info.contrastText",
+                                    cursor: onCitationClick ? "pointer" : "default",
+                                    transition: "background 120ms",
+                                    "&:hover": onCitationClick ? { bgcolor: "info.dark" } : undefined,
+                                    verticalAlign: "middle",
+                                }}
+                            >
+                                {n}
+                            </Box>
+                        </Tooltip>
+                    );
+                })}
+            </Box>
+        );
+    };
 
     return (
         <Card sx={{ overflow: "hidden" }}>
@@ -247,9 +342,9 @@ export default function ChatPanel({ segments }: Props) {
                                             </Box>
                                         ) : (
                                             <>
-                                                <Box component="span" sx={{ whiteSpace: "pre-wrap" }}>
-                                                    {msg.content}
-                                                </Box>
+                                                {msg.role === "assistant"
+                                                    ? renderWithCitations(msg.content, msg.citations)
+                                                    : <Box component="span" sx={{ whiteSpace: "pre-wrap" }}>{msg.content}</Box>}
                                                 {msg.streaming && (
                                                     <Box
                                                         component="span"

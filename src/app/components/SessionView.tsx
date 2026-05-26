@@ -254,8 +254,17 @@ export default function SessionView({
 
             {/* key={id} resets ChatPanel's internal message state when switching
                 sessions — prevents conversation about session A from leaking
-                into session B's chat panel. */}
-            {segments.length > 0 && <ChatPanel key={id} segments={segments} />}
+                into session B's chat panel.
+                onCitationClick seeks the audio player when the user clicks a [N]
+                chip in an assistant message. */}
+            {segments.length > 0 && (
+                <ChatPanel
+                    key={id}
+                    transcriptionId={id}
+                    segments={segments}
+                    onCitationClick={signedAudioUrl ? seekTo : undefined}
+                />
+            )}
         </Stack>
     );
 }
