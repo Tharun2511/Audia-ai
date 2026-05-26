@@ -140,3 +140,22 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Measurable-trigger phrasing.** When pushing back on premature optimization or default-tool choices, name the *measurable* trigger ("p95 latency above X", "corpus past Y vectors") not vibes ("when we grow").
   - **Feynman: opener.** Don't lead with "we built an important feature." Lead with the analogy.
   - **Feynman: risk-removed sharpness.** "Might not get correct book" → name the actual consequence (slow, expensive, fails past 30min).
+
+---
+
+**2026-05-25 · Phase 4.1 — Retrieval: top-k, MMR, hybrid, lost-in-the-middle**
+- Covered: top-k's three failure modes (redundancy / missed exact matches / no diversity), MMR algorithm with λ knob (formula `λ·rel − (1−λ)·max-sim-to-selected`; λ=0.7 production default), hybrid search via BM25 + dense + RRF (theory only; implementation deferred to Phase 8.2), lost-in-the-middle U-curve and 3 mitigations (fewer chunks / edge-reorder / smaller chunks), full production retrieval pipeline (fan-out-and-narrow: embed → coarse N → optional hybrid → re-rank → optional lost-in-middle reorder → top-k → LLM).
+- Built: extended [chunks.ts](../src/lib/chunks.ts) with `findCandidateChunks()` returning embeddings via `embedding::text` parse; new [rerank.ts](../src/lib/rerank.ts) with generic `maximalMarginalRelevance<T>()` — O(N×k), iterative greedy; updated [search-demo](../src/app/api/search-demo/route.ts) to return `naiveTopK` + `mmrReranked` side-by-side with per-stage timing.
+- Debugged in-session: NULL-embedding orphans surfaced as `parseVector(null).slice` crash. Fixed by adding `AND embedding IS NOT NULL` to both retrieval queries. Root cause is non-atomic two-step write in `saveChunkWithEmbedding` (TypeORM save then UPDATE) — orphans possible if embed() fails between rows. Atomic-INSERT refactor offered, deferred.
+- **Stuck (well-internalized):**
+  - **MMR formula cold** — Q1 wrote it correctly with the right λ knob mental model.
+  - **N=k pushback** — Q3 8.5/10. The senior insight ("MMR without coarse retrieval is theatrical / reduces to top-k regardless of λ") landed.
+  - **"Lower λ" diagnostic for redundancy symptoms** — Q2 clean diagnose + fix.
+  - **Feynman banned-word discipline** — second clean run; pattern is solidifying.
+  - **Library + cover-pages analogy** — extension of 3.3's library analogy that translates "near-duplicate chunks" cleanly.
+- **Fuzzy (needs reinforcement):**
+  - **Cross-encoders vs MMR — "different problems" framing** — Q4 3/10. Said only "MMR eliminates redundancy." Missed the senior framing: MMR optimizes diversity, cross-encoders optimize relevance precision; they're complementary, not alternatives. Production stack runs both. The "X and Y solve different problems" rebuttal pattern applies to most tool-A-vs-tool-B interview questions.
+  - **TypeORM/pg/pgvector layering** — Q5 6/10. Got the concept; missed the structural framing "the driver doesn't know vector at any layer" and the two-options choice (register custom encoder via pgvector-node, vs text round-trip).
+  - **Feynman closer.** Banned words clean BUT lost the "without this..." final beat that was strong in 3.3. Rule for next session: **write the "without this" sentence FIRST**, then the rest of the Feynman, so it can't be forgotten.
+  - **Feynman opener filler.** "This session mainly focused on..." is a junior tell. Lead with the analogy directly.
+  - **Orphan-prevention via atomic writes** — surfaced as a real bug; deferred to optional refactor. When we get there, frame as "the non-transactional two-step pattern is a recurring bug class — always prefer single atomic writes when both columns are determined at the same time."

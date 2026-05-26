@@ -21,7 +21,7 @@
 - [§6. Embeddings: vector spaces, cosine, model choice](#6-embeddings-vector-spaces-cosine-model-choice) ✅ *(Phase 3.1)*
 - [§7. Chunking strategies](#7-chunking-strategies) ✅ *(Phase 3.2)*
 - [§8. pgvector + indexing (IVFFlat vs HNSW)](#8-pgvector--indexing-ivfflat-vs-hnsw) ✅ *(Phase 3.3)*
-- §9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle *(Phase 4.1 — TBD)*
+- [§9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle](#9-retrieval-top-k-mmr-hybrid-lost-in-the-middle) ✅ *(Phase 4.1)*
 - §10. Generation with retrieval: templates, citations, hallucination control *(Phase 4.2 — TBD)*
 
 **Part IV — Conversation state**
@@ -1341,6 +1341,143 @@ A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via 
 
 ---
 
+## §9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle
+
+### 9.1 Top-k retrieval — where most teams start
+
+**🎯 Top-k retrieval**
+
+> **Definition:** Retrieval strategy that returns the *k* chunks with the highest similarity score (or lowest distance) to a query embedding. Sorts the entire candidate set by similarity and slices the top *k*.
+
+Textbook implementation: `ORDER BY embedding <=> $1::vector LIMIT k`. Audia did this in Phase 3.3.
+
+**Three known failure modes that drive everything else in §9:**
+
+1. **Redundancy.** Top-3 chunks may be three near-paraphrases of the same idea — one piece of information dressed up three times. Wasted context budget.
+2. **Missed exact-keyword matches.** Embeddings encode *meaning*, not surface form. A query about "April 17" may not retrieve a chunk that says "April 17" verbatim if surrounding semantic context doesn't match.
+3. **No diversity.** A 30-minute meeting with 3 topics, a query about "what we decided" — naive top-k may return 5 chunks all from whichever topic dominated by chunk count.
+
+### 9.2 MMR — diversity-aware re-ranking
+
+**🎯 MMR (Maximal Marginal Relevance)**
+
+> **Definition:** A re-ranking algorithm that selects results balancing relevance to the query against diversity from already-selected results. Returns *k* items chosen iteratively: at each step, pick the candidate maximizing `λ·sim(candidate, query) − (1-λ)·max_sim(candidate, already_selected)`.
+
+The formula:
+
+```
+MMR_score(d_i) = λ · Sim(d_i, query)  −  (1 − λ) · max_{d_j ∈ Selected} Sim(d_i, d_j)
+```
+
+In plain language: score = *relevance to query* minus *similarity to the most-similar already-picked item*. Pick the highest-scoring, add to Selected, repeat.
+
+**The `λ` knob:**
+
+| λ | Behavior | When to use |
+|---|---|---|
+| 1.0 | Pure relevance — collapses to top-k | Diversity doesn't matter |
+| 0.7 | Relevance-leaning (production default) | Most RAG |
+| 0.5 | Balanced | Conversational chat with diverse-perspective need |
+| 0.0 | Pure diversity — ignores query | Almost never useful |
+
+**Cost:** O(N × k) similarity computations after the initial vector search. Negligible for typical N=20, k=5.
+
+**Critical setup detail:** MMR needs candidate **embeddings** in memory to compute candidate-to-candidate similarities. This drives the two-step pattern:
+
+```
+(1) Coarse retrieval: top-N candidates WITH embeddings (N = 3-5× k)
+(2) MMR re-rank in-memory → top-k
+```
+
+Audia's `findCandidateChunks()` returns embeddings via `embedding::text` cast → parsed back to `number[]` in app code. The MMR runs over them in [src/lib/rerank.ts](../src/lib/rerank.ts).
+
+### 9.3 Hybrid search — combining lexical and semantic
+
+**🎯 Hybrid search**
+
+> **Definition:** Retrieval strategy that combines results from a lexical (keyword) search engine (BM25 or similar) with a dense (vector) search, fusing the two ranked lists into a single result. Captures exact-keyword matches that pure vector search misses.
+
+**Why it matters:** vector embeddings encode meaning but lose surface form. Query about *"the line where Alice said 'NDA'"* — exact match of "NDA" matters. BM25 finds those; vectors find paraphrases. Combine both for robustness.
+
+**🎯 BM25**
+
+> **Definition:** A classic lexical ranking function that scores documents by term frequency, inverse document frequency, and document-length normalization. Industry default for keyword search. Postgres exposes a close approximation via `ts_rank` on `tsvector` columns.
+
+**🎯 RRF (Reciprocal Rank Fusion)**
+
+> **Definition:** Algorithm that combines multiple ranked lists into a single list by summing `1/(k_constant + rank)` across all rankers for each document. Default `k_constant = 60`. Robust to score-scale differences.
+
+The formula:
+
+```
+RRF_score(d) = Σ_{r ∈ rankers}  1 / (60 + rank_r(d))
+```
+
+Why RRF works: documents at the top of *any* ranker get a boost; top of *multiple* rankers gets the biggest boost. **No score normalization needed** — BM25 scores and cosine similarities live on different scales, RRF sidesteps that.
+
+**For Audia today:** hybrid covered in theory only. Implementing BM25 requires `tsvector` column + GIN index + rank fusion. **Phase 8.2 implements it properly** when revisiting search as a UI feature.
+
+### 9.4 Lost-in-the-middle mitigation
+
+**🎯 Lost-in-the-middle**
+
+> **Definition:** Empirically observed LLM failure mode (Liu et al. 2023) where models pay disproportionately more attention to content at the beginning and end of long contexts, neglecting the middle. Shape is a U-curve: best recall at positions 0 and N-1, worst around N/2.
+
+**Three mitigations, in order of effort:**
+
+1. **Fewer chunks.** Pass 3 chunks instead of 10. Simplest.
+2. **Edge-position reordering.** After re-ranking by relevance, REORDER for placement: most-relevant at position 0 AND position k-1, next-most at positions 1 and k-2, least in the middle. The middle gets the chunks we care least about.
+3. **Smaller chunks.** A single 5,000-token chunk has its own internal middle. Five 1,000-token chunks let you control position. Phase 3.2 covered chunk sizing.
+
+For Audia: strategy 1 is already in place (default k=5). Strategy 2 lands in 4.2 when we build the prompt template. Strategy 3 is the chunk-size choice from 3.2.
+
+### 9.5 The production retrieval pipeline
+
+```
+[1] Embed query
+[2] Vector search: top-N coarse candidates   (N typically 20-50)
+[3] [Optional] Hybrid: merge with BM25 via RRF
+[4] [Optional] Re-rank: MMR / cross-encoder / LLM-as-reranker
+[5] [Optional] Lost-in-middle reorder
+[6] Take top-k                               (k typically 3-5)
+[7] Pass to LLM with citations
+```
+
+**"Fan out wide, narrow at each stage" is the production default.** Audia after Phase 4.1: steps 1, 2, 4 (MMR), 6. Steps 3, 5 come later (Phase 8); step 7 is Phase 4.2.
+
+### 9.6 What this means in Audia
+
+[chunks.ts](../src/lib/chunks.ts) gained `findCandidateChunks()` — same query as `findSimilarChunks` but pulls the embedding column too via `embedding::text` cast and parses back to `number[]` in app code. New [rerank.ts](../src/lib/rerank.ts) implements `maximalMarginalRelevance<T>` generically, so future callers (chat, semantic-search UI) can re-rank any embedded objects without changes. The [search-demo route](../src/app/api/search-demo/route.ts) returns BOTH `naiveTopK` and `mmrReranked` side-by-side so the difference is observable — try `λ=0.3` vs `λ=1.0` on the same query.
+
+Phase 4.2 next: wire this retrieval into the chat endpoint, build the prompt template with citations, control hallucination via "say so if not in context."
+
+### 9.7 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **Skipping the wide coarse retrieval.** MMR needs candidates *to choose from*. Pulling top-5 then "re-ranking" 5 is theatrical; the choices were already made by the vector search.
+- **Hardcoding λ=0.5.** Most production teams find λ=0.7 better — relevance still leads, diversity tiebreaks.
+- **Running MMR on (text, distance) tuples without embeddings.** Won't work; you need vectors to compute candidate-to-candidate similarity. This is what `findCandidateChunks` exists to provide.
+- **Pure-diversity λ=0.0.** Ignores the query entirely. Almost never the right call.
+- **Forgetting that re-ranking only helps if your coarse retrieval pulled the right candidates.** If the right chunk isn't in the top-N, MMR can't surface it. Tune N up if you suspect recall is the limit, not re-ranking.
+- **Top-k without ownership filtering at the SQL layer.** §8 covered this — `WHERE userEmail = $1` BEFORE ORDER BY. Cross-tenant leak is worse than redundancy.
+
+### 9.8 Defense talking points for §9
+
+**🎯 Q: "Walk me through your retrieval pipeline."**
+A: "I follow the standard fan-out-and-narrow pattern. Step 1, embed the user's query via the same model used at ingest. Step 2, vector top-N retrieval from pgvector with ownership filtering — `WHERE userEmail = $1 ORDER BY embedding <=> $2 LIMIT n`, typically N=20 which is 3-5× the final k. Step 3 in production would be hybrid via BM25 + RRF; not implemented in Audia yet. Step 4, MMR re-ranking with λ=0.7 to balance relevance against diversity — eliminates near-duplicate chunks the naive top-k surfaces. Step 5 in 4.2 will reorder for lost-in-the-middle, placing most-relevant chunks at positions 0 and k-1. Step 6, slice top-k = 5. Step 7, pass to the LLM with citation markers."
+
+**🎯 Q: "What's MMR and when do you use it?"**
+A: "Maximal Marginal Relevance — a re-ranking algorithm that picks k items balancing relevance to query against diversity from already-selected results. Formula: λ·relevance − (1−λ)·max-similarity-to-selected. Pick the highest-scoring candidate, add to selected, repeat. λ knob controls the trade-off — 1.0 collapses to top-k, 0.7 is production default, 0.0 is pure diversity. Use it whenever top-k may return near-duplicates, which in practice is most RAG workloads. Cost is O(N × k) similarity ops on top of the initial search — negligible at typical N=20, k=5."
+
+**🎯 Q: "Why hybrid search? Isn't vector search enough?"**
+A: "Vector embeddings encode meaning but lose surface form. If a user query contains specific terms — names, codes, exact phrases — vector search may miss documents that contain those terms literally, because the surrounding semantic context doesn't match. BM25 catches exact-term matches; vectors catch paraphrases and synonyms. Combine them via RRF — reciprocal rank fusion — which sums `1/(60 + rank)` across rankers per document. Robust to the different score scales (BM25 raw vs cosine in [0,2]) and pulls documents that score well in either ranker."
+
+**🎯 Q: "How do you handle lost-in-the-middle?"**
+A: "Three layers. First, keep k small — pass 3-5 chunks, not 10. Models attend better to short contexts overall. Second, after re-ranking by relevance, reorder for placement: most-relevant at position 0 AND k-1, next-most at positions 1 and k-2, least-relevant buried in the middle. The middle gets the chunks I care about least, so the U-curve attention pattern bites the least. Third, smaller chunks at ingest time — a 5,000-token single chunk has its own internal middle; five 1,000-token chunks let you control placement. The Liu et al. 2023 paper named the failure mode and is the citation to use."
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -1351,6 +1488,7 @@ A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via 
 - **Async iterator** — JavaScript pattern (`for await ... of`) for consuming streams. Each iteration yields one chunk. Used by Groq/OpenAI SDKs to expose streamed responses.
 - **Autoregressive** — a generation process where each output depends on previous outputs. Token n+1 is sampled from a distribution conditioned on tokens 1..n. All chat LLMs are autoregressive.
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
+- **BM25** — classic lexical ranking function scoring documents by term frequency, inverse document frequency, and document length. Industry default for keyword search. Postgres approximates via `ts_rank` on `tsvector`.
 - **BPE (Byte-Pair Encoding)** — sub-word tokenization algorithm that learns a vocabulary of byte sequences from a corpus by repeatedly merging the most frequent pair of adjacent symbols.
 - **Chain-of-thought (CoT)** — prompting technique where the model is instructed to show reasoning steps before the final answer. Each token is computation; reasoning tokens give the model more budget for hard problems.
 - **Chunk** — a contiguous unit of text paired with metadata (source ID, position, timestamps), embedded as one vector and retrieved as one unit.
@@ -1358,7 +1496,9 @@ A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via 
 - **Chunk overlap** — portion of text (typically 10-20% of chunk size) duplicated at the start of each chunk from the end of the previous chunk. Preserves coherence for ideas spanning boundaries.
 - **Chunk size** — target chunk length in tokens or characters. Hyperparameter; tune via recall@k measurement on a golden set.
 - **Cosine similarity** — `(A·B) / (‖A‖·‖B‖)`. Measures angle between two vectors, ignoring magnitude. Range [−1, +1]. The default text-embedding similarity metric.
+- **Candidate chunk** — a chunk returned by coarse retrieval (wider top-N) that includes its embedding, used as input to in-memory re-rankers like MMR.
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
+- **Coarse retrieval** — the first-stage wide top-N vector search before re-ranking. N typically 3-5× the final k. Provides the candidate pool that re-rankers choose from.
 - **Classifier prompt** — a cheap pre-screening LLM call that classifies user input as injection-attempt or benign before the main call runs. One of the higher-cost defense-in-depth layers.
 - **Content moderation API** — provider-side classifier (OpenAI's moderation, Anthropic's prompt-shield) that flags harmful or adversarial input. Imperfect coverage, but useful as one layer in a stack.
 - **Context window** — the maximum number of tokens (input + output combined) the model can process in a single forward pass. Llama 3.1: 128k. Claude: 200k+.
@@ -1378,10 +1518,12 @@ A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via 
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
 - **HNSW (Hierarchical Navigable Small World)** — graph-based vector index. Multi-layer graph; queries walk top-down via greedy traversal. Slower build than IVFFlat; faster queries, higher recall, incremental.
+- **Hybrid search** — retrieval that combines lexical (BM25) and dense (vector) search, fusing the two ranked lists via RRF or similar. Catches exact-keyword matches that pure vector search misses.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
 - **IVFFlat** — inverted-file vector index. Clusters vectors via k-means into N lists; queries probe closest lists. Fast build, low memory, good recall — but requires data present before build.
 - **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
 - **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
+- **MMR (Maximal Marginal Relevance)** — re-ranking algorithm balancing relevance to query against diversity from already-selected results. Iteratively picks the candidate maximizing `λ·rel − (1−λ)·max-sim-to-selected`. λ=0.7 is production default.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
 - **Norm (vector norm, L2 norm, magnitude)** — `‖A‖ = √(Σᵢ aᵢ²)`. Length of the vector. Unit-normalized vectors have norm = 1.0.
 - **Jailbreak** — a prompt injection variant aimed at bypassing the model's safety training (roleplay tricks, DAN-style prompts).
@@ -1404,6 +1546,8 @@ A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via 
 - **Prompt engineering** — the discipline of writing model instructions for reliable outputs. Reduces to a five-part audit: role, task, format, constraints, examples.
 - **Prompt injection** — user-controlled input containing content designed to override the model's system instructions. Cannot be prevented absolutely; defended via layered defenses.
 - **Recursive chunking** — strategy that splits at the largest semantic boundary first (paragraphs), recursively falling back to smaller boundaries (sentences, words) until chunks fit target size. Industry default; what LangChain's `RecursiveCharacterTextSplitter` does.
+- **Re-ranking** — second-stage filtering that reorders coarse-retrieved candidates by a different criterion (MMR for diversity, cross-encoder for accuracy, LLM-as-judge for quality). The "narrow" step in fan-out-and-narrow retrieval.
+- **RRF (Reciprocal Rank Fusion)** — algorithm combining multiple ranked lists by summing `1/(60 + rank)` across rankers per document. Default `k_constant=60`. Robust to score-scale differences, used in hybrid search.
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
@@ -1423,6 +1567,7 @@ A: "Both are approximate-nearest-neighbor indexes. IVFFlat clusters vectors via 
 - **`stream_options.include_usage`** — flag required to receive token usage data in streamed responses. Without it, usage is omitted; with it, the final chunk carries a `usage` field.
 - **System message** — the role-tagged prompt segment containing instructions, persona, and constraints. Models are trained to weight system content as operator intent.
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
+- **Top-k retrieval** — retrieval strategy returning the *k* chunks with highest similarity (or lowest distance) to a query embedding. Default starting point; vulnerable to redundancy + missed exact matches + no diversity. Improved by re-rankers like MMR.
 - **Top-k sampling** — keep only the k highest-probability tokens, zero the rest, renormalize.
 - **Tokenization** — converting a text string into a sequence of integer token IDs using a fixed vocabulary.
 - **Time to first token (TTFT)** — wall-clock latency from request sent to first response token rendered. Target < 500ms for good UX. The main metric streaming optimizes.
