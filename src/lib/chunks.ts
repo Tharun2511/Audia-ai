@@ -90,7 +90,7 @@ export async function findSimilarChunks(
                 "segmentIndices", speakers, "startTime", "endTime",
                 (embedding <=> $1::vector) AS distance
          FROM transcript_chunk
-         WHERE "userEmail" = $2 ${transcriptionClause}
+         WHERE "userEmail" = $2 AND embedding IS NOT NULL ${transcriptionClause}
          ORDER BY embedding <=> $1::vector
          LIMIT ${limitParam}`,
         params,
@@ -119,6 +119,85 @@ export async function findSimilarChunks(
             endTime: r.endTime,
             distance,
             similarity: 1 - distance,
+        };
+    });
+}
+
+/**
+ * pgvector's text output format is "[0.1,0.2,0.3]" — parse back to number[].
+ * Used when SELECTing the embedding column for in-memory re-ranking.
+ */
+function parseVector(s: string): number[] {
+    return s.slice(1, -1).split(",").map(Number);
+}
+
+export type CandidateChunk = SimilarChunkResult & {
+    embedding: number[];
+};
+
+/**
+ * Wider top-N retrieval that ALSO returns the embedding column. Used as input
+ * to in-memory re-rankers (MMR, cross-encoder, LLM-as-reranker) which need
+ * candidate vectors to compute candidate-to-candidate similarities.
+ *
+ * Typical usage: N = 3-5× the final k. Example: want top-5 after MMR, fetch
+ * top-20 here; MMR picks 5 from those 20.
+ */
+export async function findCandidateChunks(
+    queryEmbedding: number[],
+    userEmail: string,
+    opts: { transcriptionId?: string; n?: number } = {},
+): Promise<CandidateChunk[]> {
+    const db = await getDatabase();
+    const n = opts.n ?? 20;
+    const queryVec = toVectorLiteral(queryEmbedding);
+
+    const params: unknown[] = [queryVec, userEmail];
+    let transcriptionClause = "";
+    if (opts.transcriptionId) {
+        params.push(opts.transcriptionId);
+        transcriptionClause = `AND "transcriptionId" = $${params.length}`;
+    }
+    params.push(n);
+    const limitParam = `$${params.length}`;
+
+    const rows = (await db.query(
+        `SELECT id, "transcriptionId", "chunkIndex", text,
+                "segmentIndices", speakers, "startTime", "endTime",
+                (embedding <=> $1::vector) AS distance,
+                embedding::text AS embedding_text
+         FROM transcript_chunk
+         WHERE "userEmail" = $2 AND embedding IS NOT NULL ${transcriptionClause}
+         ORDER BY embedding <=> $1::vector
+         LIMIT ${limitParam}`,
+        params,
+    )) as Array<{
+        id: string;
+        transcriptionId: string;
+        chunkIndex: number;
+        text: string;
+        segmentIndices: number[];
+        speakers: string[];
+        startTime: number;
+        endTime: number;
+        distance: string | number;
+        embedding_text: string;
+    }>;
+
+    return rows.map((r) => {
+        const distance = Number(r.distance);
+        return {
+            id: r.id,
+            transcriptionId: r.transcriptionId,
+            chunkIndex: r.chunkIndex,
+            text: r.text,
+            segmentIndices: r.segmentIndices,
+            speakers: r.speakers,
+            startTime: r.startTime,
+            endTime: r.endTime,
+            distance,
+            similarity: 1 - distance,
+            embedding: parseVector(r.embedding_text),
         };
     });
 }
