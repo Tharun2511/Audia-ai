@@ -159,3 +159,12 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **Feynman closer.** Banned words clean BUT lost the "without this..." final beat that was strong in 3.3. Rule for next session: **write the "without this" sentence FIRST**, then the rest of the Feynman, so it can't be forgotten.
   - **Feynman opener filler.** "This session mainly focused on..." is a junior tell. Lead with the analogy directly.
   - **Orphan-prevention via atomic writes** — surfaced as a real bug; deferred to optional refactor. When we get there, frame as "the non-transactional two-step pattern is a recurring bug class — always prefer single atomic writes when both columns are determined at the same time."
+
+---
+
+**2026-05-26 · Phase 4.2 — Generation with retrieval: templates, citations, hallucination control**
+- Covered: RAG generation as post-retrieval phase, the 3-layer prompt template (system + numbered context + user input), three citation patterns (inline markers / structured JSON / post-hoc), three hallucination-control techniques (grounding rule / refusal anchoring / quote-then-answer), edge-position reordering for lost-in-the-middle, context budget math at Audia's scale, two protocols for citation metadata delivery (response header vs NDJSON envelope), the `Access-Control-Expose-Headers` gotcha.
+- Built: full RAG pipeline in [chat/route.ts](../src/app/api/chat/route.ts) — embed → coarse N=20 → MMR (k=5, λ=0.7) → edgeReorder → numbered context block → stream LLM with `X-Citations` header. New `CHAT_SYSTEM_PROMPT` with grounding rules + citation format + security rules. [ChatPanel.tsx](../src/app/components/ChatPanel.tsx) sends `transcriptionId` not segments; parses `X-Citations` header; regex-splits `[N]` markers in streamed text; renders chips with Tooltip + click-to-seek. [SessionView.tsx](../src/app/components/SessionView.tsx) wires `onCitationClick → seekTo(startTime)`.
+- **Phase 4 milestone:** "Chat with your transcripts" is real end-to-end. Audia now answers questions grounded in retrieved chunks, with clickable citations that seek the audio. The architectural shift (client sends reference, server retrieves) is what makes it scale beyond short meetings.
+- **Stuck (fill in after quiz/Feynman):** _TBD_
+- **Fuzzy (fill in after quiz/Feynman):** _TBD_

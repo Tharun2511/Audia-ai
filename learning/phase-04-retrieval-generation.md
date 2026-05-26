@@ -44,3 +44,50 @@ Naive top-k retrieval (`ORDER BY distance LIMIT k`) has three known failure mode
 - Liu et al. 2023 [*"Lost in the Middle"*](https://arxiv.org/abs/2307.03172) — the U-curve paper
 - Cormack, Clarke & Buettcher 2009 — original RRF paper, three pages
 - Lewis et al. 2020 — original RAG paper
+
+---
+
+## Session 4.2 — Generation with retrieval: templates, citations, hallucination control
+
+**Built in Audia:**
+- [chat/route.ts](../src/app/api/chat/route.ts) became the full RAG pipeline: embed question → `findCandidateChunks(n=20)` → MMR re-rank (k=5, λ=0.7) → `edgeReorder()` → numbered context block → streaming LLM response with citation header. New `CHAT_SYSTEM_PROMPT` has grounding rules ("use ONLY context, say so if not present") + citation format spec (inline `[N]` markers) + security rules from Phase 1.2.
+- [ChatPanel.tsx](../src/app/components/ChatPanel.tsx) now sends `{question, transcriptionId}` instead of the whole transcript. Reads `X-Citations` response header before streaming, parses `[N]` markers in streamed text via regex split, renders them as clickable MUI Chips with Tooltip metadata (speaker + timestamp + preview), routes click to `onCitationClick(startTime)`.
+- [SessionView.tsx](../src/app/components/SessionView.tsx) wires `onCitationClick → seekTo(startTime)` so clicking a chip seeks the audio player to that exact moment.
+- New `edgeReorder()` helper in chat route — 10-line loop that places most-relevant chunks at positions 0 and k-1 to mitigate lost-in-the-middle.
+
+### Concept summary
+
+RAG generation is the post-retrieval phase: take retrieved chunks, insert into a structured prompt with grounding rules ("use ONLY context, refuse if not present") and citation format ("cite with `[N]` markers"), stream the LLM response, parse citations on the client. The architectural shift in Audia is the client now sends a reference (transcriptionId) rather than the data itself — server does retrieval, only top-k chunks reach the LLM. Three citation patterns: inline markers (streams, fuzzy), structured JSON (strict, doesn't stream), post-hoc attribution (most accurate, extra call). Three hallucination control techniques layered as needed: explicit grounding rule (always), refusal anchoring few-shot (sometimes), quote-then-answer (rarely, expensive). Custom response headers need `Access-Control-Expose-Headers` or fetch hides them silently.
+
+### 5 most-likely interview questions
+
+1. **Q: Walk me through your RAG chat end-to-end.**
+   A: Client sends `{question, transcriptionId}` to chat route. Server embeds the question with Gemini text-embedding-2, calls `findCandidateChunks(n=20)` from pgvector with ownership filter, MMR re-ranks to k=5 with λ=0.7 for diversity, edge-position reorders so most-relevant chunks land at positions 0 and k-1, builds a numbered context block, wraps in `<context>` tags alongside the question in `<user_input>` tags. System prompt has grounding rules + citation format + security rules. Streams the LLM response from Groq llama-3.1-8b-instant. Citation metadata travels in `X-Citations` response header (with `Access-Control-Expose-Headers` so browser exposes it). Client parses `[N]` markers in streamed text, renders as clickable chips with tooltips; click seeks audio to chunk timestamp. Total prompt ~3500 of 8k tokens — comfortable.
+
+2. **Q: How do you prevent hallucination?**
+   A: Three layers. Explicit grounding rule in system prompt ("Use ONLY the context. Say so if not present.") — free, baseline. Optional refusal anchoring — few-shot example of refusal — adds tokens but reinforces pattern. Optional quote-then-answer — instruct model to quote supporting text before each claim — most expensive but tightest grounding. Layer count depends on stakes: Audia uses layer 1; Phase 6 evals would tell me whether to add 2 or 3. Architectural control matters more than prompts: bad retrieval breaks any grounding rule. Wide coarse retrieval + re-rank is the foundation.
+
+3. **Q: Why send citations in a header instead of in the streamed body?**
+   A: Simplicity. Body stays pure text tokens — existing reader loop unchanged. NDJSON envelope would force a client refactor and mix protocol with content. Citation payload is fully known up front — server has the chunks before any tokens stream — so sending once via header fits naturally. Trade-off: header size limit (~8KB total in most clients). At 5 chunks × ~200 bytes each = 1KB, comfortable. Critical detail: set `Access-Control-Expose-Headers: X-Citations` or the browser hides the custom header from fetch — silent failure.
+
+4. **Q: What's the architectural shift in Phase 4.2?**
+   A: Before: chat client sent the entire transcript with every question. Worked on 5-min meetings, broken on 2-hour ones — context window saturated, cost scaled with meeting length not relevance. After: client sends only a reference (transcriptionId) plus the question; server does retrieval scoped to that transcript and includes only the top-k relevant chunks in the prompt. Scales to any meeting length; per-request cost is bounded by k, not by total content. Client is also lighter — chat feature doesn't hold the whole transcript anymore.
+
+5. **Q: Why use inline `[N]` markers instead of structured JSON citations?**
+   A: Streaming. JSON output via `response_format: { type: "json_object" }` doesn't stream cleanly — you can't render a partial JSON object incrementally without complex partial-parse logic. Inline `[N]` markers stream as part of the text and can be parsed by a simple regex split on the client. Trade-off: model can hallucinate citation numbers (cite `[7]` when we only sent 5 chunks) — we handle this gracefully by falling back to plain text. Structured JSON wins when citation correctness matters more than streaming UX (legal, medical, audit-trail systems).
+
+### Gotchas
+
+- **`Access-Control-Expose-Headers` missing** → browser hides custom header from fetch; client never sees citations. Silent fail.
+- **Model cites unknown chunk numbers** → client must render fallback. Don't assume every `[N]` has a matching citation in the map.
+- **Header size limits** → 5-10 chunks of metadata fits; 50 would not. For larger citation payloads, switch to NDJSON.
+- **Forgetting to send `transcriptionId`** in the request body → server retrieves across ALL user's transcripts. Sometimes wanted, sometimes not — be explicit.
+- **Grounding rule too soft** ("try to use the context") → models will use it loosely. The rule must be "ONLY", with explicit "say so if not present" refusal directive.
+- **Top-k too large for context window** → math the budget. At chunk size 300 tokens, k=20 fills the 8k window before the answer even starts.
+
+### Go-deeper resources
+
+- Anthropic, [*RAG cookbook*](https://docs.anthropic.com/en/docs/build-with-claude/contextual-retrieval) — best single explainer of the production pipeline
+- OpenAI cookbook on grounded answers + citations
+- Liu et al. 2023, *"Lost in the Middle"* — same paper as 4.1, now applied via edge-reorder
+- Lewis et al. 2020, *"Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"* — the original RAG paper

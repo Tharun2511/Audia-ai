@@ -22,7 +22,7 @@
 - [§7. Chunking strategies](#7-chunking-strategies) ✅ *(Phase 3.2)*
 - [§8. pgvector + indexing (IVFFlat vs HNSW)](#8-pgvector--indexing-ivfflat-vs-hnsw) ✅ *(Phase 3.3)*
 - [§9. Retrieval: top-k, MMR, hybrid, lost-in-the-middle](#9-retrieval-top-k-mmr-hybrid-lost-in-the-middle) ✅ *(Phase 4.1)*
-- §10. Generation with retrieval: templates, citations, hallucination control *(Phase 4.2 — TBD)*
+- [§10. Generation with retrieval: templates, citations, hallucination control](#10-generation-with-retrieval-templates-citations-hallucination-control) ✅ *(Phase 4.2)*
 
 **Part IV — Conversation state**
 - §11. Memory strategies *(Phase 5 — TBD)*
@@ -1478,6 +1478,141 @@ A: "Three layers. First, keep k small — pass 3-5 chunks, not 10. Models attend
 
 ---
 
+## §10. Generation with retrieval: templates, citations, hallucination control
+
+### 10.1 What RAG generation is
+
+**🎯 RAG generation**
+
+> **Definition:** The post-retrieval phase of a RAG pipeline where retrieved chunks are inserted into the LLM prompt as context, grounding/citation instructions are added, and the LLM generates an answer over the context. The "G" in RAG.
+
+Phase 3 + Phase 4.1 gave us the retrieval half: embed → coarse top-N → re-rank → top-k. Phase 4.2 closes the loop: take those top-k chunks, build a prompt that demands citations and refuses to invent, stream the LLM's grounded answer back to the client.
+
+### 10.2 The three-layer RAG prompt template
+
+**🎯 RAG prompt template**
+
+> **Definition:** A structured prompt with three layers — system instructions (role + grounding rules + citation format), retrieved context (numbered chunks with metadata), and the user question. The structure mirrors the five-part prompt audit from §3 with the retrieved chunks playing the role of examples.
+
+```
+[SYSTEM]
+You are <role>. Answer using ONLY the context below.
+If the answer isn't in the context, say so explicitly.
+Cite which chunks support each claim using [N] markers inline.
+
+[CONTEXT]
+[1] Alice (12:30): chunk text...
+[2] Bob (12:45): chunk text...
+...
+
+[USER]
+<user_input>
+question
+</user_input>
+```
+
+**Why numbered brackets `[1]`, `[2]`:** stable, parseable markers the model has seen abundantly in training (Wikipedia, academic papers). Models cite reliably in this format. Alternatives like `<cite id=1>` or `(chunk_id: abc-def)` work but produce less reliable citations because the model hasn't seen them as often.
+
+### 10.3 Citation patterns — three options
+
+**🎯 Citation pattern**
+
+> **Definition:** The mechanism by which the LLM signals which retrieved chunks support each claim. Three options: inline markers (`[1]`), structured JSON output (`{answer, citations: [{chunkId, quote}]}`), or post-hoc attribution (separate LLM call that maps claims to chunks).
+
+| Pattern | Pros | Cons | When to use |
+|---|---|---|---|
+| **Inline `[N]` markers** | Streams naturally; familiar UX; easy to parse on client | Model can hallucinate chunk numbers; format drift | Default for streaming chat — Audia's pick |
+| **Structured JSON** | Strict schema; pair with `response_format` + Zod | Doesn't stream; loses real-time feedback | High-stakes (legal, medical) where citation correctness > UX |
+| **Post-hoc attribution** | Most accurate; decouples generation from citation | Extra LLM call per response; latency hit | Enterprise compliance, audit trails |
+
+### 10.4 Hallucination control — three techniques
+
+**🎯 Hallucination (RAG)**
+
+> **Definition:** An LLM generating content not grounded in the retrieved chunks — inventing details. In RAG contexts, makes the citation system unsafe because the model may cite real chunks but assert claims those chunks don't support.
+
+| Technique | Effort | Effectiveness |
+|---|---|---|
+| **Explicit grounding rule** in system prompt ("Use ONLY the context. If not present, say so.") | Free (tokens) | High baseline |
+| **Refusal anchoring** (few-shot example showing refusal) | ~200 tokens | Medium boost |
+| **Quote-then-answer** (instruct model to quote supporting text before stating claim) | ~50% more output tokens | High but expensive |
+
+For Audia: explicit grounding rule only. Refusal anchoring + quote-then-answer are Phase 6 evaluation-driven additions (measure hallucination rate, decide).
+
+### 10.5 Edge-position reordering
+
+**🎯 Edge-position reordering**
+
+> **Definition:** Output-ordering strategy where most-relevant chunks are placed at positions 0 and k-1 (prompt edges where LLM attention is strongest), with less-relevant chunks in the middle. Mitigates the lost-in-the-middle U-curve.
+
+For MMR output `[A, B, C, D, E]` (A = most relevant), reorder to `[A, C, E, D, B]`:
+- Position 0: A (most relevant — edge)
+- Position 4: B (second most — edge)
+- Position 2: E (least relevant — middle, where attention is weakest)
+
+The U-curve bites the LEAST-relevant content, exactly where you want it. Audia's `edgeReorder()` helper in [chat/route.ts](../src/app/api/chat/route.ts) does this in a 10-line loop.
+
+### 10.6 Context budget math
+
+**🎯 Context budget**
+
+> **Definition:** The fixed input-token allowance for a single LLM call. RAG prompts compete for it across system, retrieved chunks, conversation history, and the user question.
+
+Audia's Groq `llama-3.1-8b-instant` (8k context):
+- System prompt: ~400 tokens
+- 5 chunks × ~300 tokens = ~1500 tokens
+- Conversation history (Phase 5 later): ~500 tokens
+- User question: ~50 tokens
+- Output reserve: ~1000 tokens
+
+**Total used: ~3500 / 8000 — comfortable.** k=5 is the production sweet spot at our chunk size.
+
+### 10.7 The protocol for delivering citations to the client
+
+Two ways to carry citation metadata from server to client during a streaming response:
+
+| Protocol | How | Trade-off |
+|---|---|---|
+| **Response header (Audia's choice)** | `X-Citations: <JSON>` header set on the streaming Response, read via `res.headers.get()` on client | Simple; one-shot before stream starts; subject to header size limits (~8KB) |
+| **NDJSON envelope** | Each line is JSON: `{type:"meta"}`, then `{type:"delta", text}`, then `{type:"done"}` | Robust to any size; richer protocol; requires line-buffering client refactor |
+
+For Audia at k=5 chunks × ~200 bytes metadata each = ~1KB, well under header limits. Header wins on simplicity.
+
+**Critical detail:** browsers hide custom (non-CORS-safelisted) headers from `fetch()` unless the server announces them via `Access-Control-Expose-Headers: X-Citations`. Forget this and your header silently disappears on the client.
+
+### 10.8 What this means in Audia
+
+[chat/route.ts](../src/app/api/chat/route.ts) is now the full RAG pipeline: embed question → `findCandidateChunks(n=20)` → MMR re-rank (k=5, λ=0.7) → `edgeReorder()` → build numbered context block → stream LLM response with citation header. [ChatPanel.tsx](../src/app/components/ChatPanel.tsx) sends `transcriptionId` (not the whole transcript), reads `X-Citations` header before consuming the stream, parses `[N]` markers in streamed text, renders them as clickable MUI Chips with tooltips showing speaker + timestamp + preview. [SessionView.tsx](../src/app/components/SessionView.tsx) wires `onCitationClick → seekTo(startTime)` so clicking a chip seeks the audio player to that exact moment in the meeting.
+
+**The architectural shift you should feel:** before today, the chat client sent the entire transcript with every question (worked on small meetings, broken on long ones). After today, the client sends only a *reference* (transcriptionId) and the server retrieves what's relevant. Scales to any meeting length.
+
+### 10.9 Common pitfalls
+
+**⚠️ Pitfalls:**
+
+- **Skipping the grounding rule in the system prompt.** Without "use ONLY the context, say so if not present," the model will happily invent. Free fix; never skip.
+- **Forgetting `Access-Control-Expose-Headers` on custom headers.** Server sends them, client never sees them. Silent failure mode.
+- **Trusting that `[N]` always references a real chunk.** Models occasionally cite a number outside the chunk range. Client must gracefully handle unknown N (Audia falls back to rendering as plain `[N]` text).
+- **Not setting a chunk number → metadata map on the client.** O(N²) lookups in render get expensive at high message counts. Audia uses `new Map(citations.map(c => [c.n, c]))`.
+- **Embedding the whole conversation history alongside the retrieved chunks.** Phase 5 territory — but worth noting now: as chat history grows, you're trading context-window budget against retrieval depth.
+- **Using context = "stuff the whole transcript in."** This was Audia's chat before today. Works on 5-min meetings, breaks on 30-min, impossible on 2-hour. RAG is the only path to scale.
+
+### 10.10 Defense talking points for §10
+
+**🎯 Q: "Walk me through your RAG chat end-to-end."**
+A: "Client sends `{question, transcriptionId}` to `/api/chat`. Server: 1) embed question with Gemini `text-embedding-2`; 2) `findCandidateChunks(n=20)` from pgvector, ownership-filtered; 3) MMR re-rank to k=5, λ=0.7; 4) edge-position reorder so most-relevant chunks land at positions 0 and k-1; 5) build a numbered context block, wrap in `<context>` tags; 6) build system prompt with grounding rules + citation instructions + security rules; 7) stream the LLM response from Groq llama-3.1-8b-instant. Citation metadata travels in an `X-Citations` response header so the client can render `[N]` markers as clickable chips. On click, the chip seeks the audio player to the chunk's timestamp. Total prompt is ~3500 tokens of an 8k window — well-budgeted."
+
+**🎯 Q: "How do you prevent hallucination?"**
+A: "Three layers. First — explicit grounding rule in the system prompt: 'Use ONLY the context below. If the answer isn't in the context, say so.' This is free in tokens and shifts baseline model behavior toward refusal-on-no-match. Second, optional refusal anchoring — a few-shot example showing the model refusing cleanly. Third, optional quote-then-answer pattern — instruct the model to quote the supporting text before each claim, which forces grounding at the sentence level. Production layering depends on stakes: Audia uses layer 1; Phase 6 evals would tell us if 2 or 3 are needed. Beyond prompts, the architectural control is *what* you retrieve — bad retrieval makes any grounding rule moot. Wide coarse retrieval + re-rank is the foundation."
+
+**🎯 Q: "Why send citations in a header instead of in the streamed body?"**
+A: "Two reasons. First, simplicity — the streamed body stays as pure text tokens, same shape as before; the client's existing reader loop doesn't change. NDJSON envelopes would force a client refactor and mixing protocol with content. Second, the citation payload is known up front — server has all the chunks before any tokens stream. Sending them once in a header is the natural fit. Trade-off: header size limit (~8KB across all headers in most clients) caps the citation payload. At 5 chunks × ~200 bytes metadata each, we're at ~1KB — comfortable. Audia also sets `Access-Control-Expose-Headers: X-Citations` so the browser actually exposes the custom header to fetch."
+
+**🎯 Q: "Why does the client send only `transcriptionId` instead of the segments?"**
+A: "That's the RAG architectural shift. Before, chat sent the entire transcript every request — fine on a 5-minute meeting, broken on a 2-hour one because of context-window limits and cost. With RAG, the client sends a *reference* (transcriptionId), the server does retrieval scoped to that transcript, and only the top-k relevant chunks reach the LLM. Scales to arbitrary meeting length; per-request cost stays bounded. The client is also lighter — it doesn't hold the whole transcript in the chat-feature memory anymore."
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -1498,6 +1633,8 @@ A: "Three layers. First, keep k small — pass 3-5 chunks, not 10. Models attend
 - **Cosine similarity** — `(A·B) / (‖A‖·‖B‖)`. Measures angle between two vectors, ignoring magnitude. Range [−1, +1]. The default text-embedding similarity metric.
 - **Candidate chunk** — a chunk returned by coarse retrieval (wider top-N) that includes its embedding, used as input to in-memory re-rankers like MMR.
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
+- **Citation pattern** — the mechanism by which an LLM signals which retrieved chunks support each claim. Three options: inline `[N]` markers, structured JSON, or post-hoc attribution. Inline markers are streaming-friendly and the Audia default.
+- **Context budget** — the fixed input-token allowance for one LLM call. RAG prompts compete for it across system, retrieved chunks, conversation history, and user question.
 - **Coarse retrieval** — the first-stage wide top-N vector search before re-ranking. N typically 3-5× the final k. Provides the candidate pool that re-rankers choose from.
 - **Classifier prompt** — a cheap pre-screening LLM call that classifies user input as injection-attempt or benign before the main call runs. One of the higher-cost defense-in-depth layers.
 - **Content moderation API** — provider-side classifier (OpenAI's moderation, Anthropic's prompt-shield) that flags harmful or adversarial input. Imperfect coverage, but useful as one layer in a stack.
@@ -1508,6 +1645,7 @@ A: "Three layers. First, keep k small — pass 3-5 chunks, not 10. Models attend
 - **Defense-in-depth** — security principle of layering multiple imperfect defenses so an attacker has to bypass all of them simultaneously. Standard approach for prompt injection.
 - **Delimiters (in prompts)** — explicit tags or fences wrapped around user content (e.g. `<user_input>...</user_input>`) so the model can clearly distinguish data from instructions. Cheap defense layer.
 - **Direct injection** — prompt injection where the attacker is the user themselves, typing malicious instructions directly into your app.
+- **Edge-position reordering** — output-ordering strategy where most-relevant chunks go to positions 0 and k-1 (prompt edges), least-relevant to the middle. Mitigates lost-in-the-middle attention decay.
 - **Dot product** — `Σᵢ aᵢ·bᵢ`. For unit-normalized vectors equals cosine similarity; cheaper to compute. Default similarity metric when working with already-normalized embeddings.
 - **Embedding (sentence/text)** — learned vector representation of a piece of text. Geometric closeness in the vector space approximates semantic closeness. Foundation of RAG.
 - **Embedding dimensions (dim)** — the fixed length of vectors produced by an embedding model. Common: 384, 768, 1536, 3072. Higher is not linearly better; quality is multi-factorial.
@@ -1517,6 +1655,8 @@ A: "Three layers. First, keep k small — pass 3-5 chunks, not 10. Models attend
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
+- **Grounding rule** — system-prompt instruction directing the model to answer using only the provided context and to refuse if information isn't present. Cheapest hallucination control technique.
+- **Hallucination (RAG sense)** — LLM generating content not grounded in retrieved chunks. Distinct from generic LLM hallucination; specific to "claim asserts X but chunks don't support X."
 - **HNSW (Hierarchical Navigable Small World)** — graph-based vector index. Multi-layer graph; queries walk top-down via greedy traversal. Slower build than IVFFlat; faster queries, higher recall, incremental.
 - **Hybrid search** — retrieval that combines lexical (BM25) and dense (vector) search, fusing the two ranked lists via RRF or similar. Catches exact-keyword matches that pure vector search misses.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
@@ -1545,7 +1685,10 @@ A: "Three layers. First, keep k small — pass 3-5 chunks, not 10. Models attend
 - **Prompt caching** — provider feature where stable prompt prefixes are cached server-side, charging ~10× less for the cached portion on subsequent calls. Real production optimization.
 - **Prompt engineering** — the discipline of writing model instructions for reliable outputs. Reduces to a five-part audit: role, task, format, constraints, examples.
 - **Prompt injection** — user-controlled input containing content designed to override the model's system instructions. Cannot be prevented absolutely; defended via layered defenses.
+- **RAG generation** — the post-retrieval phase of a RAG pipeline where retrieved chunks are inserted into the LLM prompt as context, grounding/citation rules added, and the LLM generates a grounded answer.
+- **RAG prompt template** — structured prompt with three layers: system instructions (role, grounding rules, citation format), retrieved context (numbered chunks with metadata), and the user question wrapped in `<user_input>` tags.
 - **Recursive chunking** — strategy that splits at the largest semantic boundary first (paragraphs), recursively falling back to smaller boundaries (sentences, words) until chunks fit target size. Industry default; what LangChain's `RecursiveCharacterTextSplitter` does.
+- **Refusal anchoring** — including a few-shot example in the prompt where the model refuses to answer because the information isn't in the context. Reinforces the grounding rule pattern.
 - **Re-ranking** — second-stage filtering that reorders coarse-retrieved candidates by a different criterion (MMR for diversity, cross-encoder for accuracy, LLM-as-judge for quality). The "narrow" step in fan-out-and-narrow retrieval.
 - **RRF (Reciprocal Rank Fusion)** — algorithm combining multiple ranked lists by summing `1/(60 + rank)` across rankers per document. Default `k_constant=60`. Robust to score-scale differences, used in hybrid search.
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
