@@ -166,5 +166,24 @@ One line per session. Date · phase · what we covered · what stuck · what's f
 - Covered: RAG generation as post-retrieval phase, the 3-layer prompt template (system + numbered context + user input), three citation patterns (inline markers / structured JSON / post-hoc), three hallucination-control techniques (grounding rule / refusal anchoring / quote-then-answer), edge-position reordering for lost-in-the-middle, context budget math at Audia's scale, two protocols for citation metadata delivery (response header vs NDJSON envelope), the `Access-Control-Expose-Headers` gotcha.
 - Built: full RAG pipeline in [chat/route.ts](../src/app/api/chat/route.ts) — embed → coarse N=20 → MMR (k=5, λ=0.7) → edgeReorder → numbered context block → stream LLM with `X-Citations` header. New `CHAT_SYSTEM_PROMPT` with grounding rules + citation format + security rules. [ChatPanel.tsx](../src/app/components/ChatPanel.tsx) sends `transcriptionId` not segments; parses `X-Citations` header; regex-splits `[N]` markers in streamed text; renders chips with Tooltip + click-to-seek. [SessionView.tsx](../src/app/components/SessionView.tsx) wires `onCitationClick → seekTo(startTime)`.
 - **Phase 4 milestone:** "Chat with your transcripts" is real end-to-end. Audia now answers questions grounded in retrieved chunks, with clickable citations that seek the audio. The architectural shift (client sends reference, server retrieves) is what makes it scale beyond short meetings.
-- **Stuck (fill in after quiz/Feynman):** _TBD_
-- **Fuzzy (fill in after quiz/Feynman):** _TBD_
+- **Mid-session bug fixes worth keeping:**
+  - **Orphan NULL-embedding chunks** — root cause was non-atomic two-step write in `saveChunkWithEmbedding`. Refactored to single atomic INSERT with client-side `randomUUID()` + `validateEmbedding()` guard. Pattern: when two pieces of state must agree, write them in one statement, not two.
+  - **`c.speakers.join is not a function`** — raw SQL via `db.query` returns `simple-json` columns as raw strings; TypeORM's repo auto-parses them but raw queries don't. Added `parseJsonColumn<T>()` helper that handles both cases. Pattern: at any boundary where raw-SQL data enters typed app code, explicitly parse anything the driver doesn't natively handle.
+  - **Small-model hallucination on empty retrieval** — Llama-3.1-8b confidently invented "Sarah/John/budget" when sent a question with 0 chunks. Fixed via empty-retrieval short-circuit: skip the LLM call entirely, stream a deterministic "no indexed content" message. Pattern: architectural guards beat prompt rules for failure modes you can detect upfront.
+  - **Stale chunks on transcript edit** — PATCH now regenerates chunks (delete → re-chunk → re-embed → re-save) when segments change; DELETE cascades to chunks. Strategy A from the design space.
+  - **Backfill route** for existing transcriptions that pre-date Phase 3.3's chunking pipeline. One-off; delete after running.
+- **Stuck (well-internalized):**
+  - **RAG layers (system / context / user)** — Q1 8/10, all 3 citation patterns recalled.
+  - **Inline markers vs JSON streaming trade-off** — Q3 8/10, the "JSON can't be partially parsed by Zod, kills TTFT" insight is interview-grade.
+  - **Hallucinated chunk number client fallback** — Q2 7/10, right concept (render plain text, don't hide).
+  - **Banned-word discipline in Feynman** — 4 sessions running. Solid.
+  - **Atomic-write discipline** — internalized through the orphan-chunk bug fix in real time.
+- **Fuzzy (needs reinforcement):**
+  - **"Why bother with citations if model has chunks?" rebuttal** — Q4 6/10. Only verification angle. Missed: hallucination detection, retrieval-quality debugging, trust, audit-trail. The rebuttal pattern is "reject the framing — the model isn't the only consumer; the user is too."
+  - **Honoring question scope.** Q5 walked the entire pipeline when asked specifically about client-side from fetch-resolve onward. Same gap as Phase 3.3 Q5. Drill for Phase 5+: when a question says "from X to Y," constrain the answer to that range.
+  - **Feynman: opener with "without this..." sentence FIRST** — rule from 4.1 wasn't applied; risk-removed closer missing again. Try the mechanical constraint in 5.1: write the without-this line first, then the rest.
+  - **Feynman: USING the analogy vs NAMING it** — 4.2's Wikipedia analogy was tacked on as a label, not used to STRUCTURE the explanation. Sentence test: if you can replace the analogy noun with "the feature" and the sentence still works, you've decorated, not constructed. In 5.1: write sentence 2 entirely in the analogy's vocabulary (no "Audia," no "the system," no "the AI" — just the analogy nouns).
+- **Loose ends to follow up in Session 5.1:**
+  - Backfill route at `/api/backfill-chunks` exists but hasn't been triggered by Tharun yet. Once run, delete the route.
+  - Old transcripts (pre-Phase 3.3) may still need backfill before chat works on them.
+  - The "context tag echo in model output" issue from the JS-transcript hallucination is likely fixed by the empty-retrieval short-circuit, but worth verifying on a session that does have chunks.
