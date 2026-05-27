@@ -83,7 +83,7 @@ export default function SessionListItem({ record, selected, onSelect, onDelete }
                         {relativeTime(record.createdAt)}
                     </Typography>
                     <Typography variant="caption" sx={{ fontSize: 10, color: "text.disabled" }}>·</Typography>
-                    <Typography variant="caption" sx={{ fontSize: 10, fontFamily: "var(--font-geist-mono), monospace", color: "text.disabled" }}>
+                    <Typography className="tabular-nums" variant="caption" sx={{ fontSize: 10, fontFamily: "var(--font-geist-mono), monospace", color: "text.disabled" }}>
                         {formatDuration(record.duration)}
                     </Typography>
                     {speakers.length > 0 && (

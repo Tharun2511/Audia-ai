@@ -168,7 +168,7 @@ export default function SessionView({
                     variant="title"
                 />
                 <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", flexWrap: "wrap", mt: 1.25 }}>
-                    <Typography variant="caption" sx={{ fontSize: 11, color: "text.disabled", fontFamily: "var(--font-geist-mono), monospace" }}>
+                    <Typography className="tabular-nums" variant="caption" sx={{ fontSize: 11, color: "text.disabled", fontFamily: "var(--font-geist-mono), monospace" }}>
                         {formatDuration(duration)}
                     </Typography>
                     <Typography variant="caption" sx={{ fontSize: 11, color: "text.disabled" }}>·</Typography>
@@ -208,10 +208,9 @@ export default function SessionView({
                         zIndex: 2,
                         // Permanent soft shadow — looks fine in-flow, gives
                         // crisp separation from content scrolling beneath when
-                        // docked. Avoids needing IntersectionObserver for a
-                        // "stuck" state.
+                        // docked. CSS var swaps per color scheme.
                         "& > .MuiCard-root": {
-                            boxShadow: "0 6px 20px -8px rgba(15, 23, 42, 0.18)",
+                            boxShadow: "var(--audia-sticky-shadow)",
                         },
                     }}
                 >

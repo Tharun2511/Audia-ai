@@ -39,7 +39,7 @@ export function ReadyState({
             }}
         >
             <Stack spacing={1.5} sx={{ alignItems: "center" }}>
-                <Typography variant="h5" sx={{ fontWeight: 700, color: "text.primary" }}>
+                <Typography variant="h5" sx={{ fontWeight: 700, color: "text.primary", textWrap: "balance" }}>
                     Start a new session
                 </Typography>
                 <Typography variant="body2" sx={{ color: "text.secondary", maxWidth: 420 }}>
@@ -59,8 +59,10 @@ export function ReadyState({
                     py: 1.75,
                     fontSize: 16,
                     borderRadius: 999,
-                    boxShadow: "0 12px 28px -10px rgba(91,33,182,0.55)",
-                    "&:hover": { boxShadow: "0 14px 30px -8px rgba(91,33,182,0.7)" },
+                    boxShadow: "0 12px 28px -10px color-mix(in srgb, var(--mui-palette-primary-main) 55%, transparent)",
+                    transition: "transform 80ms ease, box-shadow 200ms ease",
+                    "&:hover": { boxShadow: "0 14px 30px -8px color-mix(in srgb, var(--mui-palette-primary-main) 70%, transparent)" },
+                    "&:active": { transform: "scale(0.98)" },
                 }}
             >
                 Start Recording
@@ -79,7 +81,7 @@ export function ReadyState({
             </Box>
 
             {error && (
-                <Box sx={{ maxWidth: 420, p: 2, borderRadius: 2, border: 1, borderColor: "error.main", bgcolor: "rgba(220,38,38,0.06)" }}>
+                <Box sx={{ maxWidth: 420, p: 2, borderRadius: 2, border: 1, borderColor: "error.main", bgcolor: "color-mix(in srgb, var(--mui-palette-error-main) 6%, transparent)" }}>
                     <Typography variant="caption" sx={{ color: "error.main", lineHeight: 1.6 }}>
                         {error}
                     </Typography>
@@ -119,8 +121,8 @@ export function RecordingState({
             <Box sx={{ position: "relative", width: 160, height: 160, display: "flex", alignItems: "center", justifyContent: "center" }}>
                 {!isPaused && (
                     <>
-                        <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "rgba(239,68,68,0.4)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite" }} />
-                        <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "rgba(239,68,68,0.25)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) 0.5s infinite" }} />
+                        <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "color-mix(in srgb, var(--mui-palette-error-main) 40%, transparent)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite" }} />
+                        <Box sx={{ position: "absolute", inset: 0, borderRadius: "50%", border: "2px solid", borderColor: "color-mix(in srgb, var(--mui-palette-error-main) 25%, transparent)", animation: "pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) 0.5s infinite" }} />
                     </>
                 )}
                 <Box
@@ -128,14 +130,16 @@ export function RecordingState({
                         width: 104,
                         height: 104,
                         borderRadius: "50%",
-                        bgcolor: isPaused ? "rgba(239,68,68,0.55)" : "#ef4444",
-                        color: "#fff",
+                        bgcolor: isPaused
+                            ? "color-mix(in srgb, var(--mui-palette-error-main) 55%, transparent)"
+                            : "error.main",
+                        color: "common.white",
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
                         boxShadow: isPaused
-                            ? "0 10px 24px -10px rgba(239,68,68,0.35)"
-                            : "0 14px 32px -8px rgba(239,68,68,0.55)",
+                            ? "0 10px 24px -10px color-mix(in srgb, var(--mui-palette-error-main) 35%, transparent)"
+                            : "0 14px 32px -8px color-mix(in srgb, var(--mui-palette-error-main) 55%, transparent)",
                         transition: "background-color 200ms, box-shadow 200ms",
                     }}
                 >
@@ -148,14 +152,14 @@ export function RecordingState({
             </Box>
 
             <Stack spacing={0.5} sx={{ alignItems: "center" }}>
-                <Typography sx={{ fontFamily: "var(--font-geist-mono), monospace", fontSize: 32, fontWeight: 700, color: "text.primary", letterSpacing: 1 }}>
+                <Typography className="tabular-nums" sx={{ fontFamily: "var(--font-geist-mono), monospace", fontSize: 32, fontWeight: 700, color: "text.primary", letterSpacing: 1 }}>
                     {formatDuration(elapsed)}
                 </Typography>
                 <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
                     {!isPaused && (
-                        <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: "#ef4444", animation: "rec-blink 1s ease-in-out infinite" }} />
+                        <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: "error.main", animation: "rec-blink 1s ease-in-out infinite" }} />
                     )}
-                    <Typography variant="body2" sx={{ color: isPaused ? "warning.main" : "#ef4444", fontWeight: 500 }}>
+                    <Typography variant="body2" sx={{ color: isPaused ? "warning.main" : "error.main", fontWeight: 500 }}>
                         {isPaused ? "Paused" : "Recording in progress"}
                     </Typography>
                 </Stack>
@@ -169,7 +173,13 @@ export function RecordingState({
                         variant="contained"
                         size="large"
                         startIcon={<PlayArrowIcon />}
-                        sx={{ px: 3.5, py: 1.5, borderRadius: 999 }}
+                        sx={{
+                            px: 3.5,
+                            py: 1.5,
+                            borderRadius: 999,
+                            transition: "transform 80ms ease",
+                            "&:active": { transform: "scale(0.98)" },
+                        }}
                     >
                         Resume
                     </Button>
@@ -179,7 +189,13 @@ export function RecordingState({
                         variant="outlined"
                         size="large"
                         startIcon={<PauseIcon />}
-                        sx={{ px: 3.5, py: 1.5, borderRadius: 999 }}
+                        sx={{
+                            px: 3.5,
+                            py: 1.5,
+                            borderRadius: 999,
+                            transition: "transform 80ms ease",
+                            "&:active": { transform: "scale(0.98)" },
+                        }}
                     >
                         Pause
                     </Button>
@@ -187,15 +203,15 @@ export function RecordingState({
                 <Button
                     onClick={onStop}
                     variant="contained"
+                    color="error"
                     size="large"
                     startIcon={<StopIcon />}
                     sx={{
-                        bgcolor: "#ef4444",
-                        color: "#fff",
                         px: 3.5,
                         py: 1.5,
                         borderRadius: 999,
-                        "&:hover": { bgcolor: "#dc2626" },
+                        transition: "transform 80ms ease, background-color 200ms",
+                        "&:active": { transform: "scale(0.98)" },
                     }}
                 >
                     Stop

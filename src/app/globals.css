@@ -1,14 +1,54 @@
-@import "tailwindcss";
+/* Color-scheme hints — paired with MUI's class-based color scheme */
+:root { color-scheme: light; }
+.mui-color-scheme-dark { color-scheme: dark; }
 
+/* Layout baseline — html/body fill the viewport, body is a flex column */
+html { height: 100%; }
+body {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+/* Stable scrollbar gutter — prevents layout shift when scrollbar appears */
+html { scrollbar-gutter: stable; }
+
+/* Kill the iOS tap flash on mobile */
+html { -webkit-tap-highlight-color: transparent; }
+
+/* Brand-colored selection */
+::selection {
+  background-color: color-mix(in srgb, var(--mui-palette-primary-main) 28%, transparent);
+  color: var(--mui-palette-text-primary);
+}
+
+/* Brand-colored caret in inputs */
+input, textarea { caret-color: var(--mui-palette-primary-main); }
+
+/* Utility: tabular figures for timers, durations, monospace numbers */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* Utility: clamp text to N lines with ellipsis. Use `style="--lines:2"` */
+.line-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--lines, 2);
+  overflow: hidden;
+}
+
+/* iOS safe-area helper for bottom-sheet / sticky bottom controls */
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+
+/* Keyframes */
 @keyframes pulse-ring {
-  0% {
-    transform: scale(0.9);
-    opacity: 0.6;
-  }
-  100% {
-    transform: scale(1.9);
-    opacity: 0;
-  }
+  0% { transform: scale(0.9); opacity: 0.6; }
+  100% { transform: scale(1.9); opacity: 0; }
 }
 
 @keyframes rec-blink {
@@ -26,20 +66,11 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
-:root {
-  color-scheme: light;
-}
+.animate-fade-in { animation: fade-in 0.25s ease both; }
 
-.mui-color-scheme-dark {
-  color-scheme: dark;
-}
-
-*, *::before, *::after {
-  box-sizing: border-box;
-}
-
-body {
-  -webkit-font-smoothing: antialiased;
+/* Honor prefers-reduced-motion across every custom animation */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in, .pulse-ring, .rec-blink, .bar-wave { animation: none !important; }
 }
 
 /* Scrollbar — light scheme */
@@ -52,10 +83,6 @@ body {
 .mui-color-scheme-dark ::-webkit-scrollbar-thumb { background: rgba(167,139,250,0.25); }
 .mui-color-scheme-dark ::-webkit-scrollbar-thumb:hover { background: rgba(167,139,250,0.45); }
 
-.animate-fade-in {
-  animation: fade-in 0.25s ease both;
-}
-
 /* BrandLogo: white border ring, only visible in dark mode */
 .brand-logo-dark-ring { display: none; }
 .mui-color-scheme-dark .brand-logo-dark-ring { display: inline; }
@@ -64,3 +91,8 @@ body {
    plain sx string (no theme function, which can't cross the RSC boundary). */
 :root { --audia-card-shadow: 0 20px 50px -20px rgba(91,33,182,0.18); }
 .mui-color-scheme-dark { --audia-card-shadow: 0 20px 50px -20px rgba(0,0,0,0.6); }
+
+/* Sticky-element shadow — softer than card shadow, used on pinned controls
+   like the SessionView audio player. Swaps per scheme. */
+:root { --audia-sticky-shadow: 0 6px 20px -8px rgba(15,23,42,0.18); }
+.mui-color-scheme-dark { --audia-sticky-shadow: 0 6px 20px -8px rgba(0,0,0,0.5); }

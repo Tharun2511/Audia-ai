@@ -127,6 +127,7 @@ export default function TitleInput({ transcriptionId, initialTitle, fallback, on
                     color: initialTitle ? "text.primary" : "text.disabled",
                     fontStyle: initialTitle ? "normal" : "italic",
                     lineHeight: 1.2,
+                    textWrap: variant === "title" ? "balance" : undefined,
                 }}
             >
                 {initialTitle ?? fallback}

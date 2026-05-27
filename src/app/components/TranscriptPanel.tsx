@@ -430,6 +430,7 @@ export default function TranscriptPanel({
                                                     {seg.speaker}
                                                 </Typography>
                                                 <Chip
+                                                    className="tabular-nums"
                                                     label={formatDuration(seg.start)}
                                                     size="small"
                                                     sx={{

@@ -473,7 +473,9 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 color="inherit"
                 sx={{
                     display: { xs: "block", lg: "none" },
-                    bgcolor: "background.paper",
+                    bgcolor: "color-mix(in srgb, var(--mui-palette-background-paper) 80%, transparent)",
+                    backdropFilter: "blur(8px) saturate(180%)",
+                    WebkitBackdropFilter: "blur(8px) saturate(180%)",
                     borderBottom: 1,
                     borderColor: "divider",
                 }}
