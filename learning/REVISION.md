@@ -25,7 +25,7 @@
 - [§10. Generation with retrieval: templates, citations, hallucination control](#10-generation-with-retrieval-templates-citations-hallucination-control) ✅ *(Phase 4.2)*
 
 **Part IV — Conversation state**
-- §11. Memory strategies *(Phase 5 — TBD)*
+- [§11. Conversation memory: rolling buffer, summary buffer, vector memory](#11-conversation-memory-rolling-buffer-summary-buffer-vector-memory) ✅ *(Phase 5.1)*
 
 **Part V — Measurement**
 - §12. Eval theory *(Phase 6.1 — TBD)*
@@ -1613,6 +1613,235 @@ A: "That's the RAG architectural shift. Before, chat sent the entire transcript 
 
 ---
 
+## §11. Conversation memory: rolling buffer, summary buffer, vector memory
+
+### Why this section exists
+
+After Phase 4, Audia answers grounded questions but treats each one as a first turn. The user asks "what did Alice say?" → gets an answer. They ask "and Bob?" → the model has no idea what "and" means. Phase 5.1 closes this loop. Critically: the fix is NOT a model feature — the model remains stateless on every call. Memory is a **client-side prompt-construction discipline** that re-injects past turns. Every chat product you've ever used does this.
+
+### 11.1 The foundational fact: LLMs are stateless
+
+Every call to a chat-completion endpoint is independent. The model has no memory of prior calls. ChatGPT, Claude.ai, Audia — all of them maintain "conversation" by replaying the message history inside each new prompt:
+
+```
+turn 1:  client → [system, user_q1]                                    → assistant_a1
+turn 2:  client → [system, user_q1, assistant_a1, user_q2]             → assistant_a2
+turn N:  client → [system, ...history..., user_qN]                     → assistant_aN
+```
+
+The "conversation" lives in the client's `messages[]` array. The model server is amnesiac.
+
+📐 **Cost consequence (memorize):** unbounded rolling history is **O(N²) in total input tokens** across N turns. Turn n's prompt is roughly `n × t` tokens (t = avg per-turn tokens); summed across N turns = `t × N(N+1)/2`. Memory strategies cap this growth.
+
+### 11.2 The three memory families
+
+⚖️ **Trade-off table — pick one (or combine):**
+
+| Strategy | What's in prompt | Pros | Cons | When to use |
+|---|---|---|---|---|
+| **Rolling buffer (last-N)** | Last N raw turns | Exact recall of recent. Zero overhead. Cheap. | Forgets anything beyond N. | Short-session chat (≤10 turn pairs). Audia 5.1. |
+| **Summary buffer** | Running summary + last K raw turns | Bounded prompt size. Survives long sessions. | Detail loss. Extra LLM call to summarize ($$$). Summary drift compounds. | Support/tutoring — gist > exact wording. |
+| **Vector memory** | Top-k *relevant* past turns | Scales to thousands of turns. Surfaces ancient relevance. | Embed + retrieval latency per turn. Picks wrong turns if embeddings are coarse. | Long-term "talk to your assistant" products. ChatGPT's long-term memory. |
+
+**Production hybrid:** rolling buffer for the local thread coherence + vector memory layered over older turns for ancient relevance. Most production chat systems do this.
+
+### 11.3 Rolling buffer — the algorithm
+
+```
+on each new turn:
+    history ← load all turns for this session, ORDER BY createdAt DESC LIMIT N
+    history ← reverse(history)                        // oldest-first
+    prompt ← [system, ...history, current_user_turn]
+    response ← LLM(prompt)
+    save user_turn + assistant_response to history
+```
+
+**N knob:**
+- N=3 turn-pairs: aggressive, cost-constrained
+- **N=5 turn-pairs (10 messages): production default for chatbot UIs** ← Audia's pick
+- N=10+: long-context, expensive
+
+**Token-bound variant:** instead of fixed N, keep "as many recent turns as fit in T tokens." Safer when turn lengths vary wildly.
+
+⚠️ **Critical:** strip citation markers `[N]` from history sent to the model. They referred to *that turn's* chunk numbering; reusing them in a new turn confuses the model into miscitation. Keep them in the persisted row (UI replay) but strip on prompt assembly.
+
+### 11.4 Summary buffer — the algorithm
+
+```
+on each new turn:
+    if history.length > K:
+        old_turns ← history[:-K]
+        summary  ← LLM(summarize_prompt(old_turns))      // ← extra LLM call
+        history  ← [{ role: "system", content: summary }, ...history[-K:]]
+    prompt ← [system, ...history, current_user_turn]
+    response ← LLM(prompt)
+```
+
+Failure mode worth knowing: **summary drift.** A subtle misread at turn 5 propagates into the summary used for turn 50. The summary is downstream of the LLM you're using to build it; its bugs become your conversation's bugs. Not a "free" optimization.
+
+**Incremental variant:** `new_summary = LLM(old_summary + dropped_turn)`. Cheaper per call; faster drift.
+
+### 11.5 Vector memory — the algorithm
+
+```
+on save (every turn):
+    vec ← embed(turn.content)
+    store (vec, turn) in turn_vector_store
+
+on each new turn q:
+    q_vec ← embed(q)
+    relevant_old ← top-k by cosine(q_vec, turn_vec) from store
+    prompt ← [system, ...relevant_old, ...last_few_raw, current_user_turn]
+    response ← LLM(prompt)
+```
+
+**This is how ChatGPT's "saved memory" feature works**: at session start, retrieve the top-N relevant saved memories + relevant past chats, inject them into the system prompt.
+
+### 11.6 Cost economics at Audia scale
+
+Audia uses llama-3.1-8b-instant ($0.05/M input). 20-turn session, ~500 tokens per turn average:
+
+| Strategy | Tokens billed | $ per session | $ at 10k sessions/day |
+|---|---|---|---|
+| Unbounded rolling | `500 × 20(21)/2 = 105,000` | $0.005 | $19k/year |
+| Last-5 turn pairs (Audia) | `1500 × 20 = 30,000` | $0.0015 | $5.5k/year |
+
+Same arithmetic on gpt-4o ($2.50/M input):
+
+| Strategy | Tokens billed | $ per session | $ at 10k sessions/day |
+|---|---|---|---|
+| Unbounded rolling | 105,000 | $0.26 | **~$960k/year** |
+| Last-5 turn pairs | 30,000 | $0.075 | $275k/year |
+
+📐 **Interview formula:**
+- Unbounded chat: `O(N²) × per_token_price`
+- Capped at K: `O(N × K) × per_token_price`
+
+The asymptotic gap is what every production team eventually optimizes.
+
+### 11.7 Where memory sits relative to RAG
+
+⚠️ **Common confusion:** "We already retrieve chunks per question — why also need history?"
+
+| | RAG retrieval (Phase 4) | Conversation memory (Phase 5) |
+|---|---|---|
+| Source | Transcript chunks (the **data**) | Past chat turns (the **dialogue**) |
+| Triggered by | Embedding similarity to current question | Just "last N turns" |
+| Answers | "What's in the meeting?" | "What did we just say to each other?" |
+| Position in prompt | Inside the current user message: `<context>...</context>` | Prior `messages[]` entries |
+| Refreshes | Per-turn (fresh top-k every question) | Append-only |
+
+Each user turn gets its *own freshly-retrieved* chunks (q3's relevant chunks ≠ q1's relevant chunks). Memory and retrieval are orthogonal layers that coexist.
+
+A turn-3 prompt:
+
+```
+messages: [
+  { role: "system",    content: CHAT_SYSTEM_PROMPT },
+  { role: "user",      content: "<context>chunks-for-q1</context><user_input>q1</user_input>" },
+  { role: "assistant", content: "a1 (citations stripped)" },
+  { role: "user",      content: "<context>chunks-for-q2</context><user_input>q2</user_input>" },
+  { role: "assistant", content: "a2 (citations stripped)" },
+  { role: "user",      content: "<context>chunks-for-q3</context><user_input>q3</user_input>" },  // CURRENT
+]
+```
+
+### 11.8 The session-id protocol
+
+Audia's chat panel doesn't know its sessionId on the first turn — the server mints one and returns it in a response header. Pattern:
+
+```
+client → POST /api/chat { question, transcriptionId, sessionId: null }
+server: mint randomUUID(), load 0 history (new session), reply with X-Chat-Session header
+client: stash session id in component state
+
+client → POST /api/chat { question, transcriptionId, sessionId: "abc-..." }
+server: load last-N turns for "abc-..." filtered by user.email, prepend to messages
+```
+
+The `userEmail` filter on history load is the critical security boundary: a leaked sessionId must not surface another user's conversation. (Same defense as the chunk retrieval's `WHERE userEmail = $1`.)
+
+### 11.9 Persistence ordering — when to write each turn
+
+| Step | When written | Why |
+|---|---|---|
+| User turn | **Before** stream starts | Even if the stream explodes or the client aborts, the question is part of the record |
+| Assistant turn | **After** stream closes (in `finally`) | We need the accumulated content. Persist even partial content on abort — the user saw it |
+| Citations | With the assistant turn | UI uses them to re-render chips on reload |
+
+Don't persist before the stream and **also** try to update later — that's the same two-step write pattern that caused Phase 4.2's orphan-NULL-embedding bug. Two rows is fine; one row updated twice is the trap.
+
+### 11.10 Citations across turns — the trap
+
+Citations are stored alongside the assistant turn but **stripped before becoming LLM input on future turns**. Why:
+
+- The persisted assistant text reads: `"The team decided March 15 [1][3]."`
+- Turn 1's chunk `[3]` referenced (say) `chunk-id-abc`.
+- On turn 5, a different retrieval returns different chunks. `[3]` now refers to `chunk-id-xyz` — a completely different chunk.
+- If we sent turn 1's text into turn 5's prompt as-is, the model might assume `[3]` in its turn-1 history is `chunk-id-xyz` and miscite.
+- Strip the markers from LLM input. Keep them in the DB so the UI can re-show the chips when the conversation is reloaded.
+
+🎯 **Defense talking point:** "We persist citations with their assistant turn for UI replay but strip the `[N]` markers from any prompt history. Markers are turn-local — they refer to that turn's chunk numbering. Reusing them across turns would confuse the model into citing the wrong source."
+
+### 11.11 What we're NOT doing (and why)
+
+| Choice | What we picked | Alternative considered | Why not |
+|---|---|---|---|
+| Memory family | Rolling buffer last-5 | Summary buffer | Audia's sessions are short (1-10 turn pairs typical). Summary's extra LLM call adds cost + latency + a new failure mode (drift). Revisit if median session length > 15 turns. |
+| Memory family | Rolling buffer last-5 | Vector memory | Same — overkill at our session lengths. Vector memory will appear in 5.2/5.3 for cross-session "talk to all your meetings." |
+| Storage | Postgres ChatMessage table | Redis / client-only | Persistence survives page reload; supports future "resume conversation" UX; same DB we already operate. |
+| ChatSession entity | Not yet | A row per session with title/createdAt | A session is implicitly defined by `sessionId` grouping. Promote to its own table when we need session listing / titles / cross-transcript chats. |
+| sessionId minting | Server-side via `randomUUID()` | Client-side | Server-side keeps the source-of-truth ordering trivial. Client doesn't generate ids it might collide on later. |
+| First-turn sessionId delivery | Response header `X-Chat-Session` | Inline JSON envelope | Same precedent set by `X-Citations` in Phase 4.2. Streaming friendly, no body restructuring. |
+
+### 11.12 Five defense talking points
+
+🎯 **Q: Why didn't you just send the whole conversation history every turn?**
+
+A: "Quadratic cost. Total input tokens across N turns of unbounded history is O(N²) — turn 20 sends 20× turn 1. At Llama-8b prices it's tolerable; at gpt-4o prices we're talking ~$1M/year on input alone at 10k sessions/day. The rolling-buffer last-5 cuts that to O(N×5) — linear in session length, bounded per-turn cost. It's the same trade-off shape as the Phase 3 'why not put the whole transcript in the prompt' question: scale forces a bounded-cost design."
+
+🎯 **Q: Why rolling buffer instead of summary buffer?**
+
+A: "Summary buffer trades token count for an extra LLM call per turn (or every K turns) AND a new failure mode — summary drift, where a subtle misread propagates into the running summary used for every subsequent turn. At Audia's session lengths (typical 1-10 turn pairs), summarizing isn't paying for itself. We'd revisit if median session length crossed 15 turns or context-window pressure became real. For long-term cross-session memory we'd reach for vector memory, not summarization."
+
+🎯 **Q: Why store conversation server-side instead of in client state?**
+
+A: "Three reasons. One: survives page reload — the user's mid-conversation context isn't lost on a refresh. Two: enables future 'resume this conversation' UX without rebuilding the storage layer. Three: the prompt assembly happens server-side anyway, so loading history is just one query before the LLM call — no network cost. Client-side state would mean the client ships its own history every turn, which doubles the request payload and creates a tampering surface we'd then have to validate."
+
+🎯 **Q: What if a user changes transcripts mid-conversation? Does memory transfer?**
+
+A: "No — sessionId is bound to the ChatPanel instance per transcript via `key={id}` in SessionView. Switching transcripts unmounts the panel, clearing sessionId state, so the next question starts a fresh server-side session. This is deliberate: a follow-up about transcript B referencing turns from transcript A would confuse retrieval (chunks for B can't ground claims about A) and the user. Cross-transcript chat is a Phase 5.2+ feature with its own design."
+
+🎯 **Q: How would you scale this if a user accumulates 10,000 chat messages?**
+
+A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — already in the entity, so the DESC + LIMIT query stays O(log N + K). Second: tier old sessions to vector memory — embed and index turns older than X days, drop them from the live rolling buffer. Third: when even index lookups become hot, partition `chat_message` by `userEmail` or `created_at` quarter. None of these are needed today at our scale; the index gets us four orders of magnitude of headroom."
+
+### 11.13 Common pitfalls
+
+⚠️ **Forgetting to strip citation markers from history.** `[N]` markers refer to per-turn chunk numbering. Carrying them across turns makes the model cite the wrong source. Symptom: model citations point at chunks the user can verify don't say what's claimed.
+
+⚠️ **Persisting before AND after the stream (two-step write).** Same pattern that caused Phase 4.2's orphan-NULL-embedding bug. Persist user turn before the stream; persist assistant turn in `finally` — two distinct rows. Don't update one row twice.
+
+⚠️ **No `userEmail` filter on history load.** A leaked sessionId becomes a full conversation exfiltration. Always filter `WHERE sessionId = ? AND userEmail = ?` — same security pattern as the chunk retrieval ownership filter.
+
+⚠️ **Unbounded history "for completeness."** It scales O(N²) in cost AND in latency (prompt-length-dependent TTFT). Always cap.
+
+⚠️ **Including the per-turn `<context>` block in stored user turns.** Context chunks are per-turn ephemera, not history. Store the raw user question, not the wrapped userMessage; assemble the context block fresh each turn.
+
+⚠️ **Treating past assistant turns as a source of truth.** Even with `[N]` markers stripped, prior assistant text is just the model's prior output — it can be wrong. Grounding rules say "cite from the CURRENT turn's chunks." Reinforce in the system prompt so the model doesn't bootstrap onto its own past claims.
+
+### 11.14 Glossary additions (alphabetical, will land in Appendix A)
+
+- **Conversation memory** — see §11. Client-owned strategy for replaying past turns into each new LLM call.
+- **Rolling buffer (memory)** — keep last N turns verbatim, drop older. Cheap, exact recall of recent context.
+- **Summary buffer (memory)** — replace old turns with a running natural-language summary regenerated by a second LLM call. Bounded; lossy.
+- **Vector memory** — embed every turn, retrieve top-k relevant past turns per question. Scales to thousands of turns.
+- **Session id** — opaque key grouping conversation turns. In Audia, server-minted on first turn, returned in `X-Chat-Session` header.
+- **Summary drift** — failure mode of summary-buffer memory where subtle misreads compound across regenerations.
+- **Token-bound history** — variant of rolling buffer that keeps "as many recent turns as fit in T tokens" instead of a fixed N.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -1635,6 +1864,7 @@ A: "That's the RAG architectural shift. Before, chat sent the entire transcript 
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
 - **Citation pattern** — the mechanism by which an LLM signals which retrieved chunks support each claim. Three options: inline `[N]` markers, structured JSON, or post-hoc attribution. Inline markers are streaming-friendly and the Audia default.
 - **Context budget** — the fixed input-token allowance for one LLM call. RAG prompts compete for it across system, retrieved chunks, conversation history, and user question.
+- **Conversation memory** — client-side strategy for re-injecting past dialogue turns into each new LLM call. Three families: rolling buffer, summary buffer, vector memory. Not a model feature.
 - **Coarse retrieval** — the first-stage wide top-N vector search before re-ranking. N typically 3-5× the final k. Provides the candidate pool that re-rankers choose from.
 - **Classifier prompt** — a cheap pre-screening LLM call that classifies user input as injection-attempt or benign before the main call runs. One of the higher-cost defense-in-depth layers.
 - **Content moderation API** — provider-side classifier (OpenAI's moderation, Anthropic's prompt-shield) that flags harmful or adversarial input. Imperfect coverage, but useful as one layer in a stack.
@@ -1693,13 +1923,17 @@ A: "That's the RAG architectural shift. Before, chat sent the entire transcript 
 - **RRF (Reciprocal Rank Fusion)** — algorithm combining multiple ranked lists by summing `1/(60 + rank)` across rankers per document. Default `k_constant=60`. Robust to score-scale differences, used in hybrid search.
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
+- **Rolling buffer memory** — conversation-memory strategy that keeps the last N turns verbatim and drops everything older. Production default for short-session chat. Audia uses N=5 turn pairs.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
+- **Session id (chat)** — opaque UUID grouping conversation turns. In Audia, server-minted on first turn; returned in `X-Chat-Session` response header; client echoes on subsequent turns.
 - **Seed** — integer that fixes the RNG used during sampling. Best-effort reproducibility (GPU non-determinism prevents bit-identical guarantees). Useful for evals.
 - **Softmax** — function that converts a vector of real numbers to a probability distribution: `softmax(x_i) = exp(x_i) / Σ exp(x_j)`.
 - **SSE (Server-Sent Events)** — HTTP/1.1 streaming protocol where each event is a `data: ...\n\n` framed chunk. Browser API: `EventSource`. Standard for OpenAI/Anthropic streaming responses.
 - **Stateless** — the model retains no information between API calls. All context must be in the prompt.
 - **Stop sequence** — string(s) which, when generated, halt the model. Provider-side mechanism. Use `["\nUser:", "\n\nHuman:"]` for chat to prevent the model from role-playing the user.
 - **Stop token** — a special token (e.g. `<|endoftext|>`) that the model emits when it judges generation complete. Different from a stop *sequence*.
+- **Summary buffer memory** — conversation-memory strategy that replaces old turns with a running natural-language summary regenerated by a second LLM call. Bounded prompt size; lossy; introduces summary-drift failure mode.
+- **Summary drift** — failure mode of summary-buffer memory where subtle misreads compound across regenerations, gradually corrupting the running summary that conditions every subsequent turn.
 - **Sandwich pattern** — prompt engineering technique where critical instructions are restated AFTER the user input. Defense against the model "forgetting" early instructions over long contexts.
 - **Semantic chunking** — embedding-based chunking that creates boundaries where adjacent sentences' embeddings diverge — i.e., the topic shifts. Highest quality, highest cost; embed every sentence to decide boundaries.
 - **Sentence-based chunking** — splitting on sentence boundaries (periods, NLP-detected), grouping N sentences per chunk. Good for prose; inconsistent chunk sizes.
@@ -1710,12 +1944,14 @@ A: "That's the RAG architectural shift. Before, chat sent the entire transcript 
 - **`stream_options.include_usage`** — flag required to receive token usage data in streamed responses. Without it, usage is omitted; with it, the final chunk carries a `usage` field.
 - **System message** — the role-tagged prompt segment containing instructions, persona, and constraints. Models are trained to weight system content as operator intent.
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
+- **Token-bound history** — rolling-buffer variant that keeps "as many recent turns as fit in T tokens" instead of a fixed turn count. Safer when turn lengths vary widely.
 - **Top-k retrieval** — retrieval strategy returning the *k* chunks with highest similarity (or lowest distance) to a query embedding. Default starting point; vulnerable to redundancy + missed exact matches + no diversity. Improved by re-rankers like MMR.
 - **Top-k sampling** — keep only the k highest-probability tokens, zero the rest, renormalize.
 - **Tokenization** — converting a text string into a sequence of integer token IDs using a fixed vocabulary.
 - **Time to first token (TTFT)** — wall-clock latency from request sent to first response token rendered. Target < 500ms for good UX. The main metric streaming optimizes.
 - **Tokens per second (TPS)** — sustained generation throughput after first token. Groq ~500, OpenAI GPT-4 ~50, Claude Sonnet ~80.
 - **Usage object** — provider response field containing `{ prompt_tokens, completion_tokens, total_tokens }`. Source of truth for billing and instrumentation.
+- **Vector memory** — conversation-memory strategy that embeds every past turn into a vector store and retrieves the top-k relevant turns per new question. Scales to thousands of turns; surfaces ancient context when relevant. How ChatGPT's "saved memory" feature works.
 - **Vector storage cost** — each `vector(N)` row costs roughly `N × 4 bytes` (32-bit floats) plus row overhead. 768-dim ≈ 3 KB. Compressible to half with `halfvec` (pgvector v0.6+).
 - **Zero-shot prompting** — instruction-only prompt with no examples. Works well for tasks the model has seen abundantly in training.
 - **Zod** — TypeScript-first schema validation library. Used in Audia to validate structured LLM outputs at runtime and produce typed data. `safeParse` is the production-friendly API.

@@ -11,6 +11,7 @@ import Typography from "@mui/material/Typography";
 import Tooltip from "@mui/material/Tooltip";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutlined";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SendIcon from "@mui/icons-material/Send";
 import StopIcon from "@mui/icons-material/Stop";
 import type { TranscriptSegment } from "@/entity/Transcription";
@@ -51,12 +52,28 @@ export default function ChatPanel({ transcriptionId, segments, onCitationClick }
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
+    /**
+     * Conversation key for rolling-buffer memory. null on first turn (server
+     * mints it and returns via X-Chat-Session header). Reset clears it, which
+     * starts a fresh conversation — the previous turns stay in the DB but are
+     * no longer loaded as context.
+     */
+    const [sessionId, setSessionId] = useState<string | null>(null);
     const bottomRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const abortControllerRef = useRef<AbortController | null>(null);
 
     const stop = () => {
         abortControllerRef.current?.abort();
+    };
+
+    const resetConversation = () => {
+        // If a stream is in flight, abort it first so the partial assistant
+        // turn doesn't keep appending after the user has reset.
+        abortControllerRef.current?.abort();
+        setMessages([]);
+        setSessionId(null);
+        setInput("");
     };
 
     useEffect(() => {
@@ -89,14 +106,23 @@ export default function ChatPanel({ transcriptionId, segments, onCitationClick }
                 method: "POST",
                 signal: ctrl.signal,
                 headers: { "Content-Type": "application/json" },
-                // RAG protocol: client sends only a reference (transcriptionId) +
-                // the question. Server does retrieval, selects relevant chunks,
-                // and includes them in the prompt. No more "ship the whole
-                // transcript" pattern — scales to long meetings.
-                body: JSON.stringify({ question, transcriptionId }),
+                // RAG + memory protocol: client sends a reference (transcriptionId),
+                // the question, and the opaque sessionId (null on the first turn —
+                // server will mint one and return it in X-Chat-Session). Server
+                // does retrieval, loads the rolling-buffer history for the session,
+                // and includes both in the prompt.
+                body: JSON.stringify({ question, transcriptionId, sessionId }),
             });
 
             if (!res.body) throw new Error("No stream");
+
+            // Persist the (possibly newly-minted) session id so the next turn
+            // carries it back. The server returns the same id we sent if it
+            // was non-null, or a fresh UUID if we sent null.
+            const newSessionId = res.headers.get("X-Chat-Session");
+            if (newSessionId && newSessionId !== sessionId) {
+                setSessionId(newSessionId);
+            }
 
             // Citations come back in a response header before the stream body.
             // Parse once; attach to the assistant message so the renderer can
@@ -271,15 +297,34 @@ export default function ChatPanel({ transcriptionId, segments, onCitationClick }
                     )}
                 </Stack>
 
-                <IconButton
-                    size="small"
-                    sx={{ color: "text.disabled", flexShrink: 0 }}
-                    aria-label={open ? "Collapse" : "Expand"}
-                >
-                    <ExpandMoreIcon
-                        sx={{ transition: "transform 200ms", transform: open ? "rotate(180deg)" : "rotate(0deg)" }}
-                    />
-                </IconButton>
+                <Stack direction="row" spacing={0.5} sx={{ alignItems: "center", flexShrink: 0 }}>
+                    {messages.length > 0 && (
+                        <Tooltip title="Start a fresh conversation" arrow>
+                            <IconButton
+                                size="small"
+                                sx={{ color: "text.disabled" }}
+                                aria-label="Reset conversation"
+                                onClick={(e) => {
+                                    // Stop the click bubbling up to the row toggle —
+                                    // resetting shouldn't also collapse the panel.
+                                    e.stopPropagation();
+                                    resetConversation();
+                                }}
+                            >
+                                <RestartAltIcon sx={{ fontSize: 18 }} />
+                            </IconButton>
+                        </Tooltip>
+                    )}
+                    <IconButton
+                        size="small"
+                        sx={{ color: "text.disabled" }}
+                        aria-label={open ? "Collapse" : "Expand"}
+                    >
+                        <ExpandMoreIcon
+                            sx={{ transition: "transform 200ms", transform: open ? "rotate(180deg)" : "rotate(0deg)" }}
+                        />
+                    </IconButton>
+                </Stack>
             </Stack>
 
             {open && (

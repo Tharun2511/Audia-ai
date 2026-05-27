@@ -1,5 +1,6 @@
 import "reflect-metadata";
 import { DataSource } from "typeorm";
+import { ChatMessage } from "../entity/ChatMessage";
 import { Transcription } from "../entity/Transcription";
 import { TranscriptChunk } from "../entity/TranscriptChunk";
 import { User } from "../entity/User";
@@ -12,7 +13,7 @@ export const AppDataSource = new DataSource({
     },
     synchronize: true,
     logging: false,
-    entities: [Transcription, TranscriptChunk, User],
+    entities: [Transcription, TranscriptChunk, User, ChatMessage],
 });
 
 let pgvectorReady = false;
