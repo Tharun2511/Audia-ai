@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "eval": "node --import tsx --conditions=react-server --env-file=.env src/evals/summary.eval.ts"
   },
   "dependencies": {
     "@deepgram/sdk": "^5.0.0",
@@ -35,6 +36,8 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.4",
+    "server-only": "^0.0.1",
+    "tsx": "^4.22.3",
     "typescript": "^5"
   }
 }

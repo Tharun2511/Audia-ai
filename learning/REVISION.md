@@ -28,7 +28,7 @@
 - [§11. Conversation memory: rolling buffer, summary buffer, vector memory](#11-conversation-memory-rolling-buffer-summary-buffer-vector-memory) ✅ *(Phase 5.1)*
 
 **Part V — Measurement**
-- §12. Eval theory *(Phase 6.1 — TBD)*
+- [§12. Eval theory: offline/online, metric families, golden sets, LLM-as-judge](#12-eval-theory-offlineonline-metric-families-golden-sets-llm-as-judge) ✅ *(Phase 6.1)*
 - §13. Building an eval harness *(Phase 6.2 — TBD)*
 
 **Part VI — Agents**
@@ -1842,6 +1842,157 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 
 ---
 
+## §12. Eval theory: offline/online, metric families, golden sets, LLM-as-judge
+
+### Why this section exists
+
+Through Phase 5, Audia's entire AI surface — summarizer, retrieval, citations, memory — was validated by "I ran a few prompts and it looked fine." That's vibes-based development: every prompt edit, model swap, or `λ`-tune is a blind gamble with no way to know if you improved or silently regressed. Phase 6 replaces vibes with measurement. 6.1 is the theory + the first harness; 6.2 wires it into CI.
+
+### 12.1 The core problem
+
+🎯 **Eval (evaluation)**
+
+> **Definition:** A repeatable, automated measurement of an AI system's output quality against fixed inputs, producing a score you can track across changes. The unit test of non-deterministic systems.
+
+Why evals are a discipline and not just "write a test": LLM output is non-deterministic and open-ended. A unit test asserts `add(2,2) === 4`. There is no `===` for "is this summary good?" — two correct summaries can share zero words. So evals swap exact-match assertion for **graded measurement**, and the whole craft is choosing a grader you trust.
+
+What it unlocks: regression safety (score moves when you change a prompt), evidence-based model swaps (cost-per-quality-point, not hunches), measurable tuning of `λ`/`k`/chunk-size/temperature.
+
+### 12.2 Offline vs online
+
+🎯 **Offline eval** — runs against a fixed curated dataset (golden set) before deploy, in dev/CI. Controlled, repeatable, catches regressions pre-merge.
+
+🎯 **Online eval** — runs against real production traffic post-deploy: explicit feedback (👍/👎), implicit signals (retry? copy?), or sampled LLM-judging of live outputs.
+
+⚖️ **Complementary, not either/or:**
+
+| | Offline | Online |
+|---|---|---|
+| When | Pre-merge, CI | Post-deploy, continuous |
+| Input | Fixed golden set | Real traffic |
+| Catches | Regressions before ship | Distribution shift, unimagined failures |
+| Misses | Inputs not in the set | Anything before it reaches users |
+| Audia phase | 6.1/6.2 (now) | Phase 12 (Ops telemetry) |
+
+Senior framing: **offline evals give confidence to ship; online evals tell you what your offline set was missing.** Feed online failures back into the golden set — it's a flywheel.
+
+### 12.3 The four metric families
+
+🎯 **Reference-based metrics (BLEU, ROUGE)** — score by n-gram overlap with a human reference. BLEU = precision-oriented (machine translation origin); ROUGE = recall-oriented (summarization origin).
+
+⚠️ **Why they're weak for LLM output (interview favorite):** they measure surface word overlap, not meaning. "The launch is March 15" vs "They'll ship on the fifteenth of March" share almost no n-grams but mean the same — BLEU/ROUGE punish the paraphrase. Built for translation (closeness to reference wording is good); don't transfer to open-ended generation. **Know they exist, know why you're NOT leaning on them.**
+
+🎯 **LLM-as-judge** — use a (usually stronger) LLM to score output against a rubric or reference. Semantic understanding instead of n-gram rigidity, at the cost of new judge biases. The modern default for open-ended output. (§12.5.)
+
+🎯 **Programmatic / task-specific checks** — deterministic assertions on structured properties: schema validation, exact match, regex, numeric tolerance, "contains required citation." Cheap, fast, 100% reliable where applicable. **Always reach for these first.** Audia's summarizer returns validated JSON, so most of its eval is programmatic (parsed? schema-valid? `tooShort` correct? `bullets.length ≤ 3`? required fact present? injection payload absent?) — zero judge cost.
+
+🎯 **Human eval** — humans score on a rubric. Gold standard, the ground truth judges are calibrated against — but slow, expensive, unscalable. Used to *validate* the automated eval, not for every run.
+
+### 12.4 Golden sets
+
+🎯 **Golden set**
+
+> **Definition:** A curated, version-controlled dataset of representative inputs paired with known-good expected outputs (or grading criteria). The fixed yardstick offline evals measure against.
+
+Build rules:
+- **Coverage over volume.** 15–20 well-chosen cases beat 500 random ones — each probes a *different* behavior (normal, too-short, injection, multi-topic, exact-recall, empty).
+- **Include hard + adversarial cases.** The injection transcript, the empty-retrieval case — those are golden-set cases.
+- **Version-control it.** It's code, reviewed in PRs. Online failures → new cases. The set grows with your understanding.
+- **Expected ≠ exact string.** For open-ended cases the "expected" is grading *criteria* ("must mention March 15; must not invent attendees"), not a literal target.
+
+⚠️ **Cardinal sin: testing on training examples.** The few-shot examples in your prompt must NOT be golden-set cases — the model has seen them. Eval cases are held out. (Audia's golden set deliberately avoids the Alice/March-15 and PWNED few-shots.)
+
+### 12.5 LLM-as-judge, deep dive
+
+**Two modes:**
+
+| Mode | Does | When |
+|---|---|---|
+| **Pointwise** | Rate one output on a rubric (1–5, pass/fail) | Absolute quality ("is this faithful?") |
+| **Pairwise** | Pick the better of A vs B | "Did prompt v2 beat v1?" — more reliable; both humans and LLMs compare better than they absolute-score |
+
+**Biases you must name** (Zheng et al. 2023, guaranteed interview question):
+- **Position bias** — favors a consistent position in pairwise. *Fix:* run both orders, average, or require a win in both.
+- **Verbosity bias** — prefers longer answers regardless of quality. *Fix:* rubric rewards conciseness.
+- **Self-enhancement bias** — prefers its own model family's outputs. *Fix:* judge with a different model than the one under test.
+
+**What makes a judge trustworthy:**
+- **Specific rubric** beats "rate 1–10." "Score fail if it invents any fact not in context" is reproducible; vague scales are noise.
+- **Low-cardinality scales** (pass/fail, 1–3) beat 1–10 — LLMs can't distinguish a 7 from an 8.
+- **Reasoning before the score** (CoT) — judging is reasoning; ask for the explanation first.
+- **Validate against humans once** — spot-check ~20 judgments. Agreement metric is **Cohen's kappa** (inter-rater agreement corrected for chance — know the term, not the formula).
+
+### 12.6 RAG-specific eval (RAGAS framing)
+
+Eval retrieval and generation *separately* — a bad answer has two possible root causes. The four RAGAS metrics map onto Phase 4:
+
+| Metric | Asks | Tests |
+|---|---|---|
+| **Context precision** | Of chunks retrieved, how many relevant? | MMR + top-k |
+| **Context recall** | Of relevant chunks that exist, how many retrieved? | Coarse N, embedding quality |
+| **Faithfulness** | Does the answer only claim what context supports? | Grounding rules |
+| **Answer relevancy** | Does the answer address the question? | Generation prompt |
+
+Diagnostic power: low **faithfulness** → generation hallucinating (fix prompt); low **context recall** → retrieval missing chunks (fix chunking/embedding/N). **Separating retrieval eval from generation eval is the senior RAG-eval insight** — "the answer was wrong because the right chunk was never retrieved" is actionable; "the answer was wrong" is not.
+
+### 12.7 The headline metric
+
+🎯 **Pass rate**
+
+> **Definition:** The fraction of golden-set cases meeting their success criteria on a run. The single number tracked across commits to detect regressions; the AI-system equivalent of "tests passing."
+
+⚠️ **A 100% pass rate on a fresh golden set usually means the set isn't adversarial enough yet**, not that the system is perfect. Real value shows up when you add cases that break it. Audia's first run was 15/15 — the next move is hardening the set with cases the 8B model is likely to fail (long meetings with many numbers, subtle injections, ambiguous too-short calls).
+
+### 12.8 What we built in Audia
+
+- **Refactor seam** ([src/lib/ai.ts](../src/lib/ai.ts)): split `summarizeTranscriptStructured()` (returns the validated `{ tooShort, bullets }` object — the eval-friendly seam) from `summarizeTranscript()` (display string wrapper, unchanged public contract).
+- **Golden set** ([src/evals/golden-summary.ts](../src/evals/golden-summary.ts)): 15 held-out cases, each tagged with the behavior it probes + `expect` criteria (`tooShort`, `mustMention`, `mustNotMention`).
+- **LLM-judge** ([src/evals/judge.ts](../src/evals/judge.ts)): faithfulness check using **llama-3.3-70b-versatile** (different + stronger than the 8B under test → mitigates self-enhancement bias), pass/fail verdict, reasoning-before-verdict, temperature 0.
+- **Runner** ([src/evals/summary.eval.ts](../src/evals/summary.eval.ts)): programmatic checks first (free), judge only on substantive cases that pass programmatic; prints per-case table + pass rate; exits 1 below 90% (CI gate for 6.2).
+- **`npm run eval`**: `node --import tsx --conditions=react-server --env-file=.env …`. The flags matter — see 12.9.
+
+### 12.9 The "run server code as a script" gotcha
+
+Running `@/lib/ai` outside Next hit three walls; the `npm run eval` flags each solve one:
+- `import "server-only"` throws (or won't resolve) outside Next's bundler. **Fix:** install the real `server-only` npm stub + pass `--conditions=react-server` so its `exports` map resolves to the no-op `empty.js`. (Next provides `server-only` via its bundler, so it isn't on disk until you install it — the error is `MODULE_NOT_FOUND`, not the usual throw.)
+- `@/*` path alias. **Fix:** `tsx` reads `tsconfig.json` `paths` natively.
+- Env vars (`GROQ_API_KEY`). **Fix:** `--env-file=.env` (a standalone script doesn't inherit Next's automatic `.env` loading).
+
+🎯 **Defense talking point:** "Server-only modules and path aliases assume the framework's bundler. To run them as a plain script for evals, you re-create what the bundler provided — the `react-server` export condition for `server-only`, tsconfig path resolution via tsx, and explicit env-file loading. Or you skip all that by running the eval as an API route inside the framework; we chose the script for a clean CI seam."
+
+### 12.10 Defense talking points
+
+🎯 **Q: Why not BLEU/ROUGE?** A: "They score n-gram overlap with a reference, so they punish correct paraphrases — 'March 15' vs 'the fifteenth of March' share no n-grams but mean the same. They were built for translation where closeness to reference wording is the goal; for open-ended summarization they don't track quality. We use programmatic checks for the structured parts and an LLM-judge for semantic faithfulness."
+
+🎯 **Q: How do you trust an LLM to grade an LLM?** A: "Three guards. Specific rubric, not 'rate 1–10' — a binary pass/fail against an explicit faithfulness definition. A different, stronger model as judge (70B judging 8B) to avoid self-enhancement bias. And reasoning-before-verdict so the score is conditioned on an explanation. Then I validate the judge against ~20 human spot-checks once — if it agrees, I trust it in CI. The judge is a measurement instrument; you calibrate it before you rely on it."
+
+🎯 **Q: Your eval passes 100% — done?** A: "No — a fresh golden set passing 100% usually means it isn't adversarial enough, not that the system is perfect. The next step is hardening: add cases I expect the 8B to fail — long multi-number meetings, subtle injections, ambiguous too-short calls — plus feed real production failures back in. Pass rate is only meaningful relative to a set that can actually fail."
+
+🎯 **Q: Where do programmatic checks stop and the judge start?** A: "Programmatic for anything deterministic — did it parse, pass the schema, set the boolean right, stay within 3 bullets, include the required exact fact, omit the injection payload. Those are free and exact, so they run first and catch most regressions. The judge only handles what programmatic can't express — semantic faithfulness of free text. Never spend a judge call on something a substring check answers."
+
+### 12.11 Common pitfalls
+
+⚠️ **Testing on few-shot examples.** The model has seen them; you're measuring memorization. Hold eval cases out.
+⚠️ **1–10 scoring scales.** LLMs can't distinguish 7 from 8. Use pass/fail or 1–3.
+⚠️ **Judging with the same model under test.** Self-enhancement bias inflates scores. Use a different family.
+⚠️ **No rubric.** "Rate quality 1–10" is noise. Define what each verdict means in terms of observable properties.
+⚠️ **LLM-judging what a substring check could verify.** Wasteful + less reliable. Programmatic first.
+⚠️ **One blended quality score for RAG.** Separate retrieval (context precision/recall) from generation (faithfulness/relevancy) or you can't diagnose root cause.
+⚠️ **Treating 100% pass as success.** Often means the set is too easy. Harden until it can fail.
+
+### 12.12 Glossary additions (alphabetical, land in Appendix A)
+
+- **Eval / offline eval / online eval** — see §12.1–12.2.
+- **BLEU / ROUGE** — n-gram-overlap reference metrics; weak for open-ended LLM output.
+- **LLM-as-judge** — stronger LLM scoring another's output against a rubric; watch position/verbosity/self-enhancement bias.
+- **Pointwise vs pairwise judging** — absolute rubric score vs better-of-two comparison; pairwise more reliable.
+- **Golden set** — curated, held-out, version-controlled eval dataset.
+- **Pass rate** — fraction of golden-set cases meeting criteria; the regression headline number.
+- **Faithfulness / answer relevancy / context precision / context recall** — the four RAGAS metrics; separate retrieval eval from generation eval.
+- **Cohen's kappa** — inter-rater agreement corrected for chance; used to validate a judge against humans.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -1852,6 +2003,7 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 - **Async iterator** — JavaScript pattern (`for await ... of`) for consuming streams. Each iteration yields one chunk. Used by Groq/OpenAI SDKs to expose streamed responses.
 - **Autoregressive** — a generation process where each output depends on previous outputs. Token n+1 is sampled from a distribution conditioned on tokens 1..n. All chat LLMs are autoregressive.
 - **Attention** — the mechanism that lets each token's representation be computed as a weighted average of other tokens' representations, weighted by learned relevance (`softmax(QKᵀ/√d_k)·V`).
+- **BLEU** — precision-oriented n-gram-overlap metric from machine translation; scores how much of the output appears in a reference. Weak for open-ended LLM output — punishes correct paraphrases.
 - **BM25** — classic lexical ranking function scoring documents by term frequency, inverse document frequency, and document length. Industry default for keyword search. Postgres approximates via `ts_rank` on `tsvector`.
 - **BPE (Byte-Pair Encoding)** — sub-word tokenization algorithm that learns a vocabulary of byte sequences from a corpus by repeatedly merging the most frequent pair of adjacent symbols.
 - **Chain-of-thought (CoT)** — prompting technique where the model is instructed to show reasoning steps before the final answer. Each token is computation; reasoning tokens give the model more budget for hard problems.
@@ -1864,6 +2016,8 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
 - **Citation pattern** — the mechanism by which an LLM signals which retrieved chunks support each claim. Three options: inline `[N]` markers, structured JSON, or post-hoc attribution. Inline markers are streaming-friendly and the Audia default.
 - **Context budget** — the fixed input-token allowance for one LLM call. RAG prompts compete for it across system, retrieved chunks, conversation history, and user question.
+- **Cohen's kappa** — inter-rater agreement metric corrected for chance agreement. Used to validate an LLM-judge against human spot-checks before trusting it in CI. Know the term, not the formula.
+- **Context precision / context recall** — RAGAS retrieval-eval metrics. Precision: of chunks retrieved, how many relevant. Recall: of relevant chunks that exist, how many retrieved. Diagnose retrieval separately from generation.
 - **Conversation memory** — client-side strategy for re-injecting past dialogue turns into each new LLM call. Three families: rolling buffer, summary buffer, vector memory. Not a model feature.
 - **Coarse retrieval** — the first-stage wide top-N vector search before re-ranking. N typically 3-5× the final k. Provides the candidate pool that re-rankers choose from.
 - **Classifier prompt** — a cheap pre-screening LLM call that classifies user input as injection-attempt or benign before the main call runs. One of the higher-cost defense-in-depth layers.
@@ -1883,7 +2037,10 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 - **Embedding** — a dense vector representation of a token (or text chunk in RAG contexts). Tokens with similar usage end up with geometrically nearby embeddings.
 - **Few-shot prompting** — including 3–5 input/output examples in the prompt before the real input. The model learns the pattern from demonstrations. Beats long descriptions for custom formats and edge cases.
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
+- **Eval** — repeatable automated measurement of AI output quality against fixed inputs, producing a trackable score. The unit test of non-deterministic systems. Offline (golden set, pre-merge) vs online (production traffic, post-deploy).
+- **Faithfulness** — RAGAS generation-eval metric: does the answer make only claims supported by retrieved context? Low faithfulness = generation hallucinating (fix the prompt). Audia's LLM-judge measures this for summaries.
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
+- **Golden set** — curated, version-controlled, held-out dataset of representative inputs + known-good outputs (or grading criteria). The yardstick offline evals measure against. Coverage over volume; never reuse few-shot examples.
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
 - **Grounding rule** — system-prompt instruction directing the model to answer using only the provided context and to refuse if information isn't present. Cheapest hallucination control technique.
 - **Hallucination (RAG sense)** — LLM generating content not grounded in retrieved chunks. Distinct from generic LLM hallucination; specific to "claim asserts X but chunks don't support X."
@@ -1892,6 +2049,7 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
 - **IVFFlat** — inverted-file vector index. Clusters vectors via k-means into N lists; queries probe closest lists. Fast build, low memory, good recall — but requires data present before build.
 - **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
+- **LLM-as-judge** — using a (usually stronger, different-family) LLM to score another model's output against a rubric. Modern default for grading open-ended output. Watch position, verbosity, and self-enhancement bias; prefer pass/fail over 1–10; reason before verdict.
 - **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
 - **MMR (Maximal Marginal Relevance)** — re-ranking algorithm balancing relevance to query against diversity from already-selected results. Iteratively picks the candidate maximizing `λ·rel − (1−λ)·max-sim-to-selected`. λ=0.7 is production default.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
@@ -1909,6 +2067,8 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 - **OWASP Top 10 for LLMs** — canonical security reference for LLM applications (genai.owasp.org). Bookmark for interviews.
 - **pgvector** — Postgres extension adding a native `vector(N)` column type, four distance operators (`<->`, `<#>`, `<=>`, `<+>`), and ANN indexing (IVFFlat, HNSW). Turns Postgres into a vector DB without new infrastructure.
 - **pgvector operators** — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1 / Manhattan). Smaller value = more similar in ORDER BY. Cosine is the default for text embeddings.
+- **Pairwise vs pointwise judging** — pairwise: judge picks the better of two outputs (more reliable). Pointwise: judge scores one output on a rubric. Both humans and LLMs compare better than they absolute-score.
+- **Pass rate** — fraction of golden-set cases meeting their success criteria on a run. The headline regression metric; gate CI on it. 100% on a fresh set usually means the set is too easy.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
 - **Principle of least privilege** — security principle that the model should have access only to what it strictly needs. The strongest defense against agentic injection attacks — if the model *can't* take a dangerous action, no injection can make it.
 - **Prompt** — the input given to an LLM, comprising system, user, and (in conversations) assistant messages. Better framed as a *specification* than a string.
@@ -1922,6 +2082,7 @@ A: "Three moves, in order. First: add a `(sessionId, createdAt DESC)` index — 
 - **Re-ranking** — second-stage filtering that reorders coarse-retrieved candidates by a different criterion (MMR for diversity, cross-encoder for accuracy, LLM-as-judge for quality). The "narrow" step in fan-out-and-narrow retrieval.
 - **RRF (Reciprocal Rank Fusion)** — algorithm combining multiple ranked lists by summing `1/(60 + rank)` across rankers per document. Default `k_constant=60`. Robust to score-scale differences, used in hybrid search.
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
+- **ROUGE** — recall-oriented n-gram-overlap metric from summarization; scores how much of a reference the output covers. Like BLEU, weak for open-ended LLM output — measures word overlap, not meaning.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
 - **Rolling buffer memory** — conversation-memory strategy that keeps the last N turns verbatim and drops everything older. Production default for short-session chat. Audia uses N=5 turn pairs.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
