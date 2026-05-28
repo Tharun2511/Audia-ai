@@ -29,7 +29,7 @@
 
 **Part V — Measurement**
 - [§12. Eval theory: offline/online, metric families, golden sets, LLM-as-judge](#12-eval-theory-offlineonline-metric-families-golden-sets-llm-as-judge) ✅ *(Phase 6.1)*
-- §13. Building an eval harness *(Phase 6.2 — TBD)*
+- [§13. Building an eval harness: CI gates, RAG eval, the flywheel, judge validation](#13-building-an-eval-harness-ci-gates-rag-eval-the-flywheel-judge-validation) ✅ *(Phase 6.2)*
 
 **Part VI — Agents**
 - §14. Tool use & function calling *(Phase 7.1 — TBD)*
@@ -1993,6 +1993,207 @@ Running `@/lib/ai` outside Next hit three walls; the `npm run eval` flags each s
 
 ---
 
+## §13. Building an eval harness: CI gates, RAG eval, the flywheel, judge validation
+
+### Why this section exists
+
+Phase 6.1 established the theory and the first harness (summarizer, 15 cases, judge). 6.2 makes evals **load-bearing**: the second AI surface gets its own harness, the suites run on every PR with a hard gate, and the workflow patterns (the flywheel, judge validation, "look at your data") get named. The goal of this section isn't more metrics — it's the operational discipline that turns "we have evals" into "evals actually prevent shipping bad code."
+
+### 13.1 The eval flywheel — workflow > metrics
+
+🎯 **Eval flywheel**
+
+> **Definition:** The continuous improvement loop where offline evals catch pre-merge regressions, production failures get added back into the golden set, the set grows in coverage, and trust in the harness compounds. The point of evals isn't the dashboard; it's the loop.
+
+A common new-team mistake: build a fancy harness with 30 metrics, see green, ship. Production breaks; nobody knows why. The harness was answering questions nobody asked.
+
+The senior pattern:
+
+```
+1. Look at production failures (real flagged outputs or 👎 signals)
+2. Add a case to the golden set that captures the failure pattern
+3. The case fails on current main ⇒ quantified bug
+4. Fix the prompt / model / retrieval ⇒ case passes
+5. Merge. The harness now permanently guards against that regression class.
+```
+
+The set grows with your *understanding of how things actually break*, not with how you imagined they might.
+
+⚖️ **What we observed today in Audia (the live flywheel demo):**
+
+The first chat eval run was **6/10**. Diagnosis:
+
+| Failure | Root cause | Fix |
+|---|---|---|
+| `injection-in-chunk` missed "$42,000" | Prompt didn't preserve exact numbers | Added "When the question asks about specific facts (numbers, dollar amounts, dates, named people), reproduce them VERBATIM" to `CHAT_SYSTEM_PROMPT` |
+| `disagreement-surface-both` faithfulness fail (model invented a decision) | Prompt didn't distinguish "decision reached" from "decision deferred" | Added "If the chunks describe a decision being TABLED, DEFERRED, POSTPONED, or DISAGREED ON without resolution, your answer MUST state that the decision is pending" |
+| `irrelevant-chunks-only` refusal heuristic missed valid refusal | Eval's `looksLikeRefusal` was incomplete — missed "no mention of" | Broadened phrase list |
+| `role-change-injection` failed on substring "arr" | Bad mustNotMention choice (3-letter substring matches "carry", "narrative") | Replaced with specific pirate-speak markers ("matey", "ahoy", "ye be") |
+
+Two real prompt bugs + two eval defects, all surfaced by the first run. Re-ran ⇒ **10/10.** And the new prompt rules aren't eval-paper — they're real improvements for real users.
+
+🎯 **Defense talking point:** "Our chat eval surfaced two prompt bugs in its first run — the model was dropping exact dollar amounts and inventing decisions when chunks showed deferral. We fixed the prompt rules, not the eval, and the next run passed. That's the eval-driven loop working: eval gives you a quantified bug; you fix the system; the eval permanently guards the fix."
+
+### 13.2 CI integration — gate or alert?
+
+🎯 **CI eval gate**
+
+> **Definition:** A CI step that runs the eval suite on every PR and blocks merge if the pass rate falls below a threshold. The mechanism turning "we have evals" into "evals actually prevent shipping bad code."
+
+⚖️ **Three modes:**
+
+| Mode | Effect | When to use |
+|---|---|---|
+| **Hard gate** | PR cannot merge until eval ≥ threshold | Critical paths (auth, RAG that grounds claims). Audia's choice. |
+| **Soft alert** | Eval runs, posts PR comment with delta vs main, but doesn't block | Exploratory features, content tuning where some regressions are acceptable. Useful while the judge is unvalidated. |
+| **Don't run** | Skip CI, run locally / nightly | When eval cost > value of merge-time signal. |
+
+**Threshold setting is itself a decision.** Too high (95%+) → flaky judges fail PRs unfairly. Too low (50%) → meaningless gate. **Rule of thumb: set the threshold ~5 points below your current baseline.** Audia gates at 90% with a 100% baseline — tolerates one judge-noise failure per 10 cases.
+
+**Cost reality.** On Groq's free tier, every PR ⇒ ~25 model calls ⇒ $0. At gpt-4o judge prices the same suite is ~$0.04/run, ~$60/year at 30 PRs/week. **Scales fine until you outgrow the free tier or the suite grows past ~200 cases**; then production teams shift to fast-subset-on-PR + full-suite-nightly (see §13.6).
+
+### 13.3 RAG eval — operationalizing the four RAGAS metrics
+
+You met these in §12.6. Operationalized:
+
+| Metric | What it asks | How to compute | What it tests |
+|---|---|---|---|
+| **Faithfulness** | Are all answer claims supported by chunks? | LLM-judge with rubric (`judgeRAGFaithfulness` in Audia) | Generation prompt + grounding rules |
+| **Answer relevancy** | Does the answer address the question? | LLM-judge (`judgeAnswerRelevancy`) or embed question/answer-paraphrase similarity | Generation prompt |
+| **Context precision** | Of chunks retrieved, what fraction are relevant? | LLM-judge per chunk: "does this help answer the question?" | MMR + top-k |
+| **Context recall** | Of relevant chunks that EXIST, how many were retrieved? | Needs chunk-level labels — hand-tag or LLM-judge over full transcript | Coarse N, chunking, embedding |
+
+**Audia 6.2 implements the top two** (faithfulness, relevancy) — they're the generation half and don't need DB infrastructure. Context precision/recall require a seeded pgvector + ground-truth chunk relevance labels, which is Phase 6.3+ scope. **This split is honest: testing generation-given-chunks is different from testing retrieval-against-real-storage, and they need different infrastructure.**
+
+🎯 **Diagnostic power table** (the interview gold from §12.6, now interview-ready):
+
+| Metric drops | Look here |
+|---|---|
+| Faithfulness ↓ | Generation prompt / grounding rules. Model hallucinating. |
+| Answer relevancy ↓ | Generation prompt. Model answering a different question. |
+| Context precision ↓ | Re-ranker (MMR λ, k). Noise getting through. |
+| Context recall ↓ | Coarse N, chunking, embedding. Right chunks never retrieved. |
+
+Without this separation, "the answer was wrong" tells you nothing. With it, you walk the chain backward.
+
+### 13.4 Pairwise vs pointwise — when to switch
+
+🎯 **Pairwise judging** — present two outputs (A vs B), judge picks the better one (or "tie").
+
+Pointwise (rubric scoring) is what Audia ships. Pairwise is **more reliable** because:
+- Both humans and LLMs are better at comparing than absolute-scoring.
+- It handles small absolute differences naturally — pointwise gives both a 7; pairwise tells you which 7 actually wins.
+- Robust to scale drift (a "7 today" vs a "7 last quarter" are hard to compare absolutely).
+
+**When to switch to pairwise:**
+- Comparing **prompt v1 vs v2** ("did the new prompt actually win?")
+- Comparing **model A vs model B**
+- Comparing **MMR λ=0.5 vs λ=0.7**
+
+⚠️ **Position bias warning:** judges favor a consistent position. *Fix:* run both orders `(A,B)` and `(B,A)`, count a win only if it wins both. Doubles cost; kills the bias.
+
+### 13.5 Validating the judge itself
+
+🎯 **Judge validation**
+
+> **Definition:** The one-time spot-check of running the LLM-judge against ~20 human-rated examples to confirm its verdicts correlate with human judgment. Until this passes, every "pass" the harness reports is unverified.
+
+Right now Audia's faithfulness + relevancy judges have never been audited. You're trusting that "70B + this rubric agrees with what *you* would call faithful." Maybe true; never measured.
+
+**Protocol:**
+1. Sample ~20 case-outputs (mix of likely-pass and likely-fail).
+2. Hand-grade each: pass/fail + reason.
+3. Run the LLM-judge on the same 20.
+4. Compute agreement = matches / 20. Compute Cohen's kappa.
+
+🎯 **Cohen's kappa**
+
+> **Definition:** Inter-rater agreement metric corrected for chance agreement. Range: -1 to +1. >0.8 = excellent, 0.6–0.8 = substantial, <0.4 = poor.
+
+**Why corrected:** if 90% of cases pass anyway, judge and human agree 81% of the time by pure chance (0.9 × 0.9). Raw agreement inflates the judge's apparent accuracy. Kappa subtracts the chance floor.
+
+You do NOT need the formula in an interview. Know the term, the range, what "corrected for chance" means.
+
+### 13.6 Cost patterns for evals at scale
+
+Audia today: 25 calls/run × Groq free tier = $0. Doesn't matter.
+
+The patterns that DO matter at scale:
+
+| Pattern | What |
+|---|---|
+| **PR fast subset** | Run a 10-case smoke subset on every PR; gate on it. |
+| **Nightly full suite** | Run all N cases overnight; alert in Slack on score drop. |
+| **PR with `[full-eval]` keyword** | Run the full suite when the PR title contains a flag — for risky changes. |
+| **Sampled production eval** | LLM-judge 1% of production responses; trend over time. |
+
+You don't need these for Audia. **You should know they exist** — interview-relevant for "how would you scale evals?"
+
+### 13.7 The "looking at your data" rule
+
+The single most-quoted piece of practitioner wisdom in this space:
+
+> **Read 100 of your model's outputs before adding a single metric.**
+
+Not because metrics are bad — because you don't know what to measure until you've seen the failure modes. Look at real outputs (dev runs, eval failures, eventual prod logs), categorize the failures into 4–6 buckets, then build a metric *per bucket*.
+
+For Audia: when an eval surfaces a failure, **read the answer, read the chunks, see why the model decided to hallucinate** before tuning λ or changing the rubric. Eval pass rate is the *signal*; reading outputs is the *diagnosis*. Today's session was a live demo: I read the 4 failures, categorized them (2 real prompt bugs + 2 eval defects), then made targeted fixes.
+
+### 13.8 What we built in Audia today
+
+- **Shared prompt seam** ([src/lib/rag-prompt.ts](../src/lib/rag-prompt.ts)): extracted `CHAT_SYSTEM_PROMPT` + `buildContextBlock` + `wrapUserMessage` so eval and route can't drift. Strengthened with two new grounding rules during the live flywheel iteration.
+- **RAG golden set** ([src/evals/golden-chat.ts](../src/evals/golden-chat.ts)): 10 cases — single-chunk recall, multi-chunk synthesis, refusal-out-of-scope, injection-in-chunk, disagreement-surface-both, exact-number recall, irrelevant-chunks refusal, speaker attribution, action-item synthesis, role-change injection.
+- **Two new judges** in [src/evals/judge.ts](../src/evals/judge.ts): `judgeRAGFaithfulness` (chunks-aware faithfulness) and `judgeAnswerRelevancy` (does the answer address the question). Refactored to a shared `callJudge()` helper so every judge has identical semantics.
+- **Chat eval runner** ([src/evals/chat.eval.ts](../src/evals/chat.eval.ts)): three layers — programmatic (substring + citation count + refusal heuristic), faithfulness judge, relevancy judge. Skips judges on refusal cases. Exits 1 below 90%.
+- **`npm run eval:chat`** and **`npm run eval:all`** wired.
+- **CI gate** ([.github/workflows/eval.yml](../.github/workflows/eval.yml)): runs both suites on every PR. Requires `secrets.GROQ_API_KEY`. Skips on doc-only changes (`learning/**`, `*.md`). `concurrency` cancels superseded runs.
+
+### 13.9 Defense talking points
+
+🎯 **Q: Walk me through how you build an eval harness from scratch.**
+A: "Start by reading the model's outputs — 50–100 real examples before defining any metric. Categorize the failures into buckets — invention, off-topic, formatting break, injection susceptibility, etc. Build one metric per bucket. Then construct a held-out golden set of 15–30 cases, each probing one bucket, including the adversarial cases (injection, deferral, ambiguous inputs). Run programmatic checks first — schema, substring, citation count — because they're free, exact, and fail fast. Layer an LLM-judge on top only for the semantic properties programmatic can't express. Use a different, stronger judge model than the system under test to avoid self-enhancement bias. Wire it as `npm run eval` for local iteration and a CI step that gates merge below a threshold. Then start the flywheel: every production failure becomes a new case."
+
+🎯 **Q: How do you keep an eval harness trustworthy as it grows?**
+A: "Three disciplines. One — validate the judge against humans periodically: spot-check ~20 verdicts by hand, compute Cohen's kappa, alert if it drops below ~0.7. Two — track pass rate over time, not just the current run; a slow decay across weeks is the signal that the set is becoming too easy. Three — feed production failures back in deliberately, every sprint. If the set stays static, the eval stops mapping to reality."
+
+🎯 **Q: You ship a prompt change that drops eval from 100% to 92%. CI gates at 90%. Does it merge?**
+A: "Yes — the gate is at 90% deliberately, with 5–10 points of tolerance below the baseline for judge noise. But I'd still investigate before merging. I'd read the two failing cases; if they're real regressions I'd revert or fix the prompt before merging. If they're judge flakiness on the same cases that pass intermittently, that's signal the judge needs hardening — a more specific rubric or pairwise comparison. The gate exists to block obvious regressions, not to substitute for thinking."
+
+🎯 **Q: Why didn't you implement context precision and context recall?**
+A: "Honest scope. Faithfulness and answer relevancy test generation given chunks — we can fabricate the chunks in the case file, no DB. Context precision and recall test retrieval, which requires a seeded pgvector index plus ground-truth chunk-relevance labels per question. That's a different infrastructure shape — golden labels at the chunk level, not the answer level — and deserves its own phase. I drew the line where the infrastructure cost crossed the value-per-session ratio. The diagnostic-power framing still works: if I see faithfulness drop in production I know to look at the prompt; if I added retrieval evals and saw context-recall drop I'd know to look at chunking or embedding."
+
+🎯 **Q: How do you scale evals to a 1000-case suite where every PR is expensive?**
+A: "Three patterns layered. PR-level: run a curated 10–20 case fast subset that catches the most common regressions; gate on it. Nightly: run the full suite, post a Slack alert if pass rate drops by more than X. Risky changes: opt-in `[full-eval]` keyword in the PR title triggers the full suite on demand. Production: sample 1% of real responses through the LLM-judge, trend the score over time — that's online eval, complementary to offline. The pattern is 'cheap on every PR, expensive when it matters.'"
+
+### 13.10 Common pitfalls
+
+⚠️ **No flywheel — static golden set.** The set captures the bugs you imagined, not the bugs production reveals. After ~3 months it stops mapping to reality. Discipline: every prod failure → new case before fixing.
+
+⚠️ **Eval and product prompt drift.** If `CHAT_SYSTEM_PROMPT` lives in two files, evals can pass on a stale copy. Extract to a shared module. (Audia today: `src/lib/rag-prompt.ts`.)
+
+⚠️ **Threshold too tight.** 95%+ means judge noise fails PRs unfairly; teams turn off the gate. Threshold ≈ baseline minus 5–10 points.
+
+⚠️ **Substring choices too broad.** `"arr"` matches "carry," "narrative," "guarantee." Substring asserts need to be specific or use word-boundary regex. (We hit this live today.)
+
+⚠️ **Skipping judge validation.** A judge that's never been audited is a measurement instrument you've never calibrated. Every "pass" is unverified.
+
+⚠️ **Running judges on cases where programmatic already failed.** Wasteful AND muddies the signal — if both layers fail, you can't tell which verdict matters; if programmatic fails but judge passes, the rubric is loose.
+
+⚠️ **Blending retrieval and generation eval.** "The answer was wrong" tells you nothing. Separate context precision/recall (retrieval) from faithfulness/relevancy (generation) so you can walk the chain backward.
+
+⚠️ **Running the same eval on every push instead of every PR.** PR-scoped runs match the "block bad merges" goal; push-scoped runs burn budget on intermediate commits. Audia's workflow uses `on: pull_request` for this reason.
+
+### 13.11 Glossary additions (alphabetical, land in Appendix A)
+
+- **CI eval gate** — see §13.2.
+- **Eval flywheel** — see §13.1.
+- **Judge validation** — see §13.5.
+- **Pairwise judging** — present two outputs to the judge; pick the better. More reliable than pointwise rubric scoring.
+- **PR fast subset / nightly full suite** — production scaling pattern: cheap eval on every PR, full suite overnight.
+- **"Looking at your data"** — practitioner discipline of reading real outputs before defining metrics. Hamel Husain's framing.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -2016,6 +2217,7 @@ Running `@/lib/ai` outside Next hit three walls; the `npm run eval` flags each s
 - **Causal mask** — a triangular matrix added to attention scores before softmax that sets future positions to −∞, ensuring each token can only attend to itself and prior tokens.
 - **Citation pattern** — the mechanism by which an LLM signals which retrieved chunks support each claim. Three options: inline `[N]` markers, structured JSON, or post-hoc attribution. Inline markers are streaming-friendly and the Audia default.
 - **Context budget** — the fixed input-token allowance for one LLM call. RAG prompts compete for it across system, retrieved chunks, conversation history, and user question.
+- **CI eval gate** — CI step that runs the eval suite on every PR and blocks merge if the pass rate falls below a threshold. Turns "we have evals" into "evals actually prevent shipping bad code." Threshold ≈ baseline minus 5–10 points to tolerate judge noise.
 - **Cohen's kappa** — inter-rater agreement metric corrected for chance agreement. Used to validate an LLM-judge against human spot-checks before trusting it in CI. Know the term, not the formula.
 - **Context precision / context recall** — RAGAS retrieval-eval metrics. Precision: of chunks retrieved, how many relevant. Recall: of relevant chunks that exist, how many retrieved. Diagnose retrieval separately from generation.
 - **Conversation memory** — client-side strategy for re-injecting past dialogue turns into each new LLM call. Three families: rolling buffer, summary buffer, vector memory. Not a model feature.
@@ -2038,6 +2240,7 @@ Running `@/lib/ai` outside Next hit three walls; the `npm run eval` flags each s
 - **Few-shot prompting** — including 3–5 input/output examples in the prompt before the real input. The model learns the pattern from demonstrations. Beats long descriptions for custom formats and edge cases.
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
 - **Eval** — repeatable automated measurement of AI output quality against fixed inputs, producing a trackable score. The unit test of non-deterministic systems. Offline (golden set, pre-merge) vs online (production traffic, post-deploy).
+- **Eval flywheel** — continuous improvement loop: offline evals catch pre-merge regressions; production failures get fed back into the golden set; the set grows with real failure patterns; trust in the harness compounds. The point of evals is the loop, not the dashboard.
 - **Faithfulness** — RAGAS generation-eval metric: does the answer make only claims supported by retrieved context? Low faithfulness = generation hallucinating (fix the prompt). Audia's LLM-judge measures this for summaries.
 - **Frequency penalty** — sampling parameter that reduces the logit of each token proportionally to how often it has already appeared. Reduces repetition in long-form output. Range 0–2.
 - **Golden set** — curated, version-controlled, held-out dataset of representative inputs + known-good outputs (or grading criteria). The yardstick offline evals measure against. Coverage over volume; never reuse few-shot examples.
@@ -2049,7 +2252,9 @@ Running `@/lib/ai` outside Next hit three walls; the `npm run eval` flags each s
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
 - **IVFFlat** — inverted-file vector index. Clusters vectors via k-means into N lists; queries probe closest lists. Fast build, low memory, good recall — but requires data present before build.
 - **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
+- **Judge validation** — one-time spot-check of running the LLM-judge against ~20 human-rated examples to confirm verdicts correlate with human judgment. Until this passes, every "pass" the harness reports is unverified. Measure with Cohen's kappa.
 - **LLM-as-judge** — using a (usually stronger, different-family) LLM to score another model's output against a rubric. Modern default for grading open-ended output. Watch position, verbosity, and self-enhancement bias; prefer pass/fail over 1–10; reason before verdict.
+- **"Looking at your data"** — practitioner discipline: read ~100 real model outputs before defining a metric. You don't know what to measure until you've seen the failure modes. Hamel Husain's framing.
 - **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
 - **MMR (Maximal Marginal Relevance)** — re-ranking algorithm balancing relevance to query against diversity from already-selected results. Iteratively picks the candidate maximizing `λ·rel − (1−λ)·max-sim-to-selected`. λ=0.7 is production default.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
@@ -2067,7 +2272,8 @@ Running `@/lib/ai` outside Next hit three walls; the `npm run eval` flags each s
 - **OWASP Top 10 for LLMs** — canonical security reference for LLM applications (genai.owasp.org). Bookmark for interviews.
 - **pgvector** — Postgres extension adding a native `vector(N)` column type, four distance operators (`<->`, `<#>`, `<=>`, `<+>`), and ANN indexing (IVFFlat, HNSW). Turns Postgres into a vector DB without new infrastructure.
 - **pgvector operators** — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1 / Manhattan). Smaller value = more similar in ORDER BY. Cosine is the default for text embeddings.
-- **Pairwise vs pointwise judging** — pairwise: judge picks the better of two outputs (more reliable). Pointwise: judge scores one output on a rubric. Both humans and LLMs compare better than they absolute-score.
+- **Pairwise vs pointwise judging** — pairwise: judge picks the better of two outputs (more reliable). Pointwise: judge scores one output on a rubric. Both humans and LLMs compare better than they absolute-score. Mitigate position bias by running both orders (A,B) and (B,A) and counting wins only when consistent.
+- **PR fast subset + nightly full suite** — scaling pattern for eval cost: a small curated subset gates every PR (cheap, fast feedback), the full suite runs overnight with Slack alerting on pass-rate drops. Reserve full-suite-on-PR for explicit opt-in (e.g., a `[full-eval]` keyword).
 - **Pass rate** — fraction of golden-set cases meeting their success criteria on a run. The headline regression metric; gate CI on it. 100% on a fresh set usually means the set is too easy.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
 - **Principle of least privilege** — security principle that the model should have access only to what it strictly needs. The strongest defense against agentic injection attacks — if the model *can't* take a dangerous action, no injection can make it.

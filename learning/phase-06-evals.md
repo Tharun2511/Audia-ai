@@ -47,3 +47,58 @@ Evals are the unit tests of non-deterministic systems: there's no `===` for "is 
 - Zheng et al. 2023, [*"Judging LLM-as-a-Judge"*](https://arxiv.org/abs/2306.05685) — MT-Bench/Chatbot Arena; read the biases section
 - [RAGAS docs](https://docs.ragas.io/en/stable/concepts/metrics/index.html) — the four RAG-eval metrics
 - OpenAI [Evals](https://github.com/openai/evals) and [`promptfoo`](https://www.promptfoo.dev/) — production eval frameworks to know by name (we built primitives first)
+
+---
+
+## Session 6.2 — Building an eval harness: CI gates, RAG eval, the flywheel
+
+**Built in Audia:**
+- Shared prompt seam [src/lib/rag-prompt.ts](../src/lib/rag-prompt.ts) — extracted `CHAT_SYSTEM_PROMPT` + `buildContextBlock` + `wrapUserMessage` from `chat/route.ts` so eval and product can't drift on prompt text. Updated [chat/route.ts](../src/app/api/chat/route.ts) to import from it.
+- [src/evals/golden-chat.ts](../src/evals/golden-chat.ts) — 10 RAG cases: single-chunk recall, multi-chunk synthesis, refusal-out-of-scope, injection-in-chunk, disagreement-surface-both, exact-number recall, irrelevant-chunks refusal, speaker attribution, action-item synthesis, role-change injection.
+- Extended [src/evals/judge.ts](../src/evals/judge.ts) with `judgeRAGFaithfulness` (chunks-aware faithfulness) and `judgeAnswerRelevancy` (does the answer address the question). Refactored to shared `callJudge()` helper.
+- [src/evals/chat.eval.ts](../src/evals/chat.eval.ts) — three layers: programmatic (substring + citation count + refusal heuristic), faithfulness judge, relevancy judge. Skips judges on refusal cases. Exits 1 below 90%.
+- `npm run eval:chat`, `npm run eval:all`.
+- [.github/workflows/eval.yml](../../.github/workflows/eval.yml) — CI gate at 90%: runs both suites on every PR, requires `secrets.GROQ_API_KEY`, skips on doc-only changes, concurrency-cancels superseded runs.
+- **Live flywheel demo:** first chat eval run was 6/10. Diagnosed → 2 real prompt bugs (didn't preserve exact numbers; invented decisions on deferral) + 2 eval defects (refusal heuristic incomplete; "arr" was a false-positive magnet substring). Fixed all four. **Re-ran: 10/10.** The two new prompt rules (verbatim-preservation + pending-decision handling) are real product improvements, not eval-paper.
+
+### Concept summary
+
+Phase 6.1 built the first harness; 6.2 makes evals load-bearing in three ways. One, the eval flywheel — every production failure becomes a new golden-set case before being fixed, so the set grows with real failure patterns instead of imagined ones. Two, CI integration — `npm run eval:all` runs on every PR with a hard gate at 90% (threshold set to baseline minus 5–10 points for judge noise tolerance), blocking merge when AI quality regresses. Three, RAG-specific eval depth — the four RAGAS metrics, separating retrieval (context precision/recall) from generation (faithfulness/answer relevancy) so a wrong answer is diagnosable. Audia 6.2 implements the generation half (faithfulness + relevancy) against fabricated chunks; full retrieval eval needs DB seeding and is deferred to 6.3+. The key engineering decision is extracting `CHAT_SYSTEM_PROMPT` into a shared module — eval and product MUST share the prompt or the eval can pass on a stale copy. Pairwise judging beats pointwise for comparing prompt v1 vs v2; judge validation against ~20 human spot-checks (measured by Cohen's kappa) is what makes the judge itself trustworthy. Scaling patterns at high volume — PR fast subset + nightly full suite + opt-in `[full-eval]` keyword — exist; Audia doesn't need them yet at Groq's free tier.
+
+### 5 most-likely interview questions
+
+1. **Q: Walk me through how you build an eval harness from scratch.**
+   A: "Start by reading the model's outputs — 50–100 real examples before defining any metric. Categorize failures into buckets (invention, off-topic, formatting breaks, injection susceptibility). Build one metric per bucket. Construct a held-out golden set of 15–30 cases each probing one bucket, including adversarial cases. Run programmatic checks first — schema, substring, citation count — free, exact, fail fast. Layer an LLM-judge on top only for what programmatic can't express. Use a different, stronger judge model than the system under test for self-enhancement-bias avoidance. Wire `npm run eval` for local iteration and a CI step that gates merge below a threshold. Then start the flywheel: every production failure becomes a new case."
+
+2. **Q: How do you handle CI eval gates without flaky failures?**
+   A: "Threshold set to baseline minus 5–10 points to tolerate judge noise — if my eval baseline is 100%, I gate at 90%. Tighter than that and judge variance fails honest PRs; looser and the gate stops catching real regressions. I also skip the eval workflow on doc-only PRs via `paths-ignore`, cancel superseded runs via `concurrency` so only the latest commit's eval matters, and post the score-vs-baseline as a PR comment for soft signal even when the hard gate passes. When the gate fails, the right move is to investigate the failing cases — sometimes they're real regressions, sometimes the judge is being flaky on the same case and the rubric needs hardening."
+
+3. **Q: Why split RAG eval into context-precision/recall and faithfulness/relevancy?**
+   A: "Different root causes. If faithfulness drops, generation is hallucinating — fix the prompt or grounding rules. If answer-relevancy drops, generation is answering the wrong question — fix the prompt. If context-precision drops, retrieval is letting noise through — tune the re-ranker (MMR λ, k). If context-recall drops, the right chunks never reach the re-ranker — fix coarse N, chunking, or the embedding model. Without that separation, 'the answer was wrong' tells you nothing; with it, you walk the diagnostic chain backward to a specific knob. Audia 6.2 implements the generation half (faithfulness, relevancy) — those work against fabricated chunks. Retrieval eval needs a seeded pgvector with ground-truth chunk-relevance labels per question; different infrastructure, separate phase."
+
+4. **Q: Your eval is at 100%. Should you trust the harness?**
+   A: "Not yet. Three things have to be true to trust it. One: the golden set must be hard enough to fail — 100% on a fresh set usually means the set is too easy, not that the system is perfect. Validate by adding adversarial cases until something fails, then fix it. Two: the judge must be validated against human judgment — spot-check ~20 verdicts by hand and compute Cohen's kappa; above 0.7 is substantial agreement. Until that's measured, every 'pass' is unverified. Three: the flywheel must be running — every production failure feeds back into the set. A static eval becomes a coverage-fiction over time."
+
+5. **Q: How would you scale this to a 1000-case suite where every PR is expensive?**
+   A: "Three layers, cheap-to-expensive. PR-level: run a curated 10–20 case fast subset that catches the most common regressions; gate on it; full suite is opt-in via a `[full-eval]` keyword in the PR title for risky changes. Nightly: run the full suite, post a Slack alert if pass rate drops by more than X. Production: sample 1% of real responses through the LLM-judge, trend the score over time — that's online eval, complementary to offline. Pattern is 'cheap on every PR, expensive when it matters.' Audia doesn't need any of this today — we're on Groq's free tier at ~25 calls per run, effectively $0 — but at gpt-4o judge prices and 1000 cases this matters."
+
+### Gotchas (additions to 6.1's list)
+
+- **Eval and product prompt drift.** Putting `CHAT_SYSTEM_PROMPT` in two files lets evals pass against a stale copy. Extract to a shared module (Audia: `src/lib/rag-prompt.ts`).
+- **Substring assertions that are too broad.** `"arr"` matches "carry," "narrative," "guarantee." Use specific markers, word-boundary regex, or whole-word matching.
+- **Skipping judge validation.** A judge that's never been audited against humans is an uncalibrated instrument. Every "pass" is unverified.
+- **Running the same eval on every push, not every PR.** Push-scoped runs burn budget on intermediate commits; use `on: pull_request` for the "block bad merges" goal.
+- **Threshold too tight.** 95%+ means judge noise fails PRs unfairly; teams turn off the gate. Threshold ≈ baseline minus 5–10 points.
+- **No flywheel — static golden set.** After ~3 months it stops mapping to reality. Discipline: every prod failure → new case before fixing the bug.
+
+### Operational notes
+
+- **GitHub Actions setup needed:** add `GROQ_API_KEY` as a repository secret (Settings → Secrets and variables → Actions → New repository secret). After the first run completes, add the workflow as a Required Status Check (Settings → Branches → Branch protection rules → main) for the gate to actually block merges.
+- **Cost on Groq free tier:** ~25 calls per `eval:all` run = effectively $0. Daily limit (100k tokens for 70B) accommodates ~9 full runs/day; 30 PRs/week trivial.
+
+### Go-deeper resources
+
+- Hamel Husain, [*"A Field Guide to Rapidly Improving AI Products"*](https://hamel.dev/blog/posts/field-guide/) — eval flywheel + "look at your data" rule
+- Eugene Yan, [*"Patterns for Building LLM-based Systems & Products — Evals"*](https://eugeneyan.com/writing/llm-patterns/#evals-to-measure-performance) — the eval decision tree
+- [RAGAS docs](https://docs.ragas.io/en/stable/concepts/metrics/index.html) — the four metrics, when each fires
+- [GitHub Actions docs on required status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging) — the wire-up for making the gate actually block

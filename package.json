@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "eval": "node --import tsx --conditions=react-server --env-file=.env src/evals/summary.eval.ts"
+    "eval": "node --import tsx --conditions=react-server --env-file=.env src/evals/summary.eval.ts",
+    "eval:chat": "node --import tsx --conditions=react-server --env-file=.env src/evals/chat.eval.ts",
+    "eval:all": "npm run eval && npm run eval:chat"
   },
   "dependencies": {
     "@deepgram/sdk": "^5.0.0",
