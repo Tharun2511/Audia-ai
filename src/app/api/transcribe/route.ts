@@ -1,7 +1,7 @@
 import { getDatabase } from "@/db/data-source";
 import { Transcription } from "@/entity/Transcription";
 import type { TranscriptSegment } from "@/entity/Transcription";
-import { deepgram, summarizeTranscript } from "@/lib/ai";
+import { deepgram, generateTitle, summarizeTranscript } from "@/lib/ai";
 import { uploadAudio } from "@/lib/audio-storage";
 import { chunkTranscript } from "@/lib/chunking";
 import { saveChunkWithEmbedding } from "@/lib/chunks";
@@ -90,11 +90,18 @@ export async function POST(req: Request) {
     const segments = parseSegments(words);
     const duration = ((result as unknown as { metadata?: { duration?: number } })?.metadata?.duration) ?? 0;
 
-    const summary = await summarizeTranscript(segments);
+    // Summary + title are independent enrichments — same source segments, no
+    // dependency between them. Parallelize so latency = max(one) not sum(both).
+    // Both return null on too-short / provider failure; we save those as-is
+    // (the user can rename / re-summarize later).
+    const [summary, title] = await Promise.all([
+        summarizeTranscript(segments),
+        generateTitle(segments),
+    ]);
 
     const db = await getDatabase();
     const repo = db.getRepository(Transcription);
-    const record = repo.create({ duration, segments, userEmail: user.email, summary, audioPathname });
+    const record = repo.create({ duration, segments, userEmail: user.email, summary, title, audioPathname });
     await repo.save(record);
 
     // Chunk + embed + persist. Parallel embed calls keep latency bounded by the

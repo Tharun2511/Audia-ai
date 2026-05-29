@@ -1,5 +1,10 @@
 import { randomUUID } from "crypto";
-import type { ChatCompletionChunk, ChatCompletionCreateParamsStreaming, ChatCompletionMessageParam } from "groq-sdk/resources/chat/completions";
+import type {
+    ChatCompletionChunk,
+    ChatCompletionCreateParamsStreaming,
+    ChatCompletionMessageParam,
+    ChatCompletionMessageToolCall,
+} from "groq-sdk/resources/chat/completions";
 import { groq } from "@/lib/ai";
 import { computeCost, logUsage } from "@/lib/ai-usage";
 import { HISTORY_MESSAGE_LIMIT, loadRecentTurns, saveTurn } from "@/lib/chat-memory";
@@ -8,6 +13,9 @@ import { getCurrentUser } from "@/lib/dal";
 import { embed } from "@/lib/embeddings";
 import { CHAT_SYSTEM_PROMPT, wrapUserMessage } from "@/lib/rag-prompt";
 import { maximalMarginalRelevance } from "@/lib/rerank";
+import { AUDIA_TOOLS, dispatchTool } from "@/lib/tools";
+
+const MAX_TOOL_ITERATIONS = 3;
 
 /**
  * Edge-position reordering: most-relevant chunks at positions 0 and k-1
@@ -178,39 +186,120 @@ export async function POST(req: Request) {
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
-            const params: StreamingCreateParamsWithUsage = {
-                messages,
-                model,
-                stream: true,
-                stream_options: { include_usage: true },
-            };
+            // ── Agentic loop (Phase 7.1) ──────────────────────────────────
+            // Up to MAX_TOOL_ITERATIONS rounds of:
+            //   1. Stream a completion. Forward delta.content to the client,
+            //      accumulate delta.tool_calls separately (they're not user-facing).
+            //   2. If the stream ended with tool_calls, execute them, append
+            //      their results to `messages`, loop.
+            //   3. If the stream ended with content (no tool_calls), we're done.
+            // The LAST allowed iteration uses tool_choice="none" so the model
+            // is forced to produce a final text answer instead of looping forever.
 
-            let usage: { prompt_tokens: number; completion_tokens: number } | null = null;
-            let streamErr: unknown = null;
             let accumulated = "";
+            let totalPromptTokens = 0;
+            let totalCompletionTokens = 0;
+            let streamErr: unknown = null;
 
             try {
-                const aiStream = await groq.chat.completions.create(params, { signal: req.signal });
-
-                for await (const rawChunk of aiStream) {
+                for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
                     if (req.signal.aborted) break;
-                    const chunk = rawChunk as ChunkWithUsage;
-                    const text = chunk.choices[0]?.delta?.content ?? "";
-                    if (text) {
-                        accumulated += text;
-                        try {
-                            controller.enqueue(encoder.encode(text));
-                        } catch {
-                            // controller closed (client disconnected) — stop reading upstream
-                            break;
+                    const isLast = iter === MAX_TOOL_ITERATIONS - 1;
+
+                    const params: StreamingCreateParamsWithUsage = {
+                        messages,
+                        model,
+                        tools: AUDIA_TOOLS,
+                        tool_choice: isLast ? "none" : "auto",
+                        stream: true,
+                        stream_options: { include_usage: true },
+                    };
+
+                    // Per-iteration accumulators. tool_calls arrive in deltas
+                    // keyed by `index`; merge name + arguments fragments.
+                    const toolCallsByIndex = new Map<number, {
+                        id: string;
+                        name: string;
+                        arguments: string;
+                    }>();
+                    let iterContent = "";
+
+                    const aiStream = await groq.chat.completions.create(params, { signal: req.signal });
+                    for await (const rawChunk of aiStream) {
+                        if (req.signal.aborted) break;
+                        const chunk = rawChunk as ChunkWithUsage;
+                        const delta = chunk.choices[0]?.delta;
+
+                        if (delta?.content) {
+                            iterContent += delta.content;
+                            accumulated += delta.content;
+                            try {
+                                controller.enqueue(encoder.encode(delta.content));
+                            } catch {
+                                // client disconnected — stop pulling tokens
+                                break;
+                            }
+                        }
+
+                        if (delta?.tool_calls) {
+                            for (const tc of delta.tool_calls) {
+                                const idx = tc.index ?? 0;
+                                const accum = toolCallsByIndex.get(idx) ?? { id: "", name: "", arguments: "" };
+                                if (tc.id) accum.id = tc.id;
+                                if (tc.function?.name) accum.name = tc.function.name;
+                                if (tc.function?.arguments) accum.arguments += tc.function.arguments;
+                                toolCallsByIndex.set(idx, accum);
+                            }
+                        }
+
+                        if (chunk.usage) {
+                            totalPromptTokens += chunk.usage.prompt_tokens;
+                            totalCompletionTokens += chunk.usage.completion_tokens;
                         }
                     }
-                    if (chunk.usage) {
-                        usage = {
-                            prompt_tokens: chunk.usage.prompt_tokens,
-                            completion_tokens: chunk.usage.completion_tokens,
-                        };
+
+                    const toolCalls = [...toolCallsByIndex.entries()]
+                        .sort(([a], [b]) => a - b)
+                        .map(([, v]) => v)
+                        .filter((tc) => tc.id && tc.name);
+
+                    if (toolCalls.length === 0) {
+                        // No tool calls this iteration — model produced a final
+                        // text answer (or empty, which we treat as done).
+                        break;
                     }
+
+                    // Append the assistant's tool-calling turn to message history,
+                    // then execute each tool and append the results. The model needs
+                    // to see its own tool_calls turn alongside the tool results on
+                    // the next iteration — otherwise it has no reference for what
+                    // each tool_call_id corresponds to.
+                    const assistantToolCalls: ChatCompletionMessageToolCall[] = toolCalls.map((tc) => ({
+                        id: tc.id,
+                        type: "function",
+                        function: { name: tc.name, arguments: tc.arguments || "{}" },
+                    }));
+                    messages.push({
+                        role: "assistant",
+                        // OpenAI's spec: content can be null when only tool_calls are returned.
+                        // We pass iterContent in case the model emitted a mix of text + calls.
+                        content: iterContent || null,
+                        tool_calls: assistantToolCalls,
+                    } as ChatCompletionMessageParam);
+
+                    console.log(
+                        `[chat] iter=${iter} tool_calls=${toolCalls.map((tc) => `${tc.name}(${tc.arguments.slice(0, 60)})`).join(", ")}`,
+                    );
+
+                    for (const tc of toolCalls) {
+                        const result = await dispatchTool(tc.name, tc.arguments, { userEmail: user.email });
+                        messages.push({
+                            role: "tool",
+                            tool_call_id: tc.id,
+                            content: result,
+                        } as ChatCompletionMessageParam);
+                    }
+                    // continue loop — next iteration sees tool results in context
                 }
             } catch (err) {
                 if (!(err instanceof Error && err.name === "AbortError") && !req.signal.aborted) {
@@ -220,7 +309,6 @@ export async function POST(req: Request) {
             } finally {
                 // Persist the assistant turn with whatever accumulated (even
                 // partial on abort — the user saw it; it's part of history).
-                // Skip entirely if nothing came through (pure error case).
                 if (accumulated.length > 0) {
                     try {
                         await saveTurn({
@@ -244,14 +332,14 @@ export async function POST(req: Request) {
                     }
                 }
 
-                if (usage) {
+                if (totalPromptTokens > 0 || totalCompletionTokens > 0) {
                     logUsage({
                         label: req.signal.aborted ? "chat-aborted" : "chat",
                         model,
-                        promptTokens: usage.prompt_tokens,
-                        completionTokens: usage.completion_tokens,
+                        promptTokens: totalPromptTokens,
+                        completionTokens: totalCompletionTokens,
                         latencyMs: Date.now() - start,
-                        cost: computeCost(model, usage.prompt_tokens, usage.completion_tokens),
+                        cost: computeCost(model, totalPromptTokens, totalCompletionTokens),
                     });
                 }
 

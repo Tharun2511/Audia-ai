@@ -32,7 +32,7 @@
 - [§13. Building an eval harness: CI gates, RAG eval, the flywheel, judge validation](#13-building-an-eval-harness-ci-gates-rag-eval-the-flywheel-judge-validation) ✅ *(Phase 6.2)*
 
 **Part VI — Agents**
-- §14. Tool use & function calling *(Phase 7.1 — TBD)*
+- [§14. Tool use & function calling: schemas, dispatch, the agentic loop](#14-tool-use--function-calling-schemas-dispatch-the-agentic-loop) ✅ *(Phase 7.1)*
 - §15. Multi-step agents & ReAct *(Phase 7.2 — TBD)*
 - §16. MCP — Model Context Protocol *(Phase 7.3 — TBD)*
 
@@ -2194,11 +2194,226 @@ A: "Three patterns layered. PR-level: run a curated 10–20 case fast subset tha
 
 ---
 
+## §14. Tool use & function calling: schemas, dispatch, the agentic loop
+
+### Why this section exists
+
+Through Phase 6, Audia's chat had one fixed shape: question in → server retrieves chunks → model answers. The model is a *language* engine — it cannot look up data the server didn't pre-fetch, take actions, or reach external APIs. **Function-calling is the protocol that lets the model ask for those actions through a structured channel the application then executes.** It's also the architectural foundation for agents (Phase 7.2) — agents are nothing more than function-calling in a loop with sensible exit conditions.
+
+### 14.1 The protocol — single-step tool use
+
+🎯 **Function calling (tool use)**
+
+> **Definition:** A model-API protocol where the model can emit a structured `tool_calls` field instead of (or alongside) text — naming a function and its arguments. The application executes the function, returns the result, and the model continues generation with that result in context. Tools = the model's hands.
+
+The three-message single-step shape:
+
+```
+[1] Client → Model
+    messages: [system, user]
+    tools: [{ name, description, parameters }]
+
+[2] Model → Client
+    role: "assistant"
+    tool_calls: [{ id, name, arguments }]
+    content: null
+
+[3] Client executes tool, sends back:
+    messages: [
+      system,
+      user,
+      assistant_with_tool_calls,         // verbatim from step 2
+      { role: "tool", tool_call_id, content: result }
+    ]
+
+[4] Model → Client
+    role: "assistant"
+    content: "Here's what I found..."
+```
+
+📐 **Cost shape:** every tool round = 2 LLM calls (one to decide, one to use the result). 3-tool task = 4 LLM calls plus the tool executions. On Groq's free tier this is fine; at gpt-4o prices it's a real line item. (Math callout INCLUDED here per the conditional rule — this directly informs production decisions about how many tools to expose and how aggressive the loop should be.)
+
+### 14.2 The tool schema — the description IS the prompt
+
+🎯 **Tool schema**
+
+> **Definition:** A JSON Schema document declaring a tool's name, natural-language description, and typed parameters. The model decides whether and how to call the tool based on this schema — the **description is the prompt** the model reads at decision time.
+
+```typescript
+{
+  type: "function",
+  function: {
+    name: "listMyMeetings",
+    description: "List the user's recorded meetings — id, title, date, duration. " +
+                 "Use this when the user asks about WHICH meetings exist. " +
+                 "Do NOT call this to answer questions about CONTENT inside a specific meeting.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", description: "Max number. Default 10, max 50." },
+        since: { type: "string", description: "ISO 8601 date filter." }
+      },
+      required: []
+    }
+  }
+}
+```
+
+⚠️ **The description is a routing prompt.** "Search a meeting transcript when the user asks about details" is what the model reads to decide *whether to call this tool at all*. Vague descriptions → the model under-calls (misses cases) or over-calls (calls for greetings). Specific descriptions with explicit positive AND negative cases ("Use this for X. Do NOT use this for Y") give markedly better routing.
+
+⚠️ **Parameter descriptions are also prompts.** The model reads them to decide what to pass as arguments. Bad parameter docs → bad arguments. The model isn't inferring from your variable name; it's reading the description.
+
+### 14.3 `tool_choice` — controlling when the model calls
+
+🎯 **`tool_choice` parameter**
+
+> **Definition:** API-level control over the model's tool-call behavior. Four modes: `"auto"` (model decides), `"required"` (must call some tool), `{type:"function", function:{name:"X"}}` (must call tool X), `"none"` (must not call any tool).
+
+| Mode | When |
+|---|---|
+| `"auto"` (default) | Normal chat — let the model decide |
+| `"required"` | Pipeline stages where you KNOW a tool must be called |
+| `"none"` | Final iteration in an agentic loop — force a text answer |
+| `{name:"X"}` | Forced single-tool invocations — testing or specific workflow steps |
+
+### 14.4 The agentic loop
+
+🎯 **Agentic loop**
+
+> **Definition:** The application-side loop that repeatedly calls the model with growing message history until the model returns content (no `tool_calls`). Each iteration: model may call N tools → execute → append results → call model again. The "agent" is nothing more than this loop with sensible exit conditions.
+
+```
+loop iteration in 0..MAX:
+    response = LLM.chat(messages, tools, tool_choice="auto" or "none" on last)
+    if response.content and not response.tool_calls:
+        return response.content
+    if response.tool_calls:
+        for call in response.tool_calls:
+            result = dispatch(call.name, call.arguments)
+            messages.append(role:"tool" with tool_call_id, content:result)
+        messages.append(response.message)    // keep assistant's tool_calls turn
+        continue
+    if iteration == MAX:
+        return "I couldn't complete this in time."
+```
+
+🎯 **Defense talking point:** "Agents aren't a special architecture — they're function-calling in a while-loop. The hard parts are tool design, observability, and stopping conditions, not the loop itself. Audia's loop is six lines; LangChain agents and OpenAI's Assistants API are built on the same pattern."
+
+⚠️ **Three failure modes that MUST be guarded:**
+- **Infinite loops** — `MAX_ITERATIONS` (typically 3–10) + return a polite "couldn't complete" if hit
+- **Tool error cascades** — propagate errors INTO the tool_result as `{ error: ... }` so model can adapt; track consecutive identical failures
+- **Hallucinated tool names** — validate against the registered dispatcher; return a clear error result so the model self-corrects
+
+### 14.5 Streaming with tool_calls
+
+⚠️ **Tool calls and streaming coexist.** Provider APIs stream `delta.content` AND `delta.tool_calls` independently. The application must:
+1. Forward `delta.content` to the client immediately (preserves streaming UX)
+2. Accumulate `delta.tool_calls` separately by `index` — `id`, `name`, and `arguments` arrive in fragments across chunks
+3. When the stream ends, if tool_calls accumulated, execute them and start the next iteration
+
+**Audia's implementation:** [chat/route.ts](../src/app/api/chat/route.ts) does exactly this. Inside each iteration, a stream forwards `delta.content` to the ReadableStream controller as bytes arrive, while `delta.tool_calls` deltas merge into a `Map<index, accumulator>`. After the upstream stream closes, the accumulated tool_calls either drive the next iteration or (if none) terminate the loop.
+
+### 14.6 When the model decides to call — anatomy
+
+The model's choice between "answer with text" and "emit a tool_call" is just next-token sampling on a vocabulary that includes a special tool-call token. There's nothing magical — same logit selection as Phase 0.1.
+
+**What makes the model lean toward calling:**
+- Tool description matches the user's request semantically
+- System prompt instructs to use tools when appropriate
+- Prior turns called the same tool successfully (in-context learning)
+- The user's question contains named entities the tools can act on
+
+**What makes it lean toward answering directly:**
+- Question is conversational ("hi", "thanks")
+- No tool description matches
+- System prompt biases toward conciseness
+- Recent turns successfully answered without tools
+
+This is why a quality system prompt + quality tool descriptions matter so much. They're not "metadata" — they're the decision-time inputs.
+
+### 14.7 Parallel tool calls
+
+🎯 **Parallel tool calls**
+
+> **Definition:** A single model response containing multiple `tool_calls` entries, intended for the application to execute concurrently. Reduces round-trip count when calls are independent.
+
+Use when:
+- Calls are **independent** (output of one isn't input to another)
+- Calls are **idempotent** or at least safe to interleave
+- The serial round-trip cost > concurrent execution cost
+
+Don't use when:
+- Calls have dependencies (`list → for each id → fetch`)
+- One outcome should determine whether to make another
+- Concurrency would hit rate limits or DB locks
+
+Audia today: only one tool, so parallel doesn't fire yet. The dispatcher loop in [chat/route.ts](../src/app/api/chat/route.ts) already handles the array shape — adding tools won't require changing the loop, only the registry.
+
+### 14.8 Production failure modes
+
+⚠️ **Under-calling.** Tool exists, model never uses it. *Diagnosis:* description too vague, or system prompt doesn't mention tool availability. *Fix:* sharpen the description with explicit "Use this for X" cases; add tool-routing rules to the system prompt.
+
+⚠️ **Over-calling.** Model calls tool for trivial cases (greetings, off-topic). *Diagnosis:* description matches too broadly. *Fix:* add negative cases ("Do NOT call this for greetings or general Audia questions").
+
+⚠️ **Bad arguments.** Model calls with empty strings, hallucinated UUIDs, fields that don't exist. *Diagnosis:* parameter descriptions too vague; required fields not marked. *Fix:* sharper parameter docs; tighten JSON Schema; validate at dispatch and return a structured error.
+
+⚠️ **Tool error handling that confuses the model.** Tool throws a stack trace → goes back to model as-is → model panics. *Fix:* normalize errors into structured `{ error: "human-readable message" }`.
+
+⚠️ **Hallucinated tools.** Model emits `tool_calls.name = "list_emails"` when no such tool exists. *Fix:* dispatcher validates names; returns `{ error: "Tool not available. Available: …" }` so the model corrects.
+
+⚠️ **Token bloat in the loop.** Each iteration appends the full tool-call message AND tool-result to history. Long loops blow the context budget. *Guard:* MAX_ITERATIONS, prune intermediate steps, summarize on long loops.
+
+### 14.9 What we built in Audia today
+
+- **[src/lib/tools.ts](../src/lib/tools.ts)** — `AUDIA_TOOLS` registry + `dispatchTool(name, rawArgs, ctx)`. First tool: `listMyMeetings(limit?, since?)` returning the user's recent meetings. Schema, dispatcher, and ownership-aware implementation co-located so they can't drift. Unknown tool names + bad-JSON arguments + exceptions all become structured `{ error: ... }` results so the model can self-correct.
+- **[chat/route.ts](../src/app/api/chat/route.ts)** — replaced the single streaming call with an agentic loop, MAX_ITERATIONS=3, last iteration `tool_choice="none"` to force a final answer. The streaming controller forwards `delta.content` to the client mid-iteration; `delta.tool_calls` deltas merge by `index` into an accumulator until the stream closes.
+- **[src/lib/rag-prompt.ts](../src/lib/rag-prompt.ts)** — added a TOOLS section to `CHAT_SYSTEM_PROMPT`: brief routing rule that tells the model when to call vs answer from `<context>`. Confirmed no eval regression — summarizer 15/15 and chat 10/10 still hold post-change.
+- **No new eval surface yet** — the chat eval is generation-given-chunks and doesn't exercise tool routing. A `tools.eval.ts` testing tool-routing decisions (calls when it should, doesn't when it shouldn't) is the natural Phase 7.2 addition.
+
+### 14.10 Defense talking points
+
+🎯 **Q: How do agents actually work? Walk me through your architecture.**
+A: "Agents are function-calling in a loop. Six lines: the model returns either text (we're done) or tool_calls (we execute them, append the results to the message history, call the model again). Up to MAX_ITERATIONS rounds. The 'agent' is the loop plus sensible exit conditions; everything else — tool design, observability, the prompt scaffolding — sits on top. LangChain and the Assistants API are built on this exact pattern. The hard parts aren't the loop; they're guarding against infinite iteration, surfacing tool errors to the model so it can adapt, and writing tool descriptions sharp enough that the model routes correctly."
+
+🎯 **Q: How does the model decide whether to call a tool?**
+A: "It's next-token sampling. The model has a vocabulary that includes a special tool-call token, and at each step it picks the highest-likelihood next token — sometimes that's text, sometimes the tool-call sequence. The decision is driven by three things at inference time: the tool description (which IS a prompt the model reads), the system prompt (whether it instructs to use tools), and the recent conversation (in-context learning from prior successful calls). That's why description quality matters so much — vague descriptions cause under-calling or over-calling. Sharp descriptions with explicit positive AND negative examples — 'Use this for X. Do NOT use this for Y.' — are what production teams iterate on."
+
+🎯 **Q: What goes wrong with tool use in production?**
+A: "Six failure modes worth naming. Under-calling — tool exists, model never reaches for it. Over-calling — tool fires on greetings. Bad arguments — empty strings, hallucinated IDs. Tool error cascades — tool throws, model panics, calls again. Hallucinated tool names — model invents a tool that doesn't exist. Token bloat — message history grows quadratically across loop iterations. Each one has a known guard: sharper descriptions for under/over-calling, tightened JSON Schema for bad args, structured `{ error: ... }` returns for graceful failure, dispatcher validation for hallucinated names, MAX_ITERATIONS for bloat. The pattern is: errors go BACK to the model as data it can adapt to, not as crashes."
+
+🎯 **Q: How does streaming work with tool calls?**
+A: "The provider streams `delta.content` and `delta.tool_calls` independently. The application forwards content to the client immediately so streaming UX is preserved, AND accumulates tool_calls by `index` — id, name, and arguments arrive in fragments across chunks. When the stream closes, if tool_calls accumulated, execute them, append the results, start the next iteration. The user sees text from each iteration stream live; the tool execution happens in the gap between iterations. It's the same pattern as Phase 2's streaming UX, extended for tool dispatch."
+
+🎯 **Q: Why MAX_ITERATIONS = 3 specifically?**
+A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model calls a tool, gets the result, answers. Three gives headroom for one self-correction cycle without letting runaway loops burn budget. The right cap is workload-specific — research agents need 10–20, RAG-style chat needs 2–3, structured extraction is often 1. The cap exists to bound cost and prevent infinite loops, not as a quality knob. We pair it with `tool_choice='none'` on the LAST iteration so the model is forced to produce a text answer rather than asking for yet another tool call."
+
+### 14.11 Common pitfalls
+
+⚠️ **Vague tool descriptions.** "Searches things" → the model routes poorly. Specific descriptions with positive AND negative cases are the single biggest lever on tool-routing quality.
+⚠️ **No MAX_ITERATIONS.** Runaway loops burn money and context budget. Always cap.
+⚠️ **No `tool_choice="none"` on the last iteration.** Without it, the model can keep asking for tools at the cap and never produce a final answer.
+⚠️ **Throwing instead of returning structured errors.** A thrown tool error crashes the loop; a `{ error: "..." }` result lets the model adapt.
+⚠️ **Forgetting to append the assistant's tool_calls turn to history.** Without it, the tool results have no `tool_call_id` reference on the next iteration — the model gets confused.
+⚠️ **Streaming `delta.tool_calls` to the user.** They're not user-facing; accumulate them server-side and only stream `delta.content`.
+⚠️ **One mega-tool that takes 15 parameters.** Hard for the model to fill correctly. Prefer multiple narrow tools with 1–3 parameters each.
+
+### 14.12 Glossary additions (land in Appendix A)
+
+- **Function calling / tool use** — see §14.1.
+- **Tool schema** — see §14.2.
+- **`tool_choice` parameter** — see §14.3.
+- **Agentic loop** — see §14.4.
+- **Parallel tool calls** — see §14.7.
+- **Tool dispatcher** — application-side function that takes a tool name + raw arguments, executes the underlying logic, and returns a string result suitable for a `role: "tool"` message back to the model.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
 
 - **AbortController** — modern JS cancellation primitive. One controller has one `signal`; pass the signal to any async API (fetch, SDK calls). Calling `.abort()` cascades to all consumers.
+- **Agentic loop** — application-side loop that repeatedly calls the model with growing message history until it returns content (no `tool_calls`). Each iteration may execute tools and append their results. Bounded by `MAX_ITERATIONS`. The "agent" is this loop plus sensible exit conditions; everything else (LangChain, Assistants API) is built on it.
 - **AbortError** — the exception thrown when an aborted signal is observed. Expected, not a failure — distinguish from real errors in catch blocks.
 - **Abort-as-control-flow** — design pattern of treating cancellation as a normal code path with its own handling, not as an exceptional error.
 - **Async iterator** — JavaScript pattern (`for await ... of`) for consuming streams. Each iteration yields one chunk. Used by Groq/OpenAI SDKs to expose streamed responses.
@@ -2238,6 +2453,7 @@ A: "Three patterns layered. PR-level: run a curated 10–20 case fast subset tha
 - **Fixed-window chunking** — splitting text by character or token count regardless of semantic structure. Simplest; ignores sentence boundaries. Best for uniform data (code, logs).
 - **Embedding** — a dense vector representation of a token (or text chunk in RAG contexts). Tokens with similar usage end up with geometrically nearby embeddings.
 - **Few-shot prompting** — including 3–5 input/output examples in the prompt before the real input. The model learns the pattern from demonstrations. Beats long descriptions for custom formats and edge cases.
+- **Function calling (tool use)** — API protocol where the model emits a structured `tool_calls` field naming a function + arguments instead of (or alongside) text. The application executes the function, returns the result via a `role:"tool"` message, model continues with that result in context. Tools = the model's hands.
 - **Five-part prompt audit** — debugging checklist for weak prompts: role, task, format, constraints, examples. Whichever is missing or vague is usually the bug.
 - **Eval** — repeatable automated measurement of AI output quality against fixed inputs, producing a trackable score. The unit test of non-deterministic systems. Offline (golden set, pre-merge) vs online (production traffic, post-deploy).
 - **Eval flywheel** — continuous improvement loop: offline evals catch pre-merge regressions; production failures get fed back into the golden set; the set grows with real failure patterns; trust in the harness compounds. The point of evals is the loop, not the dashboard.
@@ -2273,6 +2489,7 @@ A: "Three patterns layered. PR-level: run a curated 10–20 case fast subset tha
 - **pgvector** — Postgres extension adding a native `vector(N)` column type, four distance operators (`<->`, `<#>`, `<=>`, `<+>`), and ANN indexing (IVFFlat, HNSW). Turns Postgres into a vector DB without new infrastructure.
 - **pgvector operators** — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1 / Manhattan). Smaller value = more similar in ORDER BY. Cosine is the default for text embeddings.
 - **Pairwise vs pointwise judging** — pairwise: judge picks the better of two outputs (more reliable). Pointwise: judge scores one output on a rubric. Both humans and LLMs compare better than they absolute-score. Mitigate position bias by running both orders (A,B) and (B,A) and counting wins only when consistent.
+- **Parallel tool calls** — a single model response containing multiple `tool_calls` entries, intended for concurrent execution by the application. Reduces round-trip count when calls are independent and idempotent.
 - **PR fast subset + nightly full suite** — scaling pattern for eval cost: a small curated subset gates every PR (cheap, fast feedback), the full suite runs overnight with Slack alerting on pass-rate drops. Reserve full-suite-on-PR for explicit opt-in (e.g., a `[full-eval]` keyword).
 - **Pass rate** — fraction of golden-set cases meeting their success criteria on a run. The headline regression metric; gate CI on it. 100% on a fresh set usually means the set is too easy.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
@@ -2312,6 +2529,9 @@ A: "Three patterns layered. PR-level: run a curated 10–20 case fast subset tha
 - **System message** — the role-tagged prompt segment containing instructions, persona, and constraints. Models are trained to weight system content as operator intent.
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
 - **Token-bound history** — rolling-buffer variant that keeps "as many recent turns as fit in T tokens" instead of a fixed turn count. Safer when turn lengths vary widely.
+- **Tool dispatcher** — application-side function that takes a tool name + raw JSON arguments + an execution context (e.g. userEmail for ownership) and returns a string result for the `role:"tool"` message back to the model. Unknown names, bad-JSON args, and thrown errors should all become structured `{error:...}` results so the model can self-correct.
+- **Tool schema** — JSON Schema document declaring a tool's name, natural-language description, and typed parameters. The description IS the prompt the model reads at decision time; vague descriptions cause under-calling or over-calling.
+- **`tool_choice`** — API parameter controlling tool-call behavior. `"auto"` (default, model decides), `"required"` (must call some tool), `{name:"X"}` (force specific tool), `"none"` (no tool calls — use on the LAST iteration of an agentic loop to force a final text answer).
 - **Top-k retrieval** — retrieval strategy returning the *k* chunks with highest similarity (or lowest distance) to a query embedding. Default starting point; vulnerable to redundancy + missed exact matches + no diversity. Improved by re-rankers like MMR.
 - **Top-k sampling** — keep only the k highest-probability tokens, zero the rest, renormalize.
 - **Tokenization** — converting a text string into a sequence of integer token IDs using a fixed vocabulary.
