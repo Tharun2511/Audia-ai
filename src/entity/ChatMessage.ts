@@ -36,13 +36,27 @@ export class ChatMessage {
     transcriptionId!: string | null;
 
     @Column({ type: "varchar", length: 16 })
-    role!: "user" | "assistant";
+    role!: "user" | "assistant" | "tool";
 
     @Column({ type: "text" })
     content!: string;
 
     @Column({ type: "simple-json", nullable: true })
     citations!: unknown[] | null;
+
+    // Populated only on role="tool" — references the assistant tool_call.id
+    // this row is the result of. Lets us reconstruct the assistant→tool pairing
+    // when loading history (the API requires role:tool messages immediately
+    // follow their assistant turn with a matching tool_call_id).
+    @Column({ type: "varchar", length: 64, nullable: true })
+    toolCallId!: string | null;
+
+    // Populated only on role="assistant" turns that emitted tool_calls.
+    // Each entry: { id, name, arguments } — matches the OpenAI/Groq shape so
+    // we can round-trip the assistant turn back into the messages array
+    // verbatim on subsequent calls.
+    @Column({ type: "simple-json", nullable: true })
+    toolCalls!: Array<{ id: string; name: string; arguments: string }> | null;
 
     @CreateDateColumn()
     createdAt!: Date;

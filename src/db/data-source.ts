@@ -19,29 +19,31 @@ export const AppDataSource = new DataSource({
 let pgvectorReady = false;
 
 /**
- * Ensures pgvector is enabled and the embedding column exists + is protected
- * on transcript_chunk. Runs once per process.
+ * Post-init schema hardening for the embedding column.
  *
- * Three things happen here, in order:
- *   1. Enable the vector extension + add the embedding column. Idempotent.
- *   2. SELF-HEAL: NULL-embedding rows are unreachable (every retrieval filters
- *      `AND embedding IS NOT NULL`) and only ever come from a write path that
- *      bypassed `saveChunkWithEmbedding`. Delete them every startup, loud-log
- *      the count so we know they were here. Recover via /api/backfill-chunks.
- *   3. DB-LEVEL ENFORCEMENT: a CHECK constraint that future INSERTs must
- *      include a non-NULL embedding. Defense-in-depth on top of the atomic
- *      INSERT — if some future code path ever forgets to populate it, the DB
- *      rejects it at write time instead of letting it silently land as NULL.
- *      CHECK constraints are invisible to TypeORM synchronize, so they survive
- *      hot reloads and entity changes.
+ * As of Phase 7.2 fix: the `embedding` column is now declared on the
+ * TranscriptChunk entity (`@Column("vector", {length: 768, nullable: true})`),
+ * so TypeORM 0.3.27+'s native pgvector support handles column creation +
+ * preservation across synchronize. We no longer ADD COLUMN here manually —
+ * doing it post-sync was the bug (synchronize saw the column as orphan,
+ * dropped it, then we re-added it empty, wiping all embeddings every restart).
+ *
+ * What still happens here:
+ *   1. CREATE EXTENSION IF NOT EXISTS vector — needed at least once on a
+ *      fresh DB so TypeORM can create vector columns. Idempotent.
+ *   2. SELF-HEAL: delete any NULL-embedding rows. With the fix in place these
+ *      shouldn't appear, but the defense-in-depth check stays — if anything
+ *      ever lands NULL we want it cleaned + loud-logged on startup.
+ *   3. CHECK CONSTRAINT: belt on top of the entity-level `nullable: false`
+ *      (TODO once historical NULLs are backfilled). For now `nullable: true`
+ *      because legacy rows may exist; constraint stays as the eventual lock.
  */
 async function ensurePgvector(ds: DataSource) {
     if (pgvectorReady) return;
 
+    // The extension MUST exist before TypeORM tries to synchronize a vector
+    // column on a fresh DB. Idempotent, so cheap to call every startup.
     await ds.query("CREATE EXTENSION IF NOT EXISTS vector;");
-    await ds.query(
-        `ALTER TABLE transcript_chunk ADD COLUMN IF NOT EXISTS embedding vector(768);`,
-    );
 
     // Self-heal: count then delete any NULL-embedding rows.
     const nullCheck = (await ds.query(
@@ -57,7 +59,10 @@ async function ensurePgvector(ds: DataSource) {
         await ds.query(`DELETE FROM transcript_chunk WHERE embedding IS NULL`);
     }
 
-    // DB-level enforcement: any future INSERT without embedding fails loudly.
+    // DB-level CHECK constraint: any future INSERT without embedding fails
+    // loudly even if the entity-level nullable: true allows it through.
+    // Tightened to NOT NULL on the entity in a follow-up once we've confirmed
+    // no remaining legacy NULLs in production.
     await ds.query(`
         DO $$
         BEGIN
@@ -73,7 +78,7 @@ async function ensurePgvector(ds: DataSource) {
     `);
 
     pgvectorReady = true;
-    console.log("pgvector ready: extension enabled, column ensured, NOT NULL constraint active.");
+    console.log("pgvector ready: extension enabled, entity-managed column, NOT NULL constraint active.");
 }
 
 // This helper prevents Next.js from creating too many connections during development

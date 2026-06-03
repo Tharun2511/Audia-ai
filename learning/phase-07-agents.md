@@ -55,3 +55,56 @@ Through Phase 6, Audia's chat had one fixed shape: question in → server retrie
 - [OpenAI guide, *"Function calling"*](https://platform.openai.com/docs/guides/function-calling) — the canonical primer; Groq's API is OpenAI-compatible so this is literally the spec
 - [Anthropic, *"Tool use with Claude"*](https://docs.anthropic.com/en/docs/build-with-claude/tool-use) — the "tools are prompts in disguise" framing is the most important part
 - Hamel Husain, [*"Building & evaluating tool-using LLMs"*](https://hamel.dev/blog/posts/tool-use/) — what goes wrong in practice and how to measure routing
+
+---
+
+## Session 7.2 — Multi-step agents & ReAct: tool-result memory, failure modes, planning
+
+**Built in Audia:**
+- **`ChatMessage` entity extended** — `role` adds `"tool"`, plus `toolCallId` (nullable varchar) and `toolCalls` (nullable simple-json) columns. TypeORM synchronize adds via standard ALTER TABLE.
+- **[chat-memory.ts](../src/lib/chat-memory.ts) rewritten** — `HistoryMessage` is now a union of API-shaped variants (user / assistant text / assistant-with-tool_calls / role:tool). `loadRecentTurns` returns them chronologically with **orphan-pair filtering** at the window edge (collects valid tool_call_ids from in-window assistants, drops role:tool messages without an anchor). `saveTurn` accepts new optional `toolCallId` + `toolCalls` fields.
+- **[tools.ts](../src/lib/tools.ts)** — second tool `getMeetingDetails(transcriptionId)` returns title, createdAt, duration, distinct speakers + count, cached summary. Ownership filter (`userEmail`) prevents cross-user leaks even with a leaked id. Composes with `listMyMeetings` for the canonical "list → drill" pattern.
+- **[chat/route.ts](../src/app/api/chat/route.ts)** — persists assistant-with-tool_calls turn + each role:tool result inside the loop, in order (assistant first, then tool results — chronological reload reconstructs the pair correctly). `MAX_TOOL_ITERATIONS` bumped 3 → 4 to accommodate genuine two-step workflows + one self-correction slot. History from `loadRecentTurns` splats directly into the messages array — no remapping needed.
+- **Eval calibration** (small, surgical): dropped `mustCiteAtLeast` on `action-item-owner` (case probes attribution, citation is tested elsewhere); faithfulness rubric now explicitly classifies source metadata (speaker labels, timestamps) as part of the source. **Both suites pass: 15/15 + 10/10.**
+
+### Concept summary
+
+Multi-step agents are function calling in a loop with persistent tool-result memory. The loop is six lines; the architectural difference from single-step is twofold: (1) ≥2 tools so genuine composition is possible, and (2) persisting the assistant's tool_calls turn AND each role:tool result in conversation memory so subsequent turns can reference fetched data without re-calling. Without that persistence, follow-ups have amnesia about prior tool output. ReAct (Yao et al. 2023) is the original pattern — Thought / Action / Observation interleaved — and modern function-calling APIs encode it implicitly: `delta.content` = thought, `tool_calls` = action, `role:"tool"` = observation. The four canonical multi-step failure modes are cascading errors (bad data compounds), stuck loops (model emits identical calls), hallucinated state (model "remembers" things not actually in context), and off-task drift (new in multi-step — chains of reasoning steps wander from the user's goal). Guards: structured `{error}` returns, repeated-call detection, MAX_ITERATIONS with `tool_choice="none"` on the last iteration, restating the user's goal each iteration. Reactive agents (default for Audia) decide one step at a time; planning agents emit a sequence first. Reach for planning only when reactive drifts on 5+ step queries — the planning step costs an upfront LLM call. Audia's MAX = expected_steps + 1, so 4 for two-tool chat. Order preservation matters: the API requires role:tool to immediately follow its anchor assistant turn; save assistant first (lower createdAt), then each tool result.
+
+### 5 most-likely interview questions
+
+1. **Q: Walk me through your multi-step agent architecture.**
+   A: "Function calling in a loop with persistent tool-result memory. The loop iterates: model returns text (done) or tool_calls (execute, append results, call model again). Up to MAX_ITERATIONS — Audia uses 4 for the two-tool chat workload (expected_steps=2, plus one self-correction slot). Last iteration uses `tool_choice='none'` to force text. Tool results and the assistant's tool_calls turn both persist to ChatMessage so follow-ups have working memory of what was fetched. Without that persistence, every follow-up triggers a redundant re-call. LangChain agents and Anthropic's tool use are built on this same six-line pattern — the engineering work is exit conditions, tool descriptions, and observability, not the loop."
+
+2. **Q: ReAct — what is it and is it still relevant?**
+   A: "Yao et al. 2023 — the prompting pattern that interleaved Thought, Action, and Observation per iteration. It taught us that exposing reasoning helps the model self-correct. Modern function-calling APIs encode ReAct implicitly: `delta.content` carries any thoughts the model wants to surface, `tool_calls` carries actions, `role:'tool'` messages carry observations. The loop iterates them automatically. You don't write 'Thought:' tags anymore, but the underlying structure IS ReAct. If someone asks 'is ReAct still used' — yes, you just don't see the prose because the protocol does the same work."
+
+3. **Q: What's the difference between reactive and planning agents?**
+   A: "Reactive agents decide one step at a time from current context — the loop iterates ReAct. Planning agents emit a sequence-of-tool-calls plan FIRST, then execute it (may replan mid-execution). Reactive is the default — cheaper (no upfront planning call), simpler code, robust on short tasks. Planning becomes worth the extra LLM call on long structured tasks where reactive starts drifting off-task — typically 5+ step queries. Production systems often nest: short reactive loops inside an overall plan. Audia is pure reactive because the workload is 1–3 step chat queries; I'd add planning only if I observed measurable off-task drift."
+
+4. **Q: How do you persist tool results across turns?**
+   A: "Extend the conversation-memory table with two new columns: `toolCallId` (nullable, populated on `role='tool'` rows) and `toolCalls` (nullable JSON, populated on assistant rows that emitted calls). Each iteration of the loop saves the assistant-with-tool_calls turn FIRST (lower createdAt), then each tool result (higher createdAt) — order matters because the API requires `role:tool` messages to immediately follow their anchor assistant. On load, the rolling buffer returns these chronologically, with **orphan-pair filtering**: collect all valid tool_call_ids from in-window assistant turns, then drop any `role:tool` whose id isn't backed (handles the case where the LIMIT cuts mid-pair at the window boundary). Without that filtering, a broken pair would cause the API to reject the next call."
+
+5. **Q: What are the multi-step-specific failure modes you guard against?**
+   A: "Four canonical ones. **Cascading errors** — bad data on iteration 1 becomes args for iteration 2; guard with structured `{error}` returns so the model self-corrects. **Stuck loops** — model emits identical (name + args) twice; guard with duplicate detection that returns 'you just called this; try something else.' **Hallucinated state** — model claims it 'remembers' tool data that's actually rolled out of the window; guard with tool-result persistence + a system rule 'never assert info that didn't come from a tool result this conversation.' **Off-task drift** — new in multi-step, chains of reasoning wander from the user's goal; guard with restating the user's question each iteration. All four compound with cost: every iteration is 2 LLM calls, so bound MAX_ITERATIONS aggressively and instrument cost per task."
+
+### Gotchas (additions to 7.1's list)
+
+- **Persisting role:tool without the matching assistant turn.** API rejects. Always save assistant-with-tool_calls FIRST, then each tool result. Order is enforced via `createdAt` ascending on the next load.
+- **Window-edge orphan pairs.** Rolling buffer cuts mid-pair → role:tool inside but anchor outside → API rejects. Orphan-pair filtering in `loadRecentTurns` collects valid tool_call_ids from in-window assistants and drops unbacked tool messages.
+- **Treating tool results as user-facing.** They're DATA the model integrates into natural language. Never stream their JSON to the client; never let their raw shape leak into the assistant's text response.
+- **MAX_ITERATIONS scaling with tool count.** Number of tools ≠ expected steps per task. Anchor MAX to "how many calls does a typical query genuinely need," usually 1–3, not 10. Bump only when you see real symptoms.
+- **Single-tool agents.** A one-tool agent can't multi-step in any meaningful sense — every task is "call the one tool or don't." For genuine ReAct workflows you need ≥2 tools that compose.
+- **Reactive-vs-planning confusion in interviews.** Default IS reactive; planning is an escalation. Don't say "all agents are planning agents" — they're not. Say "reactive by default, planning when reactive drifts."
+
+### Operational notes
+
+- **Database migration on first deploy:** TypeORM synchronize adds the new ChatMessage columns automatically (`toolCallId`, `toolCalls`). The CHECK constraint from 7.1's hardening lives on `transcript_chunk`, not `chat_message` — no conflict.
+- **Try it manually:** ask *"What meetings did I have this week?"* → expect listMyMeetings tool call → meeting title in response. Then follow up *"Tell me more about [that meeting]"* → expect getMeetingDetails to fire with the id from turn 1's tool result (no longer needs to re-list).
+- **Server log on multi-step:** look for two `[chat] iter=N tool_calls=...` lines in one turn — that's a genuine multi-step request firing two iterations of the loop.
+
+### Go-deeper resources
+
+- Yao et al. 2023, [*"ReAct: Synergizing Reasoning and Acting in Language Models"*](https://arxiv.org/abs/2210.03629) — original ReAct paper; skim sections 1–3
+- Anthropic, [*"Building effective agents"*](https://www.anthropic.com/research/building-effective-agents) — most up-to-date practitioner essay; the workflow vs agent distinction is the interview-grade content
+- LangChain, [*"Why agents fail"*](https://blog.langchain.dev/why-agents-fail/) — known taxonomy of multi-step breakage patterns

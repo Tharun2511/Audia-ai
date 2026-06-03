@@ -15,7 +15,15 @@ import { CHAT_SYSTEM_PROMPT, wrapUserMessage } from "@/lib/rag-prompt";
 import { maximalMarginalRelevance } from "@/lib/rerank";
 import { AUDIA_TOOLS, dispatchTool } from "@/lib/tools";
 
-const MAX_TOOL_ITERATIONS = 3;
+/**
+ * Cap on the agentic loop. Rule of thumb: expected_steps + 1 self-correction
+ * slot. With 2 tools (listMyMeetings, getMeetingDetails) and the canonical
+ * workflow being "list → pick → drill" or "list → answer", we expect ≤2 tool
+ * iterations + the final text iteration = 3 productive iterations; 4 leaves
+ * one slot for self-correction. Last iteration uses tool_choice="none" to
+ * force a text answer. (Phase 7.2 bumped from 3 → 4 to support multi-step.)
+ */
+const MAX_TOOL_ITERATIONS = 4;
 
 /**
  * Edge-position reordering: most-relevant chunks at positions 0 and k-1
@@ -72,7 +80,14 @@ export async function POST(req: Request) {
     const isNewSession = sessionId !== body.sessionId;
     const transcriptionId = body.transcriptionId ?? null;
 
-    const model = "llama-3.1-8b-instant";
+    // Upgraded from llama-3.1-8b-instant to llama-3.3-70b-versatile (Phase 7.2 fix):
+    // the 8B's tool-calling discipline broke at our prompt complexity — it would
+    // emit calls in Llama's tag syntax (<function=X>{...}</function>) which Groq's
+    // OpenAI-compatible API rejects with `tool_use_failed`. The 70B emits proper
+    // tool_calls JSON. Trade-off: TPM rate limit is 12k vs 30k on 8B — fine for
+    // typical chat. Both summarizer judge and faithfulness judge already use 70B,
+    // so this is consistent.
+    const model = "llama-3.3-70b-versatile";
     const start = Date.now();
 
     // ── RAG retrieval stage ───────────────────────────────────────────────
@@ -163,11 +178,12 @@ export async function POST(req: Request) {
     );
 
     // Build the full message list: system, then the rolling-buffer history,
-    // then the current user turn wrapped with context. History turns have
-    // already had [N] markers stripped — see loadRecentTurns.
+    // then the current user turn wrapped with context. History is already
+    // API-shaped from loadRecentTurns (includes assistant-with-tool_calls and
+    // role:tool messages from prior turns, with orphan-pair filtering done).
     const messages: ChatCompletionMessageParam[] = [
         { role: "system", content: CHAT_SYSTEM_PROMPT },
-        ...history.map((h) => ({ role: h.role, content: h.content })),
+        ...(history as ChatCompletionMessageParam[]),
         { role: "user", content: userMessage },
     ];
 
@@ -269,7 +285,7 @@ export async function POST(req: Request) {
                         break;
                     }
 
-                    // Append the assistant's tool-calling turn to message history,
+                    // Append the assistant's tool-calling turn to in-memory message history,
                     // then execute each tool and append the results. The model needs
                     // to see its own tool_calls turn alongside the tool results on
                     // the next iteration — otherwise it has no reference for what
@@ -287,10 +303,32 @@ export async function POST(req: Request) {
                         tool_calls: assistantToolCalls,
                     } as ChatCompletionMessageParam);
 
+                    // PERSIST the assistant-with-calls turn (Phase 7.2) so a follow-up
+                    // turn can reload working memory of what we called. Order matters:
+                    // assistant turn before tool results, with createdAt ascending.
+                    try {
+                        await saveTurn({
+                            sessionId,
+                            userEmail: user.email,
+                            transcriptionId,
+                            role: "assistant",
+                            content: iterContent,
+                            toolCalls: toolCalls.map((tc) => ({
+                                id: tc.id,
+                                name: tc.name,
+                                arguments: tc.arguments || "{}",
+                            })),
+                        });
+                    } catch (err) {
+                        console.warn("[chat] persist assistant tool-calls turn failed", err);
+                    }
+
                     console.log(
                         `[chat] iter=${iter} tool_calls=${toolCalls.map((tc) => `${tc.name}(${tc.arguments.slice(0, 60)})`).join(", ")}`,
                     );
 
+                    // Execute tools sequentially (small N; keeps logs ordered + DB
+                    // writes deterministic). Persist each result as a role:tool row.
                     for (const tc of toolCalls) {
                         const result = await dispatchTool(tc.name, tc.arguments, { userEmail: user.email });
                         messages.push({
@@ -298,6 +336,19 @@ export async function POST(req: Request) {
                             tool_call_id: tc.id,
                             content: result,
                         } as ChatCompletionMessageParam);
+
+                        try {
+                            await saveTurn({
+                                sessionId,
+                                userEmail: user.email,
+                                transcriptionId,
+                                role: "tool",
+                                content: result,
+                                toolCallId: tc.id,
+                            });
+                        } catch (err) {
+                            console.warn(`[chat] persist tool-result turn failed (call ${tc.id})`, err);
+                        }
                     }
                     // continue loop — next iteration sees tool results in context
                 }

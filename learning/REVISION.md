@@ -33,7 +33,7 @@
 
 **Part VI — Agents**
 - [§14. Tool use & function calling: schemas, dispatch, the agentic loop](#14-tool-use--function-calling-schemas-dispatch-the-agentic-loop) ✅ *(Phase 7.1)*
-- §15. Multi-step agents & ReAct *(Phase 7.2 — TBD)*
+- [§15. Multi-step agents & ReAct: tool-result memory, failure modes, planning](#15-multi-step-agents--react-tool-result-memory-failure-modes-planning) ✅ *(Phase 7.2)*
 - §16. MCP — Model Context Protocol *(Phase 7.3 — TBD)*
 
 **Part VII — Search**
@@ -2408,12 +2408,185 @@ A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model ca
 
 ---
 
+## §15. Multi-step agents & ReAct: tool-result memory, failure modes, planning
+
+### Why this section exists
+
+7.1 gave Audia function-calling with ONE tool. The model can call, integrate, and answer in one round. **That's single-step.** Real-world questions often require multiple tool calls in sequence where the output of one feeds the input of the next ("find meetings about pricing → drill into the most recent one"). And turn-2 follow-ups need recall of turn-1's tool output, or the model has amnesia and must re-call. 7.2 makes Audia genuinely multi-step: a second tool to compose with, **tool-result memory** across turns, and the ReAct mental model that names what's happening.
+
+### 15.1 From single-step to multi-step
+
+🎯 **Multi-step agent task**
+
+> **Definition:** A task whose solution requires multiple tool calls in sequence where the choice or arguments of later calls depend on the results of earlier ones. Distinguished from single-step (one call, done) by the dependency structure between tool invocations.
+
+**Concrete Audia example:** *"Tell me about the most recent meeting where I discussed pricing."*
+
+```
+Step 1: listMyMeetings() → all meetings
+Step 2: filter to pricing-related → pick most recent → grab its id
+Step 3: getMeetingDetails(id) → summary, speakers
+Step 4: compose final answer
+```
+
+Three tool calls, each depending on the previous. **A single-tool agent cannot compose these** — and an agent with no recall of prior tool results cannot even attempt the second step.
+
+### 15.2 The ReAct pattern
+
+🎯 **ReAct (Reason + Act)**
+
+> **Definition:** A prompting/agent pattern (Yao et al. 2023) that interleaves **Thought** (reasoning about what to do next), **Action** (a tool call), and **Observation** (the tool's result). Each iteration adds one cycle to context; the model reads the running trace to decide the next move.
+
+Original ReAct used explicit prose tags:
+
+```
+Thought: I need to find meetings where pricing was discussed.
+Action: searchAcrossMeetings(query="pricing")
+Observation: [{ id: "abc", title: "Q3 Pricing Review", ... }]
+Thought: Most recent is Q3 Pricing Review. Fetch its details.
+Action: getMeetingDetails(transcriptionId="abc")
+Observation: { speakers: [...], summary: "..." }
+Thought: I have everything. Answer time.
+Answer: The most recent meeting where you discussed pricing was Q3 Pricing Review...
+```
+
+**Modern function-calling APIs encode ReAct implicitly** — you don't need to prompt "Thought:" explicitly anymore:
+
+| ReAct concept | Modern equivalent |
+|---|---|
+| Thought | `delta.content` text from the model (optional, may be empty) |
+| Action | `tool_calls` in the assistant message |
+| Observation | `role: "tool"` result message |
+| Loop | The agentic loop iterates these automatically |
+
+🎯 **Defense talking point:** *"ReAct is the original prompting pattern that interleaved reasoning, action, and observation. Modern function-calling APIs encode it implicitly — the loop structure IS ReAct, with `delta.content` carrying any reasoning the model wants to surface, `tool_calls` carrying actions, and `role:tool` messages carrying observations. You don't need explicit 'Thought:' prose anymore; you get the pattern for free."*
+
+### 15.3 The four canonical multi-step failure modes
+
+🎯 **Cascading errors** — turn 1's tool returned subtly wrong data → turn 2 uses that bad data as args → turn 2 fails or compounds → final answer is confident garbage. *Guard:* tools validate inputs; structured `{error}` results so the model self-corrects; log tool args at every step for post-mortem.
+
+🎯 **Stuck loops (oscillation)** — model calls tool A, gets result, decides to call tool A again with similar args, same result, calls A again... *Guard:* detect repeated identical (name + args) invocations; on the 2nd duplicate, return `{error: "You just called this with these args; the result didn't change. Try a different approach."}`. The model usually breaks out.
+
+🎯 **Hallucinated state** — model "remembers" details that aren't in the conversation ("You called getMeetingDetails earlier so I know the duration") even though it didn't or the result is no longer in context. *Guard:* persist tool results in conversation memory (§15.4); add a system-prompt rule "never assert information that didn't come from a tool result this conversation."
+
+🎯 **Off-task drift** (new in multi-step) — chains of small reasoning steps drift away from the user's actual question; intermediate observations trigger new lines of thought. *Guard:* restate the user's GOAL at the top of every iteration OR use a system rule "before deciding the next action, restate the user's original question."
+
+⚠️ **Cost compounding:** every iteration = 2 LLM calls + N tool dispatches. A 5-step ReAct task = 10 LLM calls. Bound iterations aggressively; instrument cost per task.
+
+### 15.4 Tool-result memory — the 7.1 gap, fixed in 7.2
+
+🎯 **Tool-result memory**
+
+> **Definition:** Persisting the assistant's tool_calls turn AND the corresponding `role: "tool"` result message in conversation history, so subsequent turns can reference fetched data without re-calling the tool. The conversational equivalent of caching — bounded by the rolling-buffer window so it doesn't grow unbounded.
+
+**The 7.1 gap, in concrete terms:**
+
+Turn 1: model calls `listMyMeetings`, gets `{meetings: [{title: "React Overview", createdAt: "2026-05-28T..."}]}`, answers "You have one meeting this week: React Overview."
+
+Turn 2: *"When is it scheduled?"* — rolling buffer reloaded only:
+- Assistant text from turn 1 ("You have one meeting this week: React Overview.")
+- **NOT** the assistant's tool_calls turn
+- **NOT** the role:tool result containing `createdAt`
+
+So turn 2's model has no memory of the timestamp; it must either re-call the tool OR refuse. That's the structural amnesia.
+
+**The 7.2 fix:**
+
+- `ChatMessage` entity extended: `role` now includes `"tool"`, plus new `toolCallId` (uuid, nullable) and `toolCalls` (simple-json, nullable) columns.
+- `loadRecentTurns` returns API-shaped messages including the assistant-with-tool_calls + role:tool pairs.
+- The chat route persists both turn types each iteration (assistant turn first, then each tool result — order matters; the API expects role:tool messages to immediately follow their assistant anchor).
+
+⚠️ **Order preservation matters.** The OpenAI/Groq spec requires `role: "tool"` messages immediately follow the assistant turn whose `tool_calls.id` they reference. Save the assistant turn FIRST (lower createdAt), then each tool result (higher createdAt), so chronological load reconstructs the pair correctly.
+
+⚠️ **Orphan-pair edge case.** If the rolling-buffer LIMIT cuts mid-pair (role:tool inside the window but its anchor assistant outside), the API rejects. *Guard:* `loadRecentTurns` collects valid tool_call_ids from in-window assistant turns first, then drops any role:tool whose id isn't backed.
+
+### 15.5 Planning vs reactive agents
+
+🎯 **Reactive agent** — the loop iterates ReAct one step at a time. The model decides each action in the moment from current context. Simple, robust on short tasks, struggles on long sequences. **This is what Audia builds.**
+
+🎯 **Planning agent** — the model first emits a *plan* (a sequence of intended tool calls), then executes step-by-step; may replan mid-execution if observations contradict the plan. One extra LLM call upfront; better on tasks coordinating many steps.
+
+⚖️ **Trade-offs:**
+
+| | Reactive | Planning |
+|---|---|---|
+| Code shape | Simple loop | Plan-then-execute |
+| Decisions | One at a time | Pre-committed sequence (with replan) |
+| Cost | Lower per task | Extra LLM call upfront |
+| Best for | Short tasks (≤4 steps), exploratory | Long tasks, structured workflows |
+| Failure mode | Off-task drift | Brittle plans that don't survive surprising observations |
+| Audia today | ✓ This is what we built | Out of scope |
+
+🎯 **Defense talking point:** *"Reactive agents are the default — model decides one step at a time from context. Planning agents emit a pre-committed sequence first. For Audia's chat workload — typically 1–3 step queries — reactive is sufficient. I'd reach for planning if I saw the reactive agent drifting off-task on 5+ step queries, which is the symptom the planning step costs an LLM call to prevent. Production systems often blend: short reactive loops nested inside an overall plan."*
+
+### 15.6 Iteration limits, revisited
+
+In 7.1, `MAX_ITERATIONS = 3` was the bound. With one tool, that meant "call once + one retry + final answer." With two tools and genuine multi-step workflows, **3 is too low** — a real two-step task ("list → drill in") needs at least 3 productive iterations.
+
+📐 **Rule of thumb:** `MAX_ITERATIONS ≈ expected_steps + 1` (one slot for self-correction). For Audia's two-tool surface with expected_steps ≤ 2 (list, drill, OR list, answer), **MAX = 4** covers it. Last iteration still uses `tool_choice: "none"` to force text.
+
+### 15.7 What we built in Audia today
+
+- **[ChatMessage](../src/entity/ChatMessage.ts) extended:** role now includes `"tool"`, plus `toolCallId` + `toolCalls` JSON columns. TypeORM synchronize adds them via standard ALTER TABLE (no pgvector ceremony — they're plain text/json).
+- **[chat-memory.ts](../src/lib/chat-memory.ts) rewritten:** `HistoryMessage` is now a union of API-shaped variants (user / assistant text / assistant-with-tool_calls / role:tool). `loadRecentTurns` returns them in chronological order with orphan-pair filtering at the window edge. `saveTurn` accepts `toolCallId` + `toolCalls` optional fields.
+- **[tools.ts](../src/lib/tools.ts):** added `getMeetingDetails(transcriptionId)` — returns title, createdAt, duration, distinct speakers + count, cached summary. Ownership filter prevents cross-user leaks. Composes with `listMyMeetings` for the canonical "list → drill" multi-step pattern.
+- **[chat/route.ts](../src/app/api/chat/route.ts):** persists assistant-with-tool_calls turn + each role:tool result inside the loop (ordered: assistant first, then tool results). `MAX_TOOL_ITERATIONS` bumped 3 → 4. History from `loadRecentTurns` splats directly into the messages array — no remapping needed.
+- **Eval calibration** (small, surgical): dropped `mustCiteAtLeast` on `action-item-owner` (case probes attribution, not citation discipline — tested elsewhere); clarified faithfulness judge rubric that source metadata (speaker labels, timestamps) is part of the source, not invention. **Eval back to 10/10.**
+
+### 15.8 Defense talking points
+
+🎯 **Q: How do multi-step agents work? Walk me through the architecture.**
+A: *"Multi-step = function calling in a loop with persistent tool-result memory. The loop is six lines: while the model returns tool_calls, execute them, append their results to the message history, call the model again. The model has access to prior tool results across turns because we persist the assistant's tool_calls turn AND each `role:'tool'` result to the conversation history — that's the architectural difference from single-step. Without that persistence the agent re-calls tools every turn or has amnesia about prior data. The 'agent' is the loop plus exit conditions (MAX_ITERATIONS, `tool_choice='none'` on the last iteration, repeated-call detection); LangChain agents and Anthropic's tool use are built on this same pattern."*
+
+🎯 **Q: ReAct — what is it and is it still relevant?**
+A: *"ReAct is Yao et al. 2023 — the prompting pattern interleaving Thought, Action, and Observation per iteration. It taught us that exposing reasoning helps the model self-correct. Modern function-calling APIs encode ReAct implicitly: `delta.content` carries any thoughts the model surfaces, `tool_calls` carries actions, `role:'tool'` messages carry observations. The loop iterates them automatically. You don't write 'Thought:' tags anymore, but the underlying structure IS ReAct. If anyone asks 'is ReAct still used' — yes, you just don't see the prose anymore because the protocol is doing the same work."*
+
+🎯 **Q: How do you bound an agentic loop?**
+A: *"Four guards. **MAX_ITERATIONS** caps the loop — workload-specific (Audia's 1–3 step chat = MAX 4; research agents 10–20; structured extraction often 1). **`tool_choice='none'` on the last iteration** forces a final text answer instead of yet another tool call. **Repeated-call detection** — if the model emits an identical (name + args) call twice in a row, return an error result so it tries a different approach instead of looping. And **observability** — log every tool name + args + result + duration per iteration so post-mortems are possible. Without these you get runaway loops, stuck oscillations, and silent failures. Defense in depth at the loop level."*
+
+🎯 **Q: Why persist tool results in conversation memory? Isn't that bloating context?**
+A: *"Trade-off. WITHOUT persistence, every follow-up that needs prior tool data forces a re-call — same data, second round-trip, doubled cost on multi-turn workflows. WITH persistence, the data sits in the message history and the model composes follow-ups from it directly. The bloat concern is real but bounded: rolling-buffer caps how many prior messages we load (Audia uses 20 message slots = ~5 turn pairs even with tool messages). Old turns roll out of the window automatically. The right framing isn't 'cache everything forever' — it's 'cache within the visible-history window the rolling buffer already maintains.' Production agent systems all do this; structured extraction pipelines that have no follow-ups can skip it."*
+
+🎯 **Q: Reactive agent vs planning agent — when do you use which?**
+A: *"Reactive by default — one decision at a time from current context. For chat-style workloads with 1–3 step queries, reactive is sufficient and cheaper (no upfront planning call). Reach for planning when reactive starts drifting off-task on 5+ step queries — that's the symptom the planning step is designed to prevent. Production systems often nest: short reactive loops inside an overall plan. The default isn't either/or; it's reactive-by-default with planning as escalation when measurable failure shows up. Audia today is pure reactive because the workload is short."*
+
+🎯 **Q: How would you scale this to 10+ tools?**
+A: *"Three moves. **One: tool discovery.** Don't ship all 10 schemas every turn — that bloats every call's prompt and confuses routing. Instead, classify the user's question into a domain first (cheap LLM call or rules-based), then expose only the relevant 2–3 tools. **Two: per-domain prompting.** Each tool family gets its own routing rules in the system prompt; you don't want hiring tools competing for attention with billing tools. **Three: hierarchical agents.** A coordinator agent decides which sub-agent (each scoped to a small toolset) handles the question; the sub-agent does the actual ReAct loop. Single-flat-toolset agents stop working past ~8 tools in my experience — instruction-following on tool selection degrades."*
+
+### 15.9 Common pitfalls
+
+⚠️ **Persisting role:tool without the matching assistant turn.** API rejects. Always save the assistant-with-tool_calls turn FIRST (lower createdAt), then each tool result.
+
+⚠️ **Loading history with the rolling buffer cutting mid-pair.** Tool result inside the window, its anchor assistant outside → API rejects. *Guard:* collect valid tool_call_ids from in-window assistants first, then drop orphan tool messages.
+
+⚠️ **Forgetting `tool_choice='none'` on the last iteration.** Model can keep asking for tools at the cap, never producing a final answer. Always force text at the boundary.
+
+⚠️ **Treating tool results as user-facing content.** Tool results are DATA the model integrates into natural language. Never stream them to the client; never let their JSON shape leak into the assistant's text response.
+
+⚠️ **Letting MAX_ITERATIONS scale with the number of tools.** Number of tools ≠ expected steps. The right anchor is "how many tool calls does the typical query genuinely need?" — usually 1–3, not 10. Bump MAX only when you see real symptoms.
+
+⚠️ **Stuck loops on identical calls.** Without repeated-call detection, the model can call `listMyMeetings()` three times with the same args, hitting MAX. *Guard:* fingerprint (name, args) per iteration; on duplicate, return a structured "you just called this" error.
+
+⚠️ **Ignoring observability.** Log tool name + args + result + duration per iteration. Without it, "why did the agent do that?" is unanswerable when a user reports weird behavior.
+
+### 15.10 Glossary additions (land in Appendix A)
+
+- **Multi-step agent task** — see §15.1.
+- **ReAct (Reason + Act)** — see §15.2.
+- **Tool-result memory** — see §15.4.
+- **Reactive agent / Planning agent** — see §15.5.
+- **Cascading errors / Stuck loops / Hallucinated state / Off-task drift** — the four canonical multi-step failure modes (§15.3).
+- **Orphan-pair filtering** — rolling-buffer load-time discipline of dropping `role:tool` messages whose anchor assistant turn is outside the loaded window. Prevents the API from rejecting on broken pairs.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
 
 - **AbortController** — modern JS cancellation primitive. One controller has one `signal`; pass the signal to any async API (fetch, SDK calls). Calling `.abort()` cascades to all consumers.
 - **Agentic loop** — application-side loop that repeatedly calls the model with growing message history until it returns content (no `tool_calls`). Each iteration may execute tools and append their results. Bounded by `MAX_ITERATIONS`. The "agent" is this loop plus sensible exit conditions; everything else (LangChain, Assistants API) is built on it.
+- **Cascading errors** — multi-step failure mode where a small wrong tool result on iteration 1 becomes the input to iteration 2, compounds into worse output, and produces a confident-but-garbage final answer. Guard: tools validate inputs and return structured errors so the model can self-correct.
 - **AbortError** — the exception thrown when an aborted signal is observed. Expected, not a failure — distinguish from real errors in catch blocks.
 - **Abort-as-control-flow** — design pattern of treating cancellation as a normal code path with its own handling, not as an exceptional error.
 - **Async iterator** — JavaScript pattern (`for await ... of`) for consuming streams. Each iteration yields one chunk. Used by Groq/OpenAI SDKs to expose streamed responses.
@@ -2463,6 +2636,7 @@ A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model ca
 - **Greedy decoding** — always picking the argmax of the logits. Deterministic but often repetitive.
 - **Grounding rule** — system-prompt instruction directing the model to answer using only the provided context and to refuse if information isn't present. Cheapest hallucination control technique.
 - **Hallucination (RAG sense)** — LLM generating content not grounded in retrieved chunks. Distinct from generic LLM hallucination; specific to "claim asserts X but chunks don't support X."
+- **Hallucinated state (agent failure mode)** — model "remembers" details that aren't in the actual conversation context, often by asserting it called a tool earlier when it didn't or when the result has rolled out of the window. Guard: persist tool results in conversation memory + system rule "never assert info that didn't come from a tool result this conversation."
 - **HNSW (Hierarchical Navigable Small World)** — graph-based vector index. Multi-layer graph; queries walk top-down via greedy traversal. Slower build than IVFFlat; faster queries, higher recall, incremental.
 - **Hybrid search** — retrieval that combines lexical (BM25) and dense (vector) search, fusing the two ranked lists via RRF or similar. Catches exact-keyword matches that pure vector search misses.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
@@ -2473,6 +2647,7 @@ A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model ca
 - **"Looking at your data"** — practitioner discipline: read ~100 real model outputs before defining a metric. You don't know what to measure until you've seen the failure modes. Hamel Husain's framing.
 - **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
 - **MMR (Maximal Marginal Relevance)** — re-ranking algorithm balancing relevance to query against diversity from already-selected results. Iteratively picks the candidate maximizing `λ·rel − (1−λ)·max-sim-to-selected`. λ=0.7 is production default.
+- **Multi-step agent task** — task whose solution requires multiple tool calls where later calls depend on earlier results (e.g. "list meetings → drill into the most recent one"). Distinguished from single-step (one call, done). Demands ≥2 tools AND tool-result memory across iterations.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
 - **Norm (vector norm, L2 norm, magnitude)** — `‖A‖ = √(Σᵢ aᵢ²)`. Length of the vector. Unit-normalized vectors have norm = 1.0.
 - **Jailbreak** — a prompt injection variant aimed at bypassing the model's safety training (roleplay tricks, DAN-style prompts).
@@ -2490,7 +2665,10 @@ A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model ca
 - **pgvector operators** — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1 / Manhattan). Smaller value = more similar in ORDER BY. Cosine is the default for text embeddings.
 - **Pairwise vs pointwise judging** — pairwise: judge picks the better of two outputs (more reliable). Pointwise: judge scores one output on a rubric. Both humans and LLMs compare better than they absolute-score. Mitigate position bias by running both orders (A,B) and (B,A) and counting wins only when consistent.
 - **Parallel tool calls** — a single model response containing multiple `tool_calls` entries, intended for concurrent execution by the application. Reduces round-trip count when calls are independent and idempotent.
+- **Off-task drift (agent failure mode)** — chains of small reasoning steps drift away from the user's actual question because intermediate observations trigger new lines of thought. New in multi-step agents (single-step can't drift). Guard: restate the user's goal at the top of every iteration.
+- **Orphan-pair filtering** — rolling-buffer load-time discipline of dropping `role:tool` messages whose anchor assistant turn is outside the loaded window. Prevents the API from rejecting on broken pairs at the window boundary.
 - **PR fast subset + nightly full suite** — scaling pattern for eval cost: a small curated subset gates every PR (cheap, fast feedback), the full suite runs overnight with Slack alerting on pass-rate drops. Reserve full-suite-on-PR for explicit opt-in (e.g., a `[full-eval]` keyword).
+- **Planning agent** — agent variant that emits a sequence-of-tool-calls plan FIRST, then executes it step by step (may replan mid-execution). Trades an upfront LLM call for better coordination on long structured tasks. Default to reactive; reach for planning when reactive drifts on 5+ step queries.
 - **Pass rate** — fraction of golden-set cases meeting their success criteria on a run. The headline regression metric; gate CI on it. 100% on a fresh set usually means the set is too easy.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
 - **Principle of least privilege** — security principle that the model should have access only to what it strictly needs. The strongest defense against agentic injection attacks — if the model *can't* take a dangerous action, no injection can make it.
@@ -2504,12 +2682,15 @@ A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model ca
 - **Refusal anchoring** — including a few-shot example in the prompt where the model refuses to answer because the information isn't in the context. Reinforces the grounding rule pattern.
 - **Re-ranking** — second-stage filtering that reorders coarse-retrieved candidates by a different criterion (MMR for diversity, cross-encoder for accuracy, LLM-as-judge for quality). The "narrow" step in fan-out-and-narrow retrieval.
 - **RRF (Reciprocal Rank Fusion)** — algorithm combining multiple ranked lists by summing `1/(60 + rank)` across rankers per document. Default `k_constant=60`. Robust to score-scale differences, used in hybrid search.
+- **ReAct (Reason + Act)** — Yao et al. 2023 prompting pattern interleaving Thought / Action / Observation per iteration. Modern function-calling APIs encode it implicitly: `delta.content` = thought, `tool_calls` = action, `role:"tool"` result = observation. The loop iterates these without explicit "Thought:" prose.
+- **Reactive agent** — agent variant where the loop iterates one ReAct step at a time, deciding each action from current context. Simple, robust on short tasks, struggles on long sequences. Default choice for chat-style workloads (Audia's pattern).
 - **ReadableStream** — Web API for emitting bytes incrementally to an HTTP response. Used by Audia's chat route to forward LLM tokens as they arrive.
 - **ROUGE** — recall-oriented n-gram-overlap metric from summarization; scores how much of a reference the output covers. Like BLEU, weak for open-ended LLM output — measures word overlap, not meaning.
 - **RoPE (Rotary Position Embedding)** — modern positional encoding that rotates Q and K vectors by position-dependent angles, making attention sensitive to relative position.
 - **Rolling buffer memory** — conversation-memory strategy that keeps the last N turns verbatim and drops everything older. Production default for short-session chat. Audia uses N=5 turn pairs.
 - **Sampling** — the process of choosing one token from the logits distribution. Combines temperature scaling and/or top-p/top-k filtering.
 - **Session id (chat)** — opaque UUID grouping conversation turns. In Audia, server-minted on first turn; returned in `X-Chat-Session` response header; client echoes on subsequent turns.
+- **Stuck loop (oscillation, agent failure mode)** — model emits identical (tool name + args) repeatedly without breaking out; hits MAX_ITERATIONS without progress. Guard: detect duplicate calls and return a structured "you just called this with these args; try a different approach" error so the model varies.
 - **Seed** — integer that fixes the RNG used during sampling. Best-effort reproducibility (GPU non-determinism prevents bit-identical guarantees). Useful for evals.
 - **Softmax** — function that converts a vector of real numbers to a probability distribution: `softmax(x_i) = exp(x_i) / Σ exp(x_j)`.
 - **SSE (Server-Sent Events)** — HTTP/1.1 streaming protocol where each event is a `data: ...\n\n` framed chunk. Browser API: `EventSource`. Standard for OpenAI/Anthropic streaming responses.
@@ -2530,6 +2711,7 @@ A: "Empirical default. Most tool-using queries resolve in 1–2 rounds: model ca
 - **Temperature** — a scalar that divides logits before softmax. <1 sharpens, >1 flattens. Controls output randomness.
 - **Token-bound history** — rolling-buffer variant that keeps "as many recent turns as fit in T tokens" instead of a fixed turn count. Safer when turn lengths vary widely.
 - **Tool dispatcher** — application-side function that takes a tool name + raw JSON arguments + an execution context (e.g. userEmail for ownership) and returns a string result for the `role:"tool"` message back to the model. Unknown names, bad-JSON args, and thrown errors should all become structured `{error:...}` results so the model can self-correct.
+- **Tool-result memory** — persisting the assistant's tool_calls turn AND the corresponding `role:"tool"` result in conversation history so subsequent turns can reference fetched data without re-calling the tool. Bounded by the rolling-buffer window; requires order-preservation (assistant turn before tool results) and orphan-pair filtering at the window edge.
 - **Tool schema** — JSON Schema document declaring a tool's name, natural-language description, and typed parameters. The description IS the prompt the model reads at decision time; vague descriptions cause under-calling or over-calling.
 - **`tool_choice`** — API parameter controlling tool-call behavior. `"auto"` (default, model decides), `"required"` (must call some tool), `{name:"X"}` (force specific tool), `"none"` (no tool calls — use on the LAST iteration of an agentic loop to force a final text answer).
 - **Top-k retrieval** — retrieval strategy returning the *k* chunks with highest similarity (or lowest distance) to a query embedding. Default starting point; vulnerable to redundancy + missed exact matches + no diversity. Improved by re-rankers like MMR.

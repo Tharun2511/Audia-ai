@@ -1,4 +1,5 @@
 import "server-only";
+import { MoreThanOrEqual } from "typeorm";
 import { getDatabase } from "@/db/data-source";
 import { Transcription } from "@/entity/Transcription";
 import type { ChatCompletionTool } from "groq-sdk/resources/chat/completions";
@@ -68,12 +69,17 @@ async function listMyMeetings(
     const db = await getDatabase();
     const repo = db.getRepository(Transcription);
 
-    const qb = repo
-        .createQueryBuilder("t")
-        .where("t.userEmail = :email", { email: ctx.userEmail })
-        .orderBy("t.createdAt", "DESC")
-        .take(limit)
-        .select(["t.id", "t.title", "t.duration", "t.createdAt"]);
+    // Use repo.find instead of QueryBuilder + .select() — the explicit select
+    // syntax with camelCase column names like `t.createdAt` can produce
+    // partially-populated entity instances where some columns load as
+    // undefined, depending on TypeORM version. The crash we saw in production
+    // ("Cannot read properties of null reading toISOString") was exactly this.
+    // repo.find loads every declared field correctly.
+    // Build the where clause incrementally so optional date filter only attaches
+    // when present. FindOptionsWhere<T> tolerates partial shape + FindOperator
+    // values, which is exactly what MoreThanOrEqual produces.
+    type WhereClause = { userEmail: string; createdAt?: ReturnType<typeof MoreThanOrEqual<Date>> };
+    const where: WhereClause = { userEmail: ctx.userEmail };
 
     if (args.since) {
         const sinceDate = new Date(args.since);
@@ -84,28 +90,112 @@ async function listMyMeetings(
             // more likely the model fixes its next call.
             return { error: `Invalid 'since' value: ${args.since}. Expected ISO 8601 date.` };
         }
-        qb.andWhere("t.createdAt >= :since", { since: sinceDate });
+        where.createdAt = MoreThanOrEqual(sinceDate);
     }
 
-    const rows = await qb.getMany();
+    const rows = await repo.find({
+        where,
+        order: { createdAt: "DESC" },
+        take: limit,
+    });
+
     return {
         count: rows.length,
-        // Return null for missing values — never placeholder strings. The model
-        // would echo "(untitled)" verbatim into its answer, which leaks
-        // implementation detail. Presentation (e.g. "an untitled meeting") is
-        // the prompt's job, not the tool's.
+        // Defensive null/undefined guard on every field — the model gets a
+        // structured value either way, never crashes on edge cases. Title null
+        // = "an untitled meeting" gets handled by the prompt, not here.
         meetings: rows.map((r) => ({
             id: r.id,
-            title: r.title,
-            createdAt: r.createdAt.toISOString(),
+            title: r.title ?? null,
+            createdAt: r.createdAt instanceof Date
+                ? r.createdAt.toISOString()
+                : (r.createdAt ?? null),
             durationSec: r.duration ?? null,
         })),
     };
 }
 
+// ── Tool: getMeetingDetails ───────────────────────────────────────────────
+
+const getMeetingDetailsSchema: ChatCompletionTool = {
+    type: "function",
+    function: {
+        name: "getMeetingDetails",
+        description:
+            "Get detailed metadata + cached summary for ONE specific meeting by its id. " +
+            "Use this when the user asks for more detail about a meeting you've already listed " +
+            "(e.g. 'tell me more about Q3 Pricing Review', 'who was in that meeting?', 'what was the summary of Sprint Planning?') — " +
+            "typically called AFTER listMyMeetings has returned a list of meetings with their ids. " +
+            "" +
+            "CRITICAL — getting the transcriptionId right: " +
+            "(1) The transcriptionId MUST be copied verbatim from a previous listMyMeetings tool result's `meetings[].id` field. " +
+            "(2) DO NOT invent, guess, or use placeholder/example UUIDs like 123e4567-e89b-12d3-a456-426614174000. " +
+            "(3) DO NOT make up UUIDs that 'look right' — only IDs that appeared in a prior tool result are valid. " +
+            "(4) If you haven't already called listMyMeetings this conversation, CALL THAT FIRST to get real ids. " +
+            "(5) When the user names a meeting (e.g. 'JavaScript Engine Overview'), match it to the corresponding `title` in the listMyMeetings result and use THAT object's `id`. " +
+            "" +
+            "Do NOT call this to retrieve raw transcript chunks — answer content questions from the <context> sources already in your prompt.",
+        parameters: {
+            type: "object",
+            properties: {
+                transcriptionId: {
+                    type: "string",
+                    description:
+                        "UUID copied verbatim from a prior listMyMeetings result's meetings[].id field. " +
+                        "Must be a real UUID returned by a tool call in this conversation — NEVER a placeholder/example UUID, NEVER invented. " +
+                        "If unsure which meeting the user means, call listMyMeetings first and match by title.",
+                },
+            },
+            required: ["transcriptionId"],
+        },
+    },
+};
+
+type GetMeetingDetailsArgs = {
+    transcriptionId?: string;
+};
+
+async function getMeetingDetails(
+    args: GetMeetingDetailsArgs,
+    ctx: { userEmail: string },
+): Promise<unknown> {
+    if (!args.transcriptionId || typeof args.transcriptionId !== "string") {
+        return { error: "transcriptionId is required and must be a string." };
+    }
+
+    const db = await getDatabase();
+    const repo = db.getRepository(Transcription);
+
+    // Ownership filter — never return another user's meeting even with a leaked id.
+    const t = await repo.findOne({
+        where: { id: args.transcriptionId, userEmail: ctx.userEmail },
+        select: ["id", "title", "duration", "createdAt", "summary", "segments"],
+    });
+
+    if (!t) {
+        return { error: `No meeting found with id ${args.transcriptionId}. Did you call listMyMeetings first to get a valid id?` };
+    }
+
+    // Distinct speakers from segments — cheap aggregation, useful for the model.
+    const speakers = Array.from(new Set(t.segments?.map((s) => s.speaker) ?? []));
+
+    return {
+        id: t.id,
+        title: t.title,
+        createdAt: t.createdAt.toISOString(),
+        durationSec: t.duration ?? null,
+        speakerCount: speakers.length,
+        speakers,
+        summary: t.summary,
+        // Don't return full segments — model doesn't need raw transcript through
+        // this tool (that's what RAG <context> is for); avoids ballooning the
+        // tool result message into the context budget.
+    };
+}
+
 // ── Registry + dispatcher ─────────────────────────────────────────────────
 
-export const AUDIA_TOOLS: ChatCompletionTool[] = [listMyMeetingsSchema];
+export const AUDIA_TOOLS: ChatCompletionTool[] = [listMyMeetingsSchema, getMeetingDetailsSchema];
 
 type ToolCtx = { userEmail: string };
 
@@ -133,6 +223,8 @@ export async function dispatchTool(
         switch (name) {
             case "listMyMeetings":
                 return JSON.stringify(await listMyMeetings(args as ListMyMeetingsArgs, ctx));
+            case "getMeetingDetails":
+                return JSON.stringify(await getMeetingDetails(args as GetMeetingDetailsArgs, ctx));
             default:
                 // Hallucinated tool name — return a list of valid names so the
                 // model can self-correct. Better than a generic "unknown".

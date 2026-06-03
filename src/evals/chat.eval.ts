@@ -26,7 +26,11 @@ import { CHAT_SYSTEM_PROMPT, wrapUserMessage } from "@/lib/rag-prompt";
 import { GOLDEN_CHAT_CASES, type ChatGoldenCase } from "./golden-chat";
 import { judgeAnswerRelevancy, judgeRAGFaithfulness } from "./judge";
 
-const MODEL = "llama-3.1-8b-instant";
+// Mirror the production chat route's model (Phase 7.2 fix: bumped from 8B to
+// 70B because 8B's tool-calling broke under our prompt complexity). Keep eval
+// model aligned with production model — measuring on a different model is the
+// "lying to yourself" pattern from Phase 6.
+const MODEL = "llama-3.3-70b-versatile";
 const THRESHOLD = 0.9;
 
 type CheckResult = { label: string; ok: boolean; detail?: string };
