@@ -108,3 +108,68 @@ Multi-step agents are function calling in a loop with persistent tool-result mem
 - Yao et al. 2023, [*"ReAct: Synergizing Reasoning and Acting in Language Models"*](https://arxiv.org/abs/2210.03629) — original ReAct paper; skim sections 1–3
 - Anthropic, [*"Building effective agents"*](https://www.anthropic.com/research/building-effective-agents) — most up-to-date practitioner essay; the workflow vs agent distinction is the interview-grade content
 - LangChain, [*"Why agents fail"*](https://blog.langchain.dev/why-agents-fail/) — known taxonomy of multi-step breakage patterns
+
+---
+
+## Session 7.3 — MCP (Model Context Protocol): JSON-RPC envelope, three primitives, transports
+
+**Built in Audia:**
+- [src/lib/mcp.ts](../src/lib/mcp.ts) — pure JSON-RPC 2.0 protocol logic (no HTTP/auth concerns). Handles `initialize`, `notifications/initialized`, `tools/list`, `tools/call`. Reuses `AUDIA_TOOLS` registry + `dispatchTool` from Phase 7.1 — **same tools, two consumers (chat route + MCP server), single source of truth**. All errors translated to JSON-RPC error responses (no thrown exceptions reach the client). Spec compliance: notifications (id absent) get no response per spec; method-not-found returns -32601; bad params return -32602.
+- [src/app/api/mcp/route.ts](../src/app/api/mcp/route.ts) — Next.js POST endpoint. `getCurrentUser()` auth happens FIRST (401 if unauthenticated — even `initialize` requires auth, by deliberate design so tool *existence* doesn't leak). Parse body → delegate to `handleMcpMessage` → return JSON (200) or empty body (204 for notifications). ~30 lines; transport concerns separated from protocol concerns.
+- **Smoke test:** all three canonical exchanges confirmed working end-to-end against the live server with real session-cookie auth. `tools/list` returns both Audia tools with full JSON Schemas matching the Groq-side schemas exactly. `tools/call listMyMeetings` returns real meeting data (JavaScript Engine Overview 66s + Front End Interview Prep 48.6s — same data the chat route returns through the function-calling path).
+
+### Concept summary
+
+MCP is Anthropic's open standard (Nov 2024) for connecting LLM applications to external tools, data, and prompts. It solves the N×M integration problem: N LLM clients each writing custom integrations to M tool providers is quadratic; standardizing the protocol collapses it to N+M. Three server primitives — tools (functions the LLM calls), resources (read-only data the user attaches), prompts (named templates) — exposed via JSON-RPC 2.0 over transport-agnostic channels (stdio for local, Streamable HTTP for remote, legacy SSE deprecated). The JSON-RPC choice matters: method-in-body (not URL), one endpoint, transport-agnostic — fundamentally different from REST's resource-oriented model. Function calling (Groq/OpenAI SDK) and MCP are at different layers and coexist: function calling is how a model API exposes tool-calling on the model side; MCP is how applications expose tools across LLM vendors. Audia's chat uses function calling internally; the MCP server reuses the SAME tools to external clients. Protocol versions are date-keyed coordination strings, not network-enforced gates — if both sides agree on a fictional version, they'd communicate fine; the version's real job is failing loudly on mismatch. Auth on MCP defers to the transport layer — bearer tokens for production HTTP, env vars for stdio, session cookies for browser context (Audia's choice today). Multi-user isolation is non-negotiable: every tool call must scope by the authenticated user, and Audia inherits this by reusing the existing internal tools' ownership filters.
+
+### 5 most-likely interview questions
+
+1. **Q: What's MCP and what problem does it solve?**
+   A: "Anthropic's open standard from November 2024 for connecting LLM applications to external tools, data, and prompts via JSON-RPC 2.0. It solves the N×M integration problem — without it, N LLM clients each need M custom integrations to M data sources, scaling quadratically. MCP standardizes the protocol so that any compliant client can use any compliant server, collapsing custom integrations to N+M. Three server primitives: tools (functions the LLM can call), resources (read-only data the user attaches as context), and prompts (parameterized templates). The framing 'USB-C for LLMs' captures it: one cable, many devices."
+
+2. **Q: Why JSON-RPC and not REST?**
+   A: "Three reasons. One: tool calling is semantically RPC — 'call this function with these args, get a result' — which maps naturally to JSON-RPC's verb-oriented envelope; REST's resource-oriented model would force awkward URL hierarchies. Two: MCP needs to work over both stdio (Claude Desktop runs MCP servers as child processes) and HTTP, and JSON-RPC is transport-agnostic by design while REST is HTTP-only by definition. Three: JSON-RPC has a formal 2010 spec with normative envelope, error codes, and id semantics — language libraries implement it interoperably because they're all reading the same spec. REST is an architectural style, not a wire spec."
+
+3. **Q: What's the relationship between MCP and function calling?**
+   A: "Different layers; they coexist. Function calling is how a model provider's API exposes the tool-call mechanism on the model side — OpenAI has theirs, Anthropic has theirs, each slightly different syntax. MCP is how applications expose tools to LLMs in a vendor-neutral way. In Audia, the chat route uses Groq's function-calling API to call llama-3.3-70b internally; the MCP server at /api/mcp exposes the SAME tools — same `AUDIA_TOOLS` registry, same dispatcher — to external LLM clients. Function calling is the model-side mechanism; MCP is the cross-application standard. They're complementary, not competing."
+
+4. **Q: How does MCP's protocol version negotiation work, and what enforces it?**
+   A: "The client sends a desired protocolVersion (date-formatted string like '2025-06-18') during the initialize handshake; the server responds with the version IT supports. If they match, both sides proceed under that spec's rules. The key insight: nothing in the network/HTTP/TLS layer enforces this. The version is a coordination string parsed at the application layer. If a client and server both invented a fake version and their actual message shapes were compatible, they'd communicate fine. The version's real job is failing loudly on mismatch and providing forward/backward compatibility hints, not gatekeeping traffic. Same pattern as HTTP version strings, TLS version bytes — protocol versions are application-layer agreements, never wire-enforced."
+
+5. **Q: What's the security boundary when Audia exposes MCP?**
+   A: "Every MCP call goes through getCurrentUser() first — same auth path the rest of Audia uses. The session cookie identifies the user; every tool dispatch is scoped by userEmail at the SQL layer in the existing tool implementations. A leaked sessionId surfaces only that user's meetings. The 401 path fires BEFORE any MCP method dispatches — even `initialize` requires auth, by deliberate design so tool existence doesn't leak across the auth boundary. For Claude Desktop / Cursor integration we'd add a bearer-token path (OAuth 2.1 per the spec), but the userEmail ownership filter at the SQL layer stays identical."
+
+### Gotchas (additions to 7.1/7.2's lists)
+
+- **Confusing JSON-RPC with REST.** Different mental models — JSON-RPC: function-oriented, method-in-body, one endpoint, transport-agnostic. REST: resource-oriented, method-in-URL, many endpoints, HTTP-only. The "JSON over HTTP" surface looks similar; the design choices are not.
+- **Protocol versions as gates.** They're coordination strings parsed at the application layer; nothing in the wire enforces them. Treat them as documentation contracts, not access control.
+- **Not isolating multi-user data.** Every MCP tool call must scope by the authenticated user. Reusing existing internal tool implementations (which already have userEmail filters) is the safe pattern.
+- **Responding to notifications.** Per JSON-RPC spec, the server MUST NOT respond to messages without an `id`. Return 204 No Content for HTTP.
+- **Throwing instead of returning JSON-RPC errors.** Thrown exceptions produce 500s without JSON-RPC envelopes — clients can't parse them. Wrap handlers and translate every error to `{jsonrpc, id, error: {code, message}}`.
+- **Drifting tool schemas between chat and MCP.** Separate definitions drift. Single source of truth (`AUDIA_TOOLS` array reused by both consumers) eliminates the class of bug.
+- **Hardcoding the protocol version without negotiation logic.** Audia today only supports `2025-06-18`. A production server should accept a range and translate; deferred to Phase 12.
+
+### Operational notes
+
+- **Smoke test from DevTools (recommended):**
+  ```js
+  const call = async (m, p) => fetch('/api/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: m, params: p })
+  }).then(r => r.json());
+  await call('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+  await call('tools/list');
+  await call('tools/call', { name: 'listMyMeetings', arguments: { limit: 5 } });
+  ```
+- **Smoke test from PowerShell (curl.exe):** use the `--%` stop-parsing token + escaped quotes; PowerShell paste is fragile with multi-line + variables, prefer one-line commands.
+- **Cookie-based auth:** Audia's MCP server reuses the existing session cookie. Means browser fetches and curl-with-cookie work. Means Claude Desktop / Cursor DON'T work yet — they'd need a bearer-token path (Phase 12 OAuth work).
+- **Phase 12 polish work for MCP:** OAuth 2.1 auth for non-browser clients, MCP-CLIENT-side wiring (Audia's chat consuming external MCP servers like Calendar/Linear/web-search/GitHub), resources and prompts primitives, batch request handling, protocol-version negotiation across multiple supported versions, MCP Inspector for local testing without writing a client.
+
+### Go-deeper resources
+
+- [Anthropic, *"Introducing the Model Context Protocol"*](https://www.anthropic.com/news/model-context-protocol) — the November 2024 announcement + "Why MCP" framing
+- [Model Context Protocol specification](https://modelcontextprotocol.io/specification/2025-06-18/) — the current spec; "Architecture" + "Basic" sections are the interview-relevant ones
+- Simon Willison, [*"What's special about the Model Context Protocol?"*](https://simonwillison.net/2024/Nov/25/model-context-protocol/) — the most interview-grade short answer to "why does this matter vs function calling?"
+- [JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification) — the actual 2010 spec MCP claims conformance to. Five-minute read; the envelope rules and error codes are the part to know.
+- [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk) — official TypeScript SDK; what you'd use in production instead of hand-writing the protocol (which we did for curriculum understanding)

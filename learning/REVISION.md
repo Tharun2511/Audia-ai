@@ -34,7 +34,7 @@
 **Part VI — Agents**
 - [§14. Tool use & function calling: schemas, dispatch, the agentic loop](#14-tool-use--function-calling-schemas-dispatch-the-agentic-loop) ✅ *(Phase 7.1)*
 - [§15. Multi-step agents & ReAct: tool-result memory, failure modes, planning](#15-multi-step-agents--react-tool-result-memory-failure-modes-planning) ✅ *(Phase 7.2)*
-- §16. MCP — Model Context Protocol *(Phase 7.3 — TBD)*
+- [§16. MCP — Model Context Protocol: JSON-RPC envelope, three primitives, transports](#16-mcp--model-context-protocol-json-rpc-envelope-three-primitives-transports) ✅ *(Phase 7.3)*
 
 **Part VII — Search**
 - §17. Re-ranking with cross-encoders *(Phase 8.1 — TBD)*
@@ -2580,6 +2580,204 @@ A: *"Three moves. **One: tool discovery.** Don't ship all 10 schemas every turn 
 
 ---
 
+## §16. MCP — Model Context Protocol: JSON-RPC envelope, three primitives, transports
+
+### Why this section exists
+
+Through Phase 7.2, Audia's chat uses Groq's OpenAI-compatible function-calling API to invoke its own internal tools (`listMyMeetings`, `getMeetingDetails`). Those tools are **locked inside Audia**. If a user wants to query their meetings from Claude Desktop, Cursor, or any other LLM client, they can't — every external client would need its own custom integration into Audia's auth + DB. **MCP fixes the N×M integration problem** by standardizing how LLM applications discover and call tools across vendors. Phase 7.3 — the final session before the interview-ready milestone — builds Audia's first MCP server and walks the protocol end-to-end.
+
+### 16.1 The problem MCP solves
+
+🎯 **The N×M integration problem**
+
+> **Definition:** When N LLM applications each need custom integrations to M data sources / tool providers, total custom code = N×M. Adding either side quadratically. MCP collapses this to N+M by inserting a common protocol between them.
+
+Before MCP: 4 LLM clients × 4 data sources = 16 custom integrations that break independently.
+After MCP: 4 clients speak ONE protocol → connect to any of 4 MCP servers exposing ONE protocol = 8 implementations total.
+
+🎯 **MCP (Model Context Protocol)**
+
+> **Definition:** An open standard from Anthropic (Nov 2024) for connecting LLM applications to external tools, data, and prompts via a JSON-RPC 2.0 client/server protocol. Decouples tool *definitions* from tool *consumers* so any compliant LLM client can use any compliant MCP server. Sometimes framed as *"USB-C for LLMs."*
+
+### 16.2 The three primitives
+
+🎯 **MCP server exposes three things:**
+
+| Primitive | Direction | When | Audia example |
+|---|---|---|---|
+| **Tools** | Model → Server | Model decides to act (has side effects or needs computation) | `listMyMeetings`, `getMeetingDetails` |
+| **Resources** | Client/User → Server | User attaches data; model reads it as context | "all meetings as JSON", "a specific transcript URI" |
+| **Prompts** | User → Server | Named parameterized prompt templates the user picks from a menu | `summarize-this-meeting`, `extract-action-items` |
+
+Tools are the analog of function calling. Resources are read-only data the user explicitly attaches. Prompts are reusable templates. **Most tutorials cover tools only; Audia today exposes tools only.** Resources + prompts are future work — same JSON-RPC envelope, additional methods (`resources/list`, `prompts/list`).
+
+### 16.3 JSON-RPC 2.0 — the wire envelope
+
+🎯 **JSON-RPC 2.0**
+
+> **Definition:** A 2010 protocol spec defining a JSON-based remote-procedure-call envelope. Request shape `{jsonrpc:"2.0", id, method, params}`; response shape `{jsonrpc:"2.0", id, result|error}`; notifications omit `id`. Transport-agnostic — works over HTTP, WebSocket, stdio, raw TCP. MCP picked it as its wire format.
+
+**Critical insight about JSON-RPC vs REST:**
+
+| | REST | JSON-RPC |
+|---|---|---|
+| Mental model | Resources (nouns) | Functions (verbs) |
+| Method identification | HTTP verb + URL path | `method` field in body |
+| Endpoint count | Many (one per resource) | **One** (every operation hits the same URL) |
+| Transport binding | HTTP-only by definition | **Transport-agnostic** |
+| Spec | Architectural style (2000) | Formal protocol spec (2010) with normative requirements |
+
+The defining JSON-RPC traits are: *method-in-body* (not URL), *one endpoint* (not many), *transport-agnostic* (not HTTP-tied). MCP picked it because (1) tool calling IS semantically RPC, (2) the same protocol works for both stdio (Claude Desktop) and HTTP (remote servers), (3) avoids years of REST URL-design debate.
+
+🎯 **Defense talking point — "Why JSON-RPC, not REST?"**
+
+> *"REST and JSON-RPC are different mental models, not just different syntax. REST is resource-oriented; JSON-RPC is function-oriented. Tool calling is fundamentally RPC — call this function with these args, get a result — so the semantics match. MCP also needs to work over stdio (Claude Desktop runs MCP servers as child processes) AND HTTP — REST can't, JSON-RPC can. The choice isn't arbitrary; it's load-bearing for the protocol's portability."*
+
+### 16.4 Protocol versions — the "social contract" insight
+
+🎯 **MCP protocol version**
+
+> **Definition:** A date-formatted string (e.g. `"2025-06-18"`) identifying which spec snapshot the client and server agree to follow. Negotiated during `initialize`. Nothing in the network layer enforces this — it's a coordination string read by both parties' application code.
+
+⚠️ **The non-obvious truth:** protocol versions are **coordination strings, not network-enforced gates**. If a client and server both invented `"banana-pie-2099"` and both sides' code accepted it, they'd communicate fine. The technical constraint is the *shape of messages*; the version is *metadata about which shape*.
+
+Why date-keyed (not SemVer):
+- MCP spec evolves rapidly (multiple revisions in ~12 months)
+- Changes are mostly additive — SemVer's "major bump = breaking" rule doesn't fit
+- Dates eliminate "is this 1.1 or 2.0?" ambiguity at version-bump time
+
+Known versions as of mid-2025: `2024-11-05` (original announcement), `2025-03-26` (early revision), **`2025-06-18` (current canonical, what Audia ships)**.
+
+### 16.5 Transports
+
+🎯 **MCP transports** — three official:
+
+| Transport | What | When |
+|---|---|---|
+| **stdio** | Server is a child process; messages over stdin/stdout | Local-only servers; Claude Desktop default; developer tools |
+| **Streamable HTTP** | Server is an HTTP endpoint; POST + optional SSE for streaming | Remote/multi-user; what Audia uses |
+| **SSE (legacy)** | Older HTTP+SSE pattern | Deprecated; new servers should use Streamable HTTP |
+
+Audia's MCP server runs over Streamable HTTP because Audia is a web app with cookie-based auth. Future Claude Desktop integration would need a stdio path layered on (or bearer-token HTTP) — explicitly deferred.
+
+### 16.6 The handshake — concrete wire format
+
+Three canonical exchanges every MCP client makes against every MCP server:
+
+```jsonc
+// 1. CLIENT → initialize (capability negotiation)
+{ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+  "params": { "protocolVersion": "2025-06-18", "capabilities": {} } }
+
+// SERVER ← here's what I support
+{ "jsonrpc": "2.0", "id": 1, "result": {
+    "protocolVersion": "2025-06-18",
+    "capabilities": { "tools": {} },
+    "serverInfo": { "name": "audia-mcp", "version": "0.1.0" } } }
+
+// 2. CLIENT → notifications/initialized (one-way; no response)
+{ "jsonrpc": "2.0", "method": "notifications/initialized" }
+//      ↑ no `id` field = notification, server must NOT respond
+
+// 3. CLIENT → tools/list (discover tools)
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }
+
+// SERVER ← here are the tool schemas (same JSON Schema as function calling)
+{ "jsonrpc": "2.0", "id": 2, "result": { "tools": [
+    { "name": "listMyMeetings",
+      "description": "List the user's recorded meetings...",
+      "inputSchema": { "type": "object", "properties": {...}, "required": [] } } ] } }
+
+// 4. CLIENT → tools/call (invoke a tool)
+{ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+  "params": { "name": "listMyMeetings", "arguments": { "limit": 5 } } }
+
+// SERVER ← wrapped result (content[] of typed blocks + isError flag)
+{ "jsonrpc": "2.0", "id": 3, "result": {
+    "content": [ { "type": "text", "text": "{\"count\":2,\"meetings\":[...]}" } ],
+    "isError": false } }
+```
+
+🎯 **Notice the structural symmetry with Groq function calling.** The `inputSchema` field is **identical to the `parameters` field on a Groq function** — both are JSON Schema. Audia's `AUDIA_TOOLS` registry serves both consumers (chat route and MCP server) without modification. **Single source of truth for tool definitions.**
+
+### 16.7 Function calling vs MCP — when each is right
+
+⚖️ **They're at different layers — coexist, don't compete:**
+
+| | Function calling (Groq SDK) | MCP |
+|---|---|---|
+| Standard | Per-provider (OpenAI, Anthropic, Google) | Open standard |
+| Where tools live | Inside the LLM app code | In a separate server, discoverable at runtime |
+| Reusability | Tied to one provider's SDK | Any compliant client |
+| Tool registration | Hardcoded at app build time | Discovered via `tools/list` |
+| Best for | First-party tools tightly coupled to your app | Tools you want EXTERNAL LLM apps to use, or third-party services your app consumes |
+| Audia's use | Internal chat route → llama-3.3-70b | `/api/mcp` exposing same tools to external clients |
+
+🎯 **Defense talking point:** *"Function calling and MCP aren't competitors — they're at different layers. Function calling is how the LLM API exposes the tool-call mechanism on the model side. MCP is how applications expose tools to LLMs in a vendor-neutral way. In Audia, the chat route uses Groq's function-calling API to talk to llama-3.3-70b internally; the MCP server reuses the SAME tool dispatcher and exposes the SAME tools to external LLM clients. They coexist by construction."*
+
+### 16.8 Auth
+
+The MCP spec defers auth to the transport layer:
+
+- **Bearer tokens** in HTTP `Authorization` header — most common for remote servers
+- **OAuth 2.1** — spec-recommended for production; first-class flows being added
+- **Session cookies** — web-app native; works for browser-context clients (Audia's choice today)
+- **Environment variables / stdin** — for stdio transport (Claude Desktop launches the server process with env vars)
+
+Audia today: **reuses the existing session cookie via `getCurrentUser()`**. Means MCP-via-browser-fetch works AND curl-with-cookie works for testing. Claude Desktop / Cursor integration would need a bearer-token path layered on later — Phase 12 OAuth work.
+
+⚠️ **Multi-user isolation is non-negotiable.** Every MCP tool call MUST scope its DB queries by the authenticated user. The same `userEmail` ownership filter Audia uses in `listMyMeetings` carries over — a leaked sessionId on the MCP path must not surface another user's meetings. Audia's MCP server inherits this by reusing the existing tool implementations.
+
+### 16.9 What we built in Audia
+
+- **[src/lib/mcp.ts](../src/lib/mcp.ts)** — pure JSON-RPC 2.0 protocol logic. Handles `initialize`, `notifications/initialized`, `tools/list`, `tools/call`. Reuses `AUDIA_TOOLS` registry + `dispatchTool` from Phase 7.1 — single source of truth for tool definitions across chat and MCP. All errors translated to JSON-RPC error responses (no thrown exceptions reach the client).
+- **[src/app/api/mcp/route.ts](../src/app/api/mcp/route.ts)** — Next.js POST endpoint. `getCurrentUser()` auth (401 if unauthenticated). Parse body → delegate to `handleMcpMessage` → return JSON or 204 for notifications. ~30 lines; transport concerns separated from protocol concerns.
+- **Smoke test confirmed:** all three canonical exchanges work end-to-end against the live server with real user auth. `tools/list` returns both Audia tools with their full JSON Schemas; `tools/call listMyMeetings` returns real meeting data.
+
+### 16.10 Defense talking points (interview-grade)
+
+🎯 **Q: Walk me through MCP. What is it and what problem does it solve?**
+A: *"Anthropic's open standard from November 2024 for connecting LLM applications to tools, data, and prompts via JSON-RPC 2.0. It solves the N×M integration problem — N LLM clients each writing custom integrations to M data sources is quadratic; MCP standardizes the protocol so it collapses to N+M. An MCP server exposes three primitives: tools (functions the LLM calls), resources (read-only data the user attaches as context), and prompts (named templates). Any compliant client — Claude Desktop, Cursor, custom — speaks the same JSON-RPC envelope to any compliant server."*
+
+🎯 **Q: Why JSON-RPC instead of REST?**
+A: *"Three reasons. One: tool calling is semantically RPC — 'call this function with these args, return a result.' That maps to JSON-RPC naturally; REST would force awkward URL-modeling. Two: MCP needs to work over BOTH stdio (Claude Desktop runs MCP servers as child processes) AND HTTP — REST is HTTP-only by definition, JSON-RPC is transport-agnostic. Three: JSON-RPC has a formal 2010 spec with normative envelope, error codes, ID semantics — multiple language libraries implement it identically because they all read the same spec. REST is an architectural style, not a wire spec."*
+
+🎯 **Q: What's the difference between MCP and function calling?**
+A: *"Different layers, not competitors. Function calling is how an LLM provider's API exposes the tool-call mechanism on the model side — OpenAI has theirs, Anthropic has theirs, Google has theirs, each slightly different. MCP is how applications expose tools to LLMs in a vendor-neutral way. In Audia, the chat route uses Groq's function-calling API to call llama-3.3-70b internally; the MCP server at /api/mcp exposes the SAME tools to external LLM clients via the standard protocol. The SAME tool registry — AUDIA_TOOLS — feeds both. Function calling is the model-side mechanism; MCP is the cross-application standard. They coexist."*
+
+🎯 **Q: How does protocol version negotiation work in MCP, and what happens if they don't match?**
+A: *"During `initialize`, the client sends its desired protocolVersion as a date string like '2025-06-18'. The server responds with whatever version IT supports. If they match, both sides proceed assuming that spec's semantics. If they don't, both sides know there's an incompatibility — typically the client either falls back to a version it supports OR aborts with a clear error. The critical insight is that the version isn't network-enforced — it's a coordination string. If both sides claimed to speak a fictional version and their actual message shapes were compatible, they'd communicate fine. The version's real job is failing loudly on mismatch, not gatekeeping traffic. MCP picked date-keyed versions over SemVer because the spec evolves fast and changes are mostly additive."*
+
+🎯 **Q: What's the security model when Audia exposes MCP?**
+A: *"Every MCP tool call goes through `getCurrentUser()` first — same auth path the rest of Audia uses. The session cookie identifies the user; every tool dispatch is scoped by that user's email at the SQL level (`WHERE userEmail = $1` in every query). A leaked sessionId surfaces only that user's data. The 401 path fires before any MCP method is dispatched, even `initialize` — so an unauthenticated client can't even discover what tools exist. That's deliberate: tool *existence* shouldn't leak across the auth boundary. For Claude Desktop / Cursor integration we'd add a bearer-token path, but the ownership filter at the SQL layer stays identical."*
+
+### 16.11 Common pitfalls
+
+⚠️ **Confusing JSON-RPC with REST.** They're different conceptual models. JSON-RPC: method-in-body, one endpoint, transport-agnostic. REST: resource-in-URL, many endpoints, HTTP-only. The "JSON over HTTP" surface looks similar; the design choices are not.
+
+⚠️ **Forgetting that protocol versions are coordination strings.** Treating them as network-enforced gates leads to confusion when "everything works on the wire" but messages still get rejected. The wire doesn't care; the parsers do.
+
+⚠️ **Not isolating multi-user data in MCP tool calls.** Every tool call must scope by the authenticated user. Reusing existing internal tool implementations (which already have ownership filters) is the safe pattern.
+
+⚠️ **Responding to notifications.** Per JSON-RPC spec, the server MUST NOT respond to messages without an `id`. Server side: detect `id === undefined` and return early (204 No Content for HTTP transport).
+
+⚠️ **Throwing instead of returning JSON-RPC errors.** A thrown exception in a handler produces a 500 with no JSON-RPC envelope; the client can't parse it. Wrap handlers and translate every error to a proper `{jsonrpc, id, error: {code, message}}` shape.
+
+⚠️ **Hardcoding the protocol version without negotiation logic.** Audia today does this for simplicity, but a production MCP server should accept a range of versions and translate as needed.
+
+⚠️ **Drifting tool schemas between chat and MCP.** If function-calling tools and MCP tools are defined separately, they drift. Single source of truth (Audia's `AUDIA_TOOLS` array, shared by both) eliminates the class of bug.
+
+### 16.12 Glossary additions (land in Appendix A)
+
+- **MCP (Model Context Protocol)** — see §16.1.
+- **JSON-RPC 2.0** — see §16.3.
+- **N×M integration problem** — see §16.1.
+- **MCP primitives (tools / resources / prompts)** — see §16.2.
+- **MCP transports (stdio / Streamable HTTP / SSE)** — see §16.5.
+- **Protocol version negotiation** — see §16.4. The version is a coordination string, not a wire-enforced gate.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
@@ -2639,6 +2837,7 @@ A: *"Three moves. **One: tool discovery.** Don't ship all 10 schemas every turn 
 - **Hallucinated state (agent failure mode)** — model "remembers" details that aren't in the actual conversation context, often by asserting it called a tool earlier when it didn't or when the result has rolled out of the window. Guard: persist tool results in conversation memory + system rule "never assert info that didn't come from a tool result this conversation."
 - **HNSW (Hierarchical Navigable Small World)** — graph-based vector index. Multi-layer graph; queries walk top-down via greedy traversal. Slower build than IVFFlat; faster queries, higher recall, incremental.
 - **Hybrid search** — retrieval that combines lexical (BM25) and dense (vector) search, fusing the two ranked lists via RRF or similar. Catches exact-keyword matches that pure vector search misses.
+- **JSON-RPC 2.0** — 2010 protocol spec defining a JSON-based remote-procedure-call envelope: `{jsonrpc, id, method, params}` request, `{jsonrpc, id, result|error}` response. Transport-agnostic (works over HTTP, stdio, WebSocket, raw TCP). Method-in-body (not URL), one endpoint (not many). MCP's wire format.
 - **Indirect injection** — prompt injection where malicious instructions are hidden in content the model retrieves or processes — RAG sources, fetched URLs, files, transcribed audio. More dangerous than direct because attacker doesn't need to be the user.
 - **IVFFlat** — inverted-file vector index. Clusters vectors via k-means into N lists; queries probe closest lists. Fast build, low memory, good recall — but requires data present before build.
 - **L2 (Euclidean) distance** — `√(Σᵢ (aᵢ−bᵢ)²)`. Geometric distance between two vectors. For unit-normalized vectors produces same ranking as cosine. Default similarity metric for non-normalized embeddings (image, some custom).
@@ -2646,6 +2845,9 @@ A: *"Three moves. **One: tool discovery.** Don't ship all 10 schemas every turn 
 - **LLM-as-judge** — using a (usually stronger, different-family) LLM to score another model's output against a rubric. Modern default for grading open-ended output. Watch position, verbosity, and self-enhancement bias; prefer pass/fail over 1–10; reason before verdict.
 - **"Looking at your data"** — practitioner discipline: read ~100 real model outputs before defining a metric. You don't know what to measure until you've seen the failure modes. Hamel Husain's framing.
 - **Lost in the middle** — empirically observed LLM failure where models pay less attention to content in the middle of long contexts than at the beginning or end. Informs retrieval-ordering decisions and favors smaller, well-targeted chunks. From Liu et al. 2023.
+- **MCP (Model Context Protocol)** — Anthropic's Nov 2024 open standard for connecting LLM applications to external tools, data, and prompts via JSON-RPC 2.0. Three primitives (tools / resources / prompts), client-server architecture, transport-agnostic (stdio + Streamable HTTP). Solves the N×M integration problem by collapsing custom integrations to a common protocol.
+- **MCP primitives** — the three things an MCP server can expose: **tools** (functions the LLM can call), **resources** (read-only data the user attaches as context), **prompts** (named parameterized templates the user picks from a menu). Audia's MCP server exposes tools only today; resources + prompts are future work.
+- **MCP transports** — stdio (child-process via stdin/stdout — Claude Desktop default), Streamable HTTP (HTTP POST + optional SSE — for remote servers, what Audia uses), legacy SSE (deprecated).
 - **MMR (Maximal Marginal Relevance)** — re-ranking algorithm balancing relevance to query against diversity from already-selected results. Iteratively picks the candidate maximizing `λ·rel − (1−λ)·max-sim-to-selected`. λ=0.7 is production default.
 - **Multi-step agent task** — task whose solution requires multiple tool calls where later calls depend on earlier results (e.g. "list meetings → drill into the most recent one"). Distinguished from single-step (one call, done). Demands ≥2 tools AND tool-result memory across iterations.
 - **MTEB (Massive Text Embedding Benchmark)** — public leaderboard ranking embedding models on retrieval, classification, clustering, etc. Use this when choosing an embedding model — beats dim-count as a quality signal.
@@ -2665,9 +2867,11 @@ A: *"Three moves. **One: tool discovery.** Don't ship all 10 schemas every turn 
 - **pgvector operators** — `<->` (L2), `<#>` (negative inner product), `<=>` (cosine distance), `<+>` (L1 / Manhattan). Smaller value = more similar in ORDER BY. Cosine is the default for text embeddings.
 - **Pairwise vs pointwise judging** — pairwise: judge picks the better of two outputs (more reliable). Pointwise: judge scores one output on a rubric. Both humans and LLMs compare better than they absolute-score. Mitigate position bias by running both orders (A,B) and (B,A) and counting wins only when consistent.
 - **Parallel tool calls** — a single model response containing multiple `tool_calls` entries, intended for concurrent execution by the application. Reduces round-trip count when calls are independent and idempotent.
+- **N×M integration problem** — when N LLM applications each need custom integrations to M data sources / tool providers, total work scales quadratically (N×M). MCP collapses this to N+M by inserting one common protocol. The "USB-C for LLMs" framing comes from solving exactly this.
 - **Off-task drift (agent failure mode)** — chains of small reasoning steps drift away from the user's actual question because intermediate observations trigger new lines of thought. New in multi-step agents (single-step can't drift). Guard: restate the user's goal at the top of every iteration.
 - **Orphan-pair filtering** — rolling-buffer load-time discipline of dropping `role:tool` messages whose anchor assistant turn is outside the loaded window. Prevents the API from rejecting on broken pairs at the window boundary.
 - **PR fast subset + nightly full suite** — scaling pattern for eval cost: a small curated subset gates every PR (cheap, fast feedback), the full suite runs overnight with Slack alerting on pass-rate drops. Reserve full-suite-on-PR for explicit opt-in (e.g., a `[full-eval]` keyword).
+- **Protocol version (date-keyed)** — MCP versions its spec by publication date (`YYYY-MM-DD`) rather than SemVer. The version is a coordination string at the application layer — nothing in the network/HTTP/TLS layer enforces it. If client + server both agreed on a fictional version and their message shapes were compatible, they'd communicate fine. The version's job is failing loudly on mismatch, not gatekeeping traffic. Same pattern as HTTP version strings, TLS version bytes, USB version descriptors.
 - **Planning agent** — agent variant that emits a sequence-of-tool-calls plan FIRST, then executes it step by step (may replan mid-execution). Trades an upfront LLM call for better coordination on long structured tasks. Default to reactive; reach for planning when reactive drifts on 5+ step queries.
 - **Pass rate** — fraction of golden-set cases meeting their success criteria on a run. The headline regression metric; gate CI on it. 100% on a fresh set usually means the set is too easy.
 - **Presence penalty** — flat logit penalty for any token that has already appeared. Encourages topic diversity. Range 0–2.
