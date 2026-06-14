@@ -20,7 +20,9 @@ import { logout } from "@/app/actions/auth";
 import { BrandLogo } from "./components/BrandLogo";
 import SessionListItem from "./components/SessionListItem";
 import SessionView from "./components/SessionView";
+import SearchResults from "./components/SearchResults";
 import SidebarSearch from "./components/SidebarSearch";
+import type { SearchHit } from "@/app/api/search/route";
 import ThemeToggle from "./components/ThemeToggle";
 import { ReadyState, RecordingState, ProcessingState } from "./components/MainPaneStates";
 
@@ -54,6 +56,17 @@ export default function HomeClient({ userEmail, userName }: Props) {
     const [justCompletedId, setJustCompletedId] = useState<string | null>(null);
     const [drawerOpen, setDrawerOpen] = useState(false);
     const [searchQuery, setSearchQuery] = useState("");
+
+    /* ---------- Semantic search (Phase 8.1) ----------
+     * The sidebar box filters the session list instantly as you type
+     * (searchQuery → filteredHistory). Pressing Enter ESCALATES to a semantic
+     * search across all transcript CONTENT via /api/search (bi-encoder recall →
+     * cross-encoder rerank). Those ranked results take over the main pane.
+     * searchActiveQuery is non-empty while a semantic search is showing. */
+    const [searchActiveQuery, setSearchActiveQuery] = useState("");
+    const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+    const [searching, setSearching] = useState(false);
+    const searchActive = searchActiveQuery.length > 0;
 
     /*
      * The "Just completed" chip is a confetti moment — fresh after recording.
@@ -113,6 +126,38 @@ export default function HomeClient({ userEmail, userName }: Props) {
         });
     }, [history, searchQuery]);
     const isFiltering = searchQuery.trim().length > 0;
+
+    const clearSearch = useCallback(() => {
+        setSearchActiveQuery("");
+        setSearchHits([]);
+        setSearching(false);
+    }, []);
+
+    const runSemanticSearch = useCallback(async (q: string) => {
+        const query = q.trim();
+        if (!query) return;
+        setSelectedId(null);          // hand the main pane to the results view
+        setDrawerOpen(false);         // close the mobile drawer so results are visible
+        setSearchActiveQuery(query);
+        setSearchHits([]);
+        setSearching(true);
+        try {
+            const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+            if (!res.ok) throw new Error(`Server returned ${res.status}`);
+            const data: { hits: SearchHit[] } = await res.json();
+            setSearchHits(data.hits ?? []);
+        } catch {
+            toast.error("Search failed. Try again.");
+            clearSearch();
+        } finally {
+            setSearching(false);
+        }
+    }, [clearSearch]);
+
+    const openSearchHit = useCallback((transcriptionId: string) => {
+        setSelectedId(transcriptionId);
+        clearSearch();
+    }, [clearSearch]);
 
     /* ---------- Delete with Undo ----------
      * Optimistic remove + 5s window to undo before the server-side delete
@@ -303,12 +348,14 @@ export default function HomeClient({ userEmail, userName }: Props) {
         setSelectedId(null);
         setError(null);
         setDrawerOpen(false);
+        clearSearch();
     };
 
     /* ---------- What does the main pane show? ---------- */
-    let mainView: "recording" | "processing" | "session" | "ready";
+    let mainView: "recording" | "processing" | "search" | "session" | "ready";
     if (status === "recording" || status === "paused") mainView = "recording";
     else if (status === "processing") mainView = "processing";
+    else if (searchActive) mainView = "search";
     else if (selectedRecord) mainView = "session";
     else mainView = "ready";
 
@@ -376,7 +423,10 @@ export default function HomeClient({ userEmail, userName }: Props) {
             </Stack>
             {historyLoaded && history.length > 0 && (
                 <Box sx={{ px: 1.5, pb: 1, flexShrink: 0 }}>
-                    <SidebarSearch value={searchQuery} onChange={setSearchQuery} />
+                    <SidebarSearch value={searchQuery} onChange={setSearchQuery} onSubmit={runSemanticSearch} />
+                    <Typography variant="caption" sx={{ display: "block", px: 1, pt: 0.75, fontSize: 10, color: "text.disabled", lineHeight: 1.4 }}>
+                        Filters as you type · press <Box component="kbd" sx={{ fontFamily: "var(--font-geist-mono), monospace", fontSize: 9, px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: "action.selected" }}>Enter</Box> to search across all meetings
+                    </Typography>
                 </Box>
             )}
             <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", px: 1.5, pb: 2 }}>
@@ -413,7 +463,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
                                 key={record.id}
                                 record={record}
                                 selected={record.id === selectedId}
-                                onSelect={(id) => { setSelectedId(id); setDrawerOpen(false); }}
+                                onSelect={(id) => { setSelectedId(id); setDrawerOpen(false); clearSearch(); }}
                                 onDelete={requestDelete}
                             />
                         ))}
@@ -437,9 +487,24 @@ export default function HomeClient({ userEmail, userName }: Props) {
         );
     } else if (mainView === "processing") {
         mainContent = <ProcessingState />;
+    } else if (mainView === "search") {
+        mainContent = (
+            <SearchResults
+                query={searchActiveQuery}
+                hits={searchHits}
+                loading={searching}
+                onClose={clearSearch}
+                onOpenHit={openSearchHit}
+            />
+        );
     } else if (mainView === "session" && selectedRecord) {
         mainContent = (
             <SessionView
+                // key on the session id forces a full remount when you switch
+                // sessions — without it React reuses the instance, which can
+                // leave the previous transcript's DOM/scroll/audio state behind
+                // (the "two transcripts at once" bug).
+                key={selectedRecord.id}
                 id={selectedRecord.id}
                 title={selectedRecord.title}
                 summary={selectedRecord.summary}

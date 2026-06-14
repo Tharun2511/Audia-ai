@@ -376,3 +376,33 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - **MCP-routing eval** — like Phase 6's tool-routing concern but for MCP-method-routing: do `initialize`/`tools/list`/`tools/call` dispatch correctly under malformed input? A small eval surface that probes the handlers.
   - **Migration cutover** — eventual disable of `synchronize: true`, adopt explicit migrations. Phase 12 territory; tagged here so it doesn't get lost.
   - Still-open from earlier: judge validation (Cohen's kappa, 6.2); backfill route run+delete (4.2); 7.2's React duplicate-key UI warning.
+
+---
+
+**2026-06-05 · Phase 8.1 — Cross-encoder re-ranking & semantic search as a product surface · 🔵 TRACK B BEGINS**
+- Covered: bi-encoder vs cross-encoder (independence = the bi-encoder's lossiness on negation/direction/exact-terms; cross-attention = the cross-encoder's accuracy; can't-precompute = its non-scalability); retrieve-and-rerank as the canonical two-stage funnel (recall stage → precision stage; N passes affordable ONLY because Stage 1 narrowed the field); cross-encoder vs MMR as complementary (precision vs diversity — closing the 4.1 Q4 gap); logits vs normalized scores (BGE raw logits + sigmoid; Jina normalized; rank-within-query never global-threshold-without-calibration); the "consumer changed from model to human" framing for why ranking quality suddenly matters in a search UI; provider trade-offs (Jina API vs local BGE-ONNX vs LLM-as-reranker vs Cohere).
+- Built: [src/lib/rerank-cross.ts](../src/lib/rerank-cross.ts) — `crossEncoderRerank` via Jina Reranker API (`jina-reranker-v2-base-multilingual`), graceful fallback to bi-encoder order (NaN score) if key missing/API errors. [src/app/api/search/route.ts](../src/app/api/search/route.ts) — `GET /api/search`: embed → `findCandidateChunks(n=30, all transcripts)` → cross-encoder rerank (k=8) → ownership-filtered title attach; returns both relevanceScore + biEncoderSimilarity + per-stage timing, no LLM. [SearchResults.tsx](../src/app/components/SearchResults.tsx) — main-pane ranked hits (purple % chip = relevance), `mainView: "search"` state. [SidebarSearch.tsx](../src/app/components/SidebarSearch.tsx) + [HomeClient.tsx](../src/app/HomeClient.tsx) — filter-as-you-type (lexical, existing) + search-on-Enter (semantic, new). `npx tsc --noEmit` clean.
+- Build chose: Jina API reranker (real cross-encoder, free, low-friction) + full feature (API + sidebar UI). MMR dropped for the search surface (diversity matters for LLM context budgets, not human result lists).
+- **Mid-session bug fixes (reported from the running app):**
+  - **Double clear (✕) button** — `type="search"` drew the browser's native clear on top of the custom MUI clear. Fixed: hid `::-webkit-search-cancel-button` / `-decoration` in SidebarSearch sx.
+  - **Two transcripts displayed at once on session switch** — `<SessionView>` had no `key`, so React reused the instance across switches (stale DOM + carried-over audio position). Fixed: `key={selectedRecord.id}` forces clean remount. (Flagged HMR/Fast-Refresh as possible contributor; asked for hard-refresh confirmation.)
+- **Two long-standing weaknesses CLOSED this session:**
+  - **🎯 Cross-encoder vs MMR "different problems" (Q2, 9/10)** — the exact 4.1 Q4 gap ("said only MMR eliminates redundancy; missed they're complementary"). Now articulated cleanly and unprompted. Compounding correction landed.
+  - **🎯 Query-dependence reasoning (Q4, 8/10)** — "not comparable across queries" with the 0.95-vs-0.5 example, cold.
+- **Stuck (well-internalized):**
+  - **Bi/cross core + the "why" (Q1, 8.5).** Precompute-vs-not as the load-bearing distinction, not just "one's faster."
+  - **Consumer-changed framing (Q5, 8).** "User sees results directly; the LLM can sort chunks out" — got the structural reason ranking matters here and not in chat.
+  - **🧠 Feynman 8/10 — best mechanism-fit to date.** Train (fast/cheap/long-haul = recall) + auto-rickshaw (slow/expensive/precise last-mile = precision); the funnel is *built into* the analogy (can't rickshaw across the country, train can't reach your door → need both, in order). Banned-word clean; USE-not-NAME held.
+- **Fuzzy (needs reinforcement):**
+  - **Q3 (6.5) — restated Q1 instead of attacking the premise.** "Why not cross-encode everything / skip pgvector" needs: (1) cross-encoder scores **can't be precomputed/indexed** → N passes over the *whole corpus per query*; (2) therefore **you still need the bi-encoder to make N small**. He gave the consequence (slow) not the premise rebuttal (can't index + Stage 1 is load-bearing). Same shape as prior "name the mechanism, not just the effect."
+  - **Cross-attention as the accuracy mechanism (Q1).** Said "puts query+chunk together"; the precise term is they **attend to each other**.
+  - **"Complementary / run both" (Q2).** Had "different problems"; add the production close ("so you run bi-encoder → cross-encoder → MMR").
+  - **"Calibration" by name (Q4).** Had the concept; lead with the term.
+  - **🧠 Feynman close (recurring since 5.1).** Still a restatement ("we added the auto-rickshaw") not a risk-removed consequence. Model given in analogy vocab ("...the train drops you in the right *city* but 20 km from the actual address — close on the map, useless for getting there"). Drill unchanged: **write the without-this close FIRST**, then build the body toward it. Feynman trajectory: 7.2 (5.5) → 7.3 (7.5) → 8.1 (8).
+- **Plan decided this session:** finish **8.2 (hybrid search: BM25 + dense + RRF + query expansion)** next, then **inserted 8.5 — LangChain + LangGraph.js** (Tharun's explicit ask; teaching emphasis = "which framework for which use case"; deliverable = refactor the hand-rolled chat agent into a LangGraph graph **as a parallel path**, keep the primitive version). MCP-client work (Google Calendar) taught at theory level then shelved. See [[audia_ai_progress]].
+- **Loose ends to follow up:**
+  - **`JINA_API_KEY`** must be in `.env` for reranking; without it search degrades to bi-encoder order (also the cleanest A/B to *see* the lift).
+  - **Browser verification** of the two bug fixes (double-✕, two-transcripts) — hard-refresh, switch sessions, confirm. Pending Tharun.
+  - **Click-to-seek** in search results deferred (opens the meeting; exact-timestamp seek needs lifting `seekTo` into SessionView via a prop).
+  - **No automated search-ranking eval** — needs labeled query→relevant-chunk pairs (RAGAS context precision/recall) to measure the rerank lift numerically.
+  - Carry-forwards: judge validation (Cohen's kappa, 6.2); backfill route run+delete (4.2).

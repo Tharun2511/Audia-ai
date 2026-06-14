@@ -37,7 +37,7 @@
 - [§16. MCP — Model Context Protocol: JSON-RPC envelope, three primitives, transports](#16-mcp--model-context-protocol-json-rpc-envelope-three-primitives-transports) ✅ *(Phase 7.3)*
 
 **Part VII — Search**
-- §17. Re-ranking with cross-encoders *(Phase 8.1 — TBD)*
+- [§17. Re-ranking with cross-encoders: bi-encoder vs cross-encoder, retrieve-and-rerank](#17-re-ranking-with-cross-encoders-bi-encoder-vs-cross-encoder-retrieve-and-rerank) ✅ *(Phase 8.1)*
 - §18. Hybrid search & query expansion *(Phase 8.2 — TBD)*
 
 **Part VIII — Speech**
@@ -2778,9 +2778,132 @@ A: *"Every MCP tool call goes through `getCurrentUser()` first — same auth pat
 
 ---
 
+## §17. Re-ranking with cross-encoders: bi-encoder vs cross-encoder, retrieve-and-rerank
+
+### 17.1 The whole game in one sentence
+
+> A bi-encoder embeds query and document *separately* and is cheap enough to run over millions; a cross-encoder reads them *together* and is precise but only affordable on a few dozen — so you chain them: bi-encoder for recall, cross-encoder for precision. That chain is **retrieve-and-rerank**.
+
+Phase 8 is where Audia's search stops being internal plumbing and becomes a product surface the user looks at directly. Everything that follows is downstream of one consequence of that shift: **when the user sees the ranking, the ranking has to be good.**
+
+### 17.2 Why our existing search was lossy — the bi-encoder limitation
+
+From Phase 3 onward, every retrieval in Audia is a **bi-encoder** system. The name describes the architecture: there are conceptually *two* encoders (one for the query, one for the document) that run *independently*. `embed(question)` turns the query into a 768-dim vector; the chunk was turned into its own 768-dim vector at ingest time; `pgvector`'s `<=>` compares them by cosine distance.
+
+The defining property — and the limitation — is **independence**. The model compresses the query into ~768 numbers *before it has ever seen the document*, and vice versa. Whatever fine-grained relationship exists between this specific query and this specific document is gone by the time the two vectors meet; all that's left is a geometric comparison of two pre-baked summaries. Concretely, this flattens:
+
+- **Negation.** "We decided *not* to ship in March" and "We decided to ship in March" share almost every token and embed to nearly the same vector. To a bi-encoder they're near-identical; the single most important word is averaged away.
+- **Directionality / role.** "Alice asked Bob to own pricing" vs "Bob asked Alice to own pricing." Same bag of concepts, opposite meaning.
+- **Rare exact terms.** A specific error code, ticket number, or product name gets diluted into the chunk's overall topic vector — so a query *for that exact term* may not rank the chunk that contains it above a chunk that's merely on-topic.
+
+This was acceptable for Phases 4–7 because retrieval was feeding an LLM. Send the model five roughly-right chunks and a capable model sorts out which actually answers the question; a mediocre #1 chunk costs little. **The consumer was a model, and the model was forgiving.** Phase 8 changes the consumer to a *human* reading a ranked list, and humans read top-down. The #1 result being "topically near" instead of "actually best" is now a visible product defect.
+
+### 17.3 The cross-encoder
+
+A **cross-encoder** removes the independence. Instead of two separate passes, it concatenates the query and one document into a single input — roughly `[CLS] query [SEP] document [SEP]` — and runs *one* transformer forward pass over the pair. Because it's a single pass, the query's tokens and the document's tokens attend to each other directly inside the network. The output isn't a vector to compare later; it's a single scalar **relevance score** for *this query against this document*.
+
+Intuition (no transformer math): a bi-encoder is two people in separate rooms each writing a summary, then a clerk comparing the summaries — the comparison only sees the summaries, never the originals. A cross-encoder is one person reading the query and the document side by side and judging the match. Reading them together is exactly why it catches negation and role-direction: the word "not" in the document can be evaluated *in the context of* the query.
+
+The catch is structural and it dictates everything about how you use it:
+
+| | Bi-encoder | Cross-encoder |
+|---|---|---|
+| Encoding | query and doc separately | query + doc together, one pass |
+| Output | a vector per item | one relevance score per (query, doc) pair |
+| Precompute doc vectors? | ✅ yes (embed once, store) | ❌ no — score depends on the query |
+| Cost per query | 1 embed + ANN (ms) | **N forward passes** (one per candidate) |
+| Scale | millions | dozens |
+| Quality | good recall, soft precision | excellent precision |
+
+You **cannot** precompute a cross-encoder score, because the score doesn't exist until a query arrives. So you can't index it, and you can't run it over the corpus. You can only afford it on a handful of candidates.
+
+### 17.4 Retrieve-and-rerank — the canonical two-stage pipeline
+
+The resolution is a funnel:
+
+```
+  millions of chunks
+        │
+        ▼  STAGE 1: bi-encoder  (findCandidateChunks → pgvector <=>)   FAST · recall
+   coarse top-N  (Audia: n = 30)
+        │
+        ▼  STAGE 2: cross-encoder  (crossEncoderRerank → Jina API)     SLOW · precision
+   precise top-k  (Audia: k = 8)  ──►  shown to the user
+```
+
+Stage 1 is recall-oriented: cast a wide, cheap net and tolerate false positives — its only job is to make sure the genuinely-relevant chunks are *somewhere* in the top-N. Stage 2 is precision-oriented: spend the expensive model only on those N to find the true best-k. **The cross-encoder is affordable only because Stage 1 narrowed the field first** — N forward passes where N=30, not N=millions. This is the standard production RAG retrieval architecture; "reranking" in industry almost always means exactly this second stage.
+
+A subtle but important point: Stage 1's N is a recall knob and Stage 2's k is a precision knob. Raise N and you give the cross-encoder more chances to find a buried gem (better recall, more latency/cost). Lower k and you show fewer, higher-confidence results. They tune independently.
+
+### 17.5 Cross-encoder vs MMR — they solve different problems
+
+Audia already had a reranker of sorts — **MMR** (§9). It's tempting to think the cross-encoder replaces it. It doesn't; they optimize orthogonal things.
+
+**⚖️ Trade-off table — reranking objectives**
+
+| | Cross-encoder | MMR |
+|---|---|---|
+| Optimizes | relevance **precision** | result **diversity** |
+| Question it answers | "Is this *actually* a good match?" | "Have I already covered this idea?" |
+| Failure it fixes | bi-encoder's lossy #1 | five near-duplicate chunks |
+| Needs | a model that scores (query, doc) | candidate-to-candidate similarities |
+
+The fully-loaded production order is **bi-encoder retrieve N → cross-encoder rerank to M → MMR diversify to k**: get the most-relevant set, *then* deduplicate it. For Audia's *search results page* I deliberately dropped MMR — when a human scans search results, they usually want the most-relevant moments in honest order, even if two are about the same thing; diversity matters more when you're packing a *fixed LLM context budget* (the chat case) and can't afford a redundant slot. So: cross-encoder for search, both for chat-RAG if we ever wire it there.
+
+### 17.6 Scores: logits vs normalized, and why you don't threshold blindly
+
+What the reranker returns depends on the provider, and this trips people up:
+
+- **Raw cross-encoders (e.g. BGE-reranker)** emit a **raw logit** — an unbounded real number (e.g. `-2.3`, `4.8`). Higher = more relevant, but it's *not* a probability and *not* comparable across different queries. To get a [0,1] number you apply a sigmoid yourself, and even then it's not calibrated.
+- **The Jina API** (what Audia uses) returns `relevance_score` already in **[0,1]** (sigmoid applied server-side). Friendlier for display — Audia shows it as a `%` chip — but it's still a *within-query* signal.
+
+The rule: **rank within one query by the score; do not apply a global threshold** (`score > 0.5` → keep) without calibrating against labeled data first. A "0.4" on one query and a "0.4" on another don't mean the same thing. Audia ranks and displays; it never silently drops a result below a hardcoded cutoff.
+
+### 17.7 Latency becomes user-facing
+
+In chat, retrieval latency hid inside the time the LLM was already taking to generate. In a search box, the cross-encoder's time sits *between the user's keystroke and the results appearing*. For an API reranker (Jina) that's a network round-trip on top of Stage 1; for a local model (BGE/ONNX) it's CPU inference plus cold-start. Either way the lever is **keep N small** — which is precisely Stage 1's job. Audia's n=30 is a deliberate latency budget, not an arbitrary number.
+
+### 17.8 How it maps to Audia's code
+
+- **Stage 1** — `findCandidateChunks(queryEmbedding, userEmail, { n: 30 })` in [chunks.ts](../src/lib/chunks.ts). Already cross-transcript (no `transcriptionId` → all the user's meetings) and ownership-filtered in SQL. This primitive existed since 3.3; its comment even named "cross-encoder" as a future consumer.
+- **Stage 2** — `crossEncoderRerank(q, candidates, k=8)` in [rerank-cross.ts](../src/lib/rerank-cross.ts). POSTs `{ model, query, documents, top_n }` to the Jina API; maps the index-referenced, relevance-sorted results back onto the candidate objects. Falls back to bi-encoder order with `NaN` score if `JINA_API_KEY` is missing or the call errors — a dead reranker must never take down search.
+- **Endpoint** — `GET /api/search` in [search/route.ts](../src/app/api/search/route.ts). Orchestrates embed → Stage 1 → Stage 2 → title attachment; returns both `relevanceScore` and `biEncoderSimilarity` for transparency. No LLM call — pure ranked retrieval.
+- **UI** — [SearchResults.tsx](../src/app/components/SearchResults.tsx) (main-pane ranked list, purple % chip = relevance) + [SidebarSearch.tsx](../src/app/components/SidebarSearch.tsx) (filter-as-you-type *and* search-on-Enter) + a new `mainView: "search"` in [HomeClient.tsx](../src/app/HomeClient.tsx).
+
+### 17.9 🎯 Defense talking points
+
+- **"Isn't a cross-encoder just a slower embedding model?"** No — it's a different architecture with a different output. An embedding model produces a *vector you compare later*; a cross-encoder produces a *score for a specific pair* and never yields a reusable vector. The slowness isn't incidental — it's the direct cost of not being able to precompute, which is the same property that makes it more accurate.
+- **"Why not skip the bi-encoder and just cross-encode everything?"** Because the cross-encoder can't be indexed — every query would be N forward passes over the *entire* corpus. The bi-encoder exists to make N small. They're not redundant; they're a recall stage and a precision stage.
+- **"You added MMR earlier for the same reason, right?"** No — different objective. MMR maximizes diversity (anti-redundancy); the cross-encoder maximizes relevance precision. A mature stack runs both, in that order.
+- **"Your reranker is down — is search broken?"** No. It degrades to bi-encoder order and drops the relevance chips. Reranking is a precision *enhancement* layered on a working recall stage, not a hard dependency.
+
+### 17.10 ⚠️ Common pitfalls
+
+- Treating reranker scores as probabilities or thresholding globally without calibration.
+- Feeding the cross-encoder too many candidates (latency scales with N).
+- Forgetting the reranker is an external dependency with no graceful fallback.
+- Dropping the ownership filter on the *title* lookup (the chunk query is scoped; the title query must be too).
+- Importing a server-only route module into a client component without `import type` (leaks server code into the client bundle).
+- Assuming cross-transcript search needed new retrieval — the recall query already supported it; only the precision stage and UI were new.
+
+### 17.11 Glossary additions (land in Appendix A)
+
+- **Bi-encoder** — see §17.2.
+- **Cross-encoder (reranker)** — see §17.3.
+- **Retrieve-and-rerank** — see §17.4.
+- **Recall stage vs precision stage** — see §17.4.
+- **Reranker logits vs normalized scores** — see §17.6.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
+
+- **Bi-encoder** — retrieval architecture that embeds query and document *separately* into vectors and ranks by cosine. Document vectors are precomputable, so it scales to millions (ANN) — but query and document never interact, so it's lossy on negation, role-direction, and exact terms. Audia's pgvector retrieval. See §17.2.
+- **Cross-encoder (reranker)** — feeds query and one document *together* through a transformer in one pass, outputting a single relevance score. Far more precise than a bi-encoder (tokens attend across query/doc) but not precomputable → one forward pass per candidate, so usable only on a small candidate set. See §17.3.
+- **Retrieve-and-rerank** — two-stage retrieval: a bi-encoder recalls a coarse top-N from the whole corpus, then a cross-encoder re-scores those N to a precise top-k. The funnel makes the expensive precision stage affordable. The canonical production RAG retrieval pattern. See §17.4.
+- **Reranker scores (logits vs normalized)** — raw cross-encoders (BGE) emit unbounded logits, not comparable across queries; some APIs (Jina) return [0,1] normalized scores. Either way, rank *within* a query; don't threshold globally without calibration. See §17.6.
 
 - **AbortController** — modern JS cancellation primitive. One controller has one `signal`; pass the signal to any async API (fetch, SDK calls). Calling `.abort()` cascades to all consumers.
 - **Agentic loop** — application-side loop that repeatedly calls the model with growing message history until it returns content (no `tool_calls`). Each iteration may execute tools and append their results. Bounded by `MAX_ITERATIONS`. The "agent" is this loop plus sensible exit conditions; everything else (LangChain, Assistants API) is built on it.

@@ -9,6 +9,12 @@ import SearchIcon from "@mui/icons-material/Search";
 interface Props {
     value: string;
     onChange: (value: string) => void;
+    /**
+     * Fired on Enter. The instant title filter happens via onChange as the user
+     * types; Enter escalates to a SEMANTIC search across all transcript content
+     * (Phase 8.1). Two behaviors on one box: filter-as-you-type, search-on-Enter.
+     */
+    onSubmit?: (value: string) => void;
 }
 
 /**
@@ -16,7 +22,7 @@ interface Props {
  * so the parent doesn't have to. The shortcut is ignored while the user is
  * typing in any input/textarea/contenteditable so it never steals keystrokes.
  */
-export default function SidebarSearch({ value, onChange }: Props) {
+export default function SidebarSearch({ value, onChange, onSubmit }: Props) {
     const inputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
@@ -48,6 +54,9 @@ export default function SidebarSearch({ value, onChange }: Props) {
                 if (e.key === "Escape" && value) {
                     e.preventDefault();
                     onChange("");
+                } else if (e.key === "Enter" && value.trim() && onSubmit) {
+                    e.preventDefault();
+                    onSubmit(value.trim());
                 }
             }}
             placeholder="Search sessions…"
@@ -84,6 +93,11 @@ export default function SidebarSearch({ value, onChange }: Props) {
                     bgcolor: "action.hover",
                     "& fieldset": { border: "none" },
                 },
+                // type="search" makes the browser draw its OWN native clear (✕)
+                // button on top of our custom MUI clear button — two ✕ marks
+                // doing the same thing. Hide the native one; keep ours.
+                "& input[type=search]::-webkit-search-cancel-button": { display: "none" },
+                "& input[type=search]::-webkit-search-decoration": { display: "none" },
             }}
         />
     );
