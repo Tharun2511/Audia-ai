@@ -99,6 +99,9 @@ export default function SearchResults({ query, hits, loading, onClose, onOpenHit
                         const colorMap = buildColorMap(speakers);
                         const hasScore = Number.isFinite(hit.relevanceScore);
                         const pct = hasScore ? Math.round(hit.relevanceScore * 100) : null;
+                        // Which recall arm(s) surfaced this hit — "both" = found by
+                        // semantic AND keyword search (the strongest hybrid signal).
+                        const sourceLabel = hit.sources.length >= 2 ? "both" : hit.sources[0] ?? "";
 
                         return (
                             <ListItemButton
@@ -181,6 +184,21 @@ export default function SearchResults({ query, hits, loading, onClose, onOpenHit
                                                     <Box key={sp} sx={{ width: 6, height: 6, borderRadius: "50%", bgcolor: colorMap[sp] }} />
                                                 ))}
                                             </Stack>
+                                        </>
+                                    )}
+                                    {sourceLabel && (
+                                        <>
+                                            <Typography variant="caption" sx={{ fontSize: 10, color: "text.disabled" }}>·</Typography>
+                                            <Typography
+                                                variant="caption"
+                                                sx={{
+                                                    fontSize: 10,
+                                                    color: sourceLabel === "both" ? "primary.main" : "text.disabled",
+                                                    fontWeight: sourceLabel === "both" ? 600 : 400,
+                                                }}
+                                            >
+                                                {sourceLabel}
+                                            </Typography>
                                         </>
                                     )}
                                 </Stack>

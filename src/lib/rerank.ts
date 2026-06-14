@@ -151,3 +151,66 @@ export function maximalMarginalRelevance<T extends { embedding: number[] }>(
     // We've picked k items (or all available, whichever came first).
     return selected;
 }
+
+/**
+ * Reciprocal Rank Fusion (Cormack et al. 2009) — the fusion step of hybrid
+ * search (Phase 8.2).
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * THE PROBLEM IT SOLVES.
+ * ─────────────────────────────────────────────────────────────────────────
+ * Dense retrieval scores are cosine similarities (~0..1); lexical (BM25 /
+ * ts_rank) scores are unbounded and corpus-dependent. They live on
+ * INCOMPARABLE scales, so you can't just add them. Normalizing (min-max,
+ * z-score) is fiddly and distribution-sensitive.
+ *
+ * RRF sidesteps all of that by fusing on RANK, not score:
+ *
+ *     RRF(d) = Σ over lists  1 / (k + rank_list(d))            rank is 1-based
+ *
+ * Properties:
+ *   - SCALE-INVARIANT: only a document's POSITION in each list matters, so the
+ *     two systems' raw score magnitudes are irrelevant. (This is also why our
+ *     lexical arm doesn't need true BM25 — ts_rank_cd's ordering is all we use.)
+ *   - NO TUNING: k=60 is the field default and "just works"; the lists don't
+ *     even have to be related.
+ *   - REWARDS AGREEMENT: a doc ranked high in BOTH lists outscores one that's
+ *     #1 in only one. The k constant flattens the head so rank-1 doesn't
+ *     dominate (rank 1 → 1/61 ≈ 0.0164; rank 2 → 1/62 ≈ 0.0161).
+ *
+ * @param lists  named ranked lists (each already sorted best-first)
+ * @param keyFn  stable identity for an item (so the same chunk across lists fuses)
+ * @param k      smoothing constant; 60 is the standard default
+ */
+export type Fused<T> = T & {
+    rrfScore: number;
+    /** Which input lists contributed this item, e.g. ["semantic", "keyword"]. */
+    sources: string[];
+};
+
+export function reciprocalRankFusion<T>(
+    lists: { name: string; items: T[] }[],
+    keyFn: (item: T) => string,
+    k = 60,
+): Fused<T>[] {
+    const acc = new Map<string, { item: T; score: number; sources: Set<string> }>();
+
+    for (const { name, items } of lists) {
+        items.forEach((item, i) => {
+            const key = keyFn(item);
+            const rank = i + 1; // 1-based: the top item is rank 1, not 0
+            const contribution = 1 / (k + rank);
+            const existing = acc.get(key);
+            if (existing) {
+                existing.score += contribution;
+                existing.sources.add(name);
+            } else {
+                acc.set(key, { item, score: contribution, sources: new Set([name]) });
+            }
+        });
+    }
+
+    return [...acc.values()]
+        .map((e) => ({ ...e.item, rrfScore: e.score, sources: [...e.sources] }))
+        .sort((a, b) => b.rrfScore - a.rrfScore);
+}

@@ -49,3 +49,51 @@ Cross-encoder ≠ MMR. **MMR optimizes diversity** (anti-redundancy); **a cross-
 - **No automated eval yet** for search ranking — a Phase 8.2/6.3 follow-up would need labeled query→relevant-chunk pairs (RAGAS context precision/recall) to measure the lift numerically rather than by eye.
 - **Cross-transcript retrieval was already a primitive** — `findCandidateChunks` with no `transcriptionId` searches all the user's meetings. 8.1 added the precision stage + the UI; the recall query existed since 3.3.
 - **Deferred:** click-to-seek to the exact timestamp (currently opens the meeting; seeking needs lifting `seekTo` state into `SessionView` via a prop). MMR-then-rerank composition. Local-BGE option (no vendor).
+
+---
+
+## Session 8.2 — Hybrid search: BM25/lexical + dense, fused with RRF
+
+**Built in Audia:**
+- [src/lib/chunks.ts](../src/lib/chunks.ts) — new `findLexicalChunks(query, userEmail, {n})`: the **sparse/keyword arm** via Postgres full-text search (`websearch_to_tsquery` + `to_tsvector` + `ts_rank_cd`), ownership-filtered. Computed **inline** (no generated tsvector column / GIN index yet) — same "no premature indexing" stance as the deferred HNSW (3.3), and it dodges the TypeORM-synchronize-drops-orphan-column bug class. Documented the indexed-column upgrade path.
+- [src/lib/rerank.ts](../src/lib/rerank.ts) — new generic `reciprocalRankFusion(lists, keyFn, k=60)`: fuses ranked lists on **rank**, returns items tagged with `rrfScore` + `sources` (which arms found them).
+- [src/app/api/search/route.ts](../src/app/api/search/route.ts) — rewired to hybrid: `embed(q)` then **dense (`findSimilarChunks`) + lexical (`findLexicalChunks`) in parallel** → **RRF fuse** → cap to 30 → **cross-encoder rerank** (8.1) → titles. Response adds `sources` per hit + `arms` counts.
+- [SearchResults.tsx](../src/app/components/SearchResults.tsx) — shows a per-hit source tag (`semantic` / `keyword` / **`both`** highlighted in primary) so the hybrid behavior is visible.
+- `npx tsc --noEmit` clean. Query expansion taught as theory; implementation deferred.
+
+### Concept summary
+
+8.1 made ranking more **precise**; 8.2 makes retrieval **recall more**. The bridge insight: a cross-encoder can only re-rank what dense retrieval already surfaced — **you can't rerank a chunk that was never retrieved.** Dense (bi-encoder) search matches *meaning* but blurs rare exact tokens (IDs, codes, product names) into the topic vector; **lexical/BM25** search matches *exact terms* but is blind to paraphrase. Opposite blind spots → run both and fuse. BM25 scores by term frequency (with saturation, knob `k1`) × inverse document frequency × length-normalization (knob `b`); it's "sparse" because the representation is a mostly-zero vector over the vocabulary. The fusion problem: cosine (~0–1) and BM25 (unbounded) are incomparable scales, so you can't add them. **Reciprocal Rank Fusion** fuses on **rank** instead: `RRF(d) = Σ 1/(k + rank_list(d))`, `k=60` — scale-invariant, no tuning, and it rewards docs ranked high in *both* lists. Because RRF only uses ranks, the lexical arm doesn't need *true* BM25 — Postgres `ts_rank_cd` (not BM25) is fine; its only job is to order keyword hits, which is why losing ParadeDB's `pg_search` on Neon costs us nothing here. **Query expansion** (taught, not built) is the pre-retrieval recall lever: multi-query (LLM paraphrases → retrieve each → RRF-fuse), HyDE (embed a hypothetical answer, not the question), lexical synonym expansion — all trade an LLM call + drift risk for recall.
+
+### 5 most-likely interview questions
+
+1. **Q: You already had a cross-encoder reranker. Why add hybrid search?**
+   A: "Because reranking and hybrid fix different stages. The cross-encoder improves *precision* on the candidate set dense retrieval handed it — but it can't surface a chunk that was never retrieved. If a rare exact term like an error code or product name got blurred by the bi-encoder and ranked #340, no reranker saves it; that's a *recall* failure. Hybrid adds a lexical arm that nails exact terms, fusing it with dense so the candidate set is better *before* reranking. Recall upstream, precision downstream — they stack."
+
+2. **Q: Dense vs lexical — what does each miss?**
+   A: "Dense/embedding search matches meaning, so it finds paraphrase and synonyms — 'how did we feel about the launch' → 'the release went great' — but it blurs rare exact tokens into a topic vector, so IDs, error codes, acronyms, and product names slip. Lexical/BM25 is the mirror: it nails those exact tokens via term frequency × IDF, but it's blind to synonyms and meaning. Opposite blind spots, which is exactly why you fuse them."
+
+3. **Q: Why RRF instead of just adding or averaging the two scores?**
+   A: "Because the scores live on incomparable scales — cosine is roughly 0–1, BM25 is unbounded and corpus-dependent. Adding them lets one dominate arbitrarily; normalizing (min-max, z-score) is fiddly and distribution-sensitive. RRF fuses on *rank* instead of score: each doc gets Σ 1/(k+rank) across the lists, k≈60. It's scale-invariant — only position matters — needs no tuning, and rewards docs that rank high in *both* lists. That last property is the quality signal: agreement across two independent methods."
+
+4. **Q: You used Postgres full-text search, not real BM25. Doesn't that hurt quality?**
+   A: "Barely, because of RRF. ts_rank_cd isn't true BM25 — it lacks BM25's exact IDF/saturation behavior — but RRF fuses on *rank*, so the lexical arm's raw scores are thrown away; all I need is for it to *order* keyword hits sensibly, which FTS does. The win from the lexical arm is recall (catching exact-term matches dense missed), not its score calibration. True BM25 via ParadeDB's pg_search would be marginally better ordering, but it's unavailable on new Neon projects as of March 2026, and the RRF design makes the gap immaterial."
+
+5. **Q: What is query expansion and when would you reach for it?**
+   A: "Rewriting or augmenting the query before retrieval to bridge vocabulary gaps and boost recall. Forms: multi-query (LLM generates N paraphrases, retrieve each, RRF-fuse the lists), HyDE (have the LLM write a hypothetical answer and embed *that* — a fake answer sits closer to real answers in embedding space than the question does), and lexical synonym expansion. You reach for it when hybrid alone still misses — but each form adds an LLM call (latency + cost) and risks drift, so it's a recall lever, not a default."
+
+### Gotchas
+
+- **Reranking can't fix recall.** If both arms miss a chunk, it's gone — no downstream stage recovers it. Hybrid is the recall fix; reranking is precision.
+- **Never add raw dense + lexical scores.** Incomparable scales. Fuse on rank (RRF) or carefully normalize first.
+- **RRF rank is 1-based.** The top item is rank 1, not 0 (1/(60+0) would over-weight it).
+- **`websearch_to_tsquery`, not `to_tsquery`.** The former parses arbitrary user input safely (quotes, OR, negation) and never throws; `to_tsquery` throws on raw user text.
+- **Don't add a tsvector column carelessly under `synchronize: true`.** TypeORM may drop an orphan column it doesn't know about (the pgvector bug). Inline FTS, or put the generated column on the entity.
+- **Empty tsquery** (all stopwords) → zero lexical matches; the dense arm must still carry the result. Handled.
+
+### Operational notes
+
+- **Inline FTS, no index yet** — sequential ts match, fine at <10k chunks/user after the `userEmail` filter. Upgrade at scale: `tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED` column + GIN index.
+- **Verify the hybrid lift:** search an **exact term** that appears verbatim in a meeting but is phrased oddly (an error code, a name). Dense-only (8.1) might miss it; hybrid should surface it with a `keyword` or `both` tag. Search a **conceptual** phrase with different words → `semantic`. A great hit shows **`both`**.
+- **No automated eval yet** — needs labeled query→relevant-chunk pairs (RAGAS context recall) to measure the recall lift numerically.
+- **Deferred:** query expansion implementation (multi-query / HyDE); hybrid in the *chat* RAG path (currently chat is dense+MMR; same `findLexicalChunks` + RRF would drop in); generated tsvector column + GIN index at scale.

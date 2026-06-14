@@ -38,7 +38,7 @@
 
 **Part VII — Search**
 - [§17. Re-ranking with cross-encoders: bi-encoder vs cross-encoder, retrieve-and-rerank](#17-re-ranking-with-cross-encoders-bi-encoder-vs-cross-encoder-retrieve-and-rerank) ✅ *(Phase 8.1)*
-- §18. Hybrid search & query expansion *(Phase 8.2 — TBD)*
+- [§18. Hybrid search: BM25/lexical + dense, RRF fusion, query expansion](#18-hybrid-search-bm25lexical--dense-rrf-fusion-query-expansion) ✅ *(Phase 8.2)*
 
 **Part VIII — Speech**
 - §19. ASR architectures, Whisper, diarization *(Phase 9.1 — TBD)*
@@ -2896,10 +2896,117 @@ In chat, retrieval latency hid inside the time the LLM was already taking to gen
 
 ---
 
+## §18. Hybrid search: BM25/lexical + dense, RRF fusion, query expansion
+
+### 18.1 The whole game in one sentence
+
+> Dense search matches meaning but misses exact rare tokens; lexical/BM25 search matches exact tokens but misses meaning — so run both and fuse their *ranks* with Reciprocal Rank Fusion. That's hybrid search, and it fixes **recall**, which reranking (§17) cannot.
+
+### 18.2 The bridge from §17 — reranking can't fix recall
+
+§17's cross-encoder re-ranks the candidate set that dense retrieval handed it. Crucial limit:
+
+> **You cannot rerank a chunk that was never retrieved.**
+
+If the chunk containing `"ERR_CONNECTION_4012"` or the product name `"Voyager"` never entered the dense top-N — because the bi-encoder embedded that rare token into a fuzzy topic vector and ranked it #340 — then no reranker surfaces it. That's a **recall** failure. §17 improved **precision** on what recall found; §18 fixes recall itself. The two stack: better recall feeds the reranker a better pool.
+
+### 18.3 Two retrieval families, opposite blind spots
+
+**Dense (semantic) retrieval** — embeddings + cosine (bi-encoder, §17.2). Matches *meaning*: finds paraphrase/synonyms. Blurs rare exact tokens into the topic vector.
+
+**Lexical (sparse) retrieval — BM25** — bag-of-words keyword ranking. Matches *exact terms*: TF × IDF. Blind to synonyms/meaning. "Sparse" = the representation is a mostly-zero vector over the whole vocabulary, vs the dense embedding's ~768 packed floats.
+
+**📐 BM25 (depth optional; intuition required):**
+```
+score(D,Q) = Σ_t  IDF(t) · ( f(t,D)·(k1+1) ) / ( f(t,D) + k1·(1 − b + b·|D|/avgdl) )
+```
+- **IDF(t)** — rare terms weigh more ("Voyager" ≫ "the").
+- **f(t,D)** — term frequency, but **saturating** (knob `k1`≈1.2–2): the 10th occurrence adds far less than the 2nd; defeats keyword stuffing.
+- **b·|D|/avgdl** — **length normalization** (knob `b`≈0.75): long docs don't win just by being long.
+
+**⚖️ Complementary failure modes:**
+
+| Query | Dense | Lexical (BM25) |
+|---|---|---|
+| "how did we feel about the launch?" | ✅ "the release went great" | ❌ no shared words |
+| "ERR_CONNECTION_4012" | ❌ rare token blurred | ✅ exact top hit |
+| "Voyager pricing" (product name) | ⚠️ drifts to generic pricing | ✅ pins the name |
+| "concerns about timeline" | ✅ "worried we'll slip" | ❌ misses paraphrase |
+
+### 18.4 Reciprocal Rank Fusion (RRF)
+
+The fusion problem: cosine (~0–1) and BM25 (unbounded, corpus-dependent) live on **incomparable scales** — you can't add them, and normalizing is fiddly/distribution-sensitive. RRF fuses on **rank**:
+
+**📐 RRF (memorize):**
+```
+RRF(d) = Σ over lists  1 / (k + rank_list(d))          rank is 1-based, k ≈ 60
+```
+- **Scale-invariant** — only position matters, so the two systems' raw magnitudes are irrelevant.
+- **No tuning** — k=60 (Cormack et al. 2009) just works; the lists needn't be related.
+- **Rewards agreement** — high in *both* lists beats #1 in only one. k flattens the head (rank 1 → 1/61 ≈ 0.0164; rank 2 → 1/62 ≈ 0.0161) so the top isn't wildly dominant.
+
+**The load-bearing consequence for Audia:** because RRF uses *ranks*, the lexical arm needs only to **order** keyword hits well — not produce calibrated BM25 scores. So Postgres `ts_rank_cd` (which is *not* BM25) is perfectly fine, and losing ParadeDB's `pg_search` on Neon (unavailable for new projects, Mar 2026) costs nothing.
+
+Alternative fusion = **weighted score combination** (`α·norm(dense) + (1−α)·norm(lexical)`): needs per-distribution normalization + tuning α. RRF is the simpler, more robust production default.
+
+### 18.5 Query expansion (pre-retrieval recall lever)
+
+Augment/rewrite the query *before* retrieval to bridge vocabulary gaps:
+- **Multi-query** — LLM generates N paraphrases → retrieve each → RRF-fuse all lists.
+- **HyDE (Hypothetical Document Embeddings)** — LLM writes a *hypothetical answer*, embed *that*, search with it; a fake answer sits closer to real answers in embedding space than the question does.
+- **Lexical expansion** — add synonyms/related terms to the keyword query.
+
+Trade-off: recall ↑, but each adds an LLM call (latency + cost) and **drift** risk. A lever for when hybrid alone still misses — not a default. (Taught Phase 8.2; implementation deferred.)
+
+### 18.6 How it maps to Audia
+
+```
+query ──┬─► dense: findSimilarChunks (pgvector <=>)            → list A (meaning)
+        └─► lexical: findLexicalChunks (FTS ts_rank_cd)        → list B (exact terms)
+                          │  reciprocalRankFusion(k=60) on ranks
+                          ▼
+                    fused pool (≤30)
+                          ▼  crossEncoderRerank (§17, Jina)
+                       top-k ──► search UI (source tag: semantic / keyword / both)
+```
+- Lexical arm: `findLexicalChunks` in [chunks.ts](../src/lib/chunks.ts) — inline `websearch_to_tsquery`/`to_tsvector`/`ts_rank_cd`, no column/index yet (no-premature-indexing, §8 / 3.3).
+- Fusion: `reciprocalRankFusion` in [rerank.ts](../src/lib/rerank.ts).
+- Orchestration: [search/route.ts](../src/app/api/search/route.ts) — both arms in parallel → RRF → rerank → titles.
+
+### 18.7 🎯 Defense talking points
+
+- **"Why hybrid if you have a reranker?"** Recall vs precision. The reranker can't surface what recall missed; hybrid widens recall (exact-term matches) *before* reranking. They stack.
+- **"Why not just add the scores?"** Incomparable scales; one would dominate arbitrarily. RRF fuses on rank → scale-invariant, no tuning.
+- **"FTS isn't real BM25 — quality hit?"** Negligible: RRF uses ranks, so the lexical arm's raw scores are discarded; it only needs to *order* keyword hits. Its value is recall, not calibration.
+- **"When query expansion?"** When hybrid still misses (vocabulary mismatch). It buys recall at the cost of an LLM call + drift risk.
+
+### 18.8 ⚠️ Common pitfalls
+
+- Believing the reranker can recover a chunk recall never retrieved.
+- Adding raw dense + lexical scores (incomparable scales).
+- 0-based RRF rank (over-weights the top item).
+- `to_tsquery` on raw user input (throws) — use `websearch_to_tsquery`.
+- Adding a tsvector column under `synchronize: true` without entity awareness (orphan-drop bug).
+
+### 18.9 Glossary additions (land in Appendix A)
+
+- **Lexical / sparse retrieval (BM25)** — see §18.3.
+- **TF / IDF / saturation (k1) / length-norm (b)** — see §18.3.
+- **Reciprocal Rank Fusion (RRF)** — see §18.4.
+- **Hybrid search** — see §18.1.
+- **Query expansion / multi-query / HyDE** — see §18.5.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
 
+- **Hybrid search** — running dense (semantic) and lexical (keyword/BM25) retrieval together and fusing the results, to recall what neither gets alone. Fixes recall; complements the reranker's precision. See §18.
+- **BM25 / lexical (sparse) retrieval** — bag-of-words keyword ranking: TF (with saturation, knob k1) × IDF × length-normalization (knob b). Nails exact rare tokens (IDs, names, codes); blind to synonyms. "Sparse" = mostly-zero vector over the vocabulary. See §18.3.
+- **Reciprocal Rank Fusion (RRF)** — fuse multiple ranked lists by summing 1/(k+rank) per doc (k≈60, rank 1-based). Scale-invariant (uses ranks not scores), no tuning, rewards docs ranked high in multiple lists. See §18.4.
+- **Query expansion** — augmenting/rewriting the query before retrieval to boost recall: multi-query (LLM paraphrases + fuse), HyDE (embed a hypothetical answer), synonym expansion. Costs an LLM call + drift risk. See §18.5.
+- **HyDE (Hypothetical Document Embeddings)** — generate a fake answer with an LLM, embed THAT, and retrieve with it — a hypothetical answer sits closer to real answers in embedding space than the question. See §18.5.
 - **Bi-encoder** — retrieval architecture that embeds query and document *separately* into vectors and ranks by cosine. Document vectors are precomputable, so it scales to millions (ANN) — but query and document never interact, so it's lossy on negation, role-direction, and exact terms. Audia's pgvector retrieval. See §17.2.
 - **Cross-encoder (reranker)** — feeds query and one document *together* through a transformer in one pass, outputting a single relevance score. Far more precise than a bi-encoder (tokens attend across query/doc) but not precomputable → one forward pass per candidate, so usable only on a small candidate set. See §17.3.
 - **Retrieve-and-rerank** — two-stage retrieval: a bi-encoder recalls a coarse top-N from the whole corpus, then a cross-encoder re-scores those N to a precise top-k. The funnel makes the expensive precision stage affordable. The canonical production RAG retrieval pattern. See §17.4.

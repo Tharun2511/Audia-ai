@@ -255,3 +255,86 @@ export async function findCandidateChunks(
         };
     });
 }
+
+// ── Lexical (keyword) retrieval — the sparse arm of hybrid search (Phase 8.2) ──
+
+export type LexicalChunkResult = {
+    id: string;
+    transcriptionId: string;
+    chunkIndex: number;
+    text: string;
+    segmentIndices: number[];
+    speakers: string[];
+    startTime: number;
+    endTime: number;
+    /** Postgres ts_rank_cd score — used only for ordering this list; RRF fuses on rank, not this value. */
+    lexScore: number;
+};
+
+/**
+ * Keyword search over a user's chunks via Postgres full-text search — the
+ * complement to dense/semantic retrieval. Where dense search blurs rare exact
+ * tokens (IDs, codes, product names) into a topic vector, this nails them.
+ *
+ * Implementation note — NO generated tsvector column / GIN index (yet):
+ *   We compute `to_tsvector('english', text)` INLINE per query instead of
+ *   maintaining a `tsvector GENERATED ALWAYS AS (...) STORED` column + GIN
+ *   index. Two reasons:
+ *     1. Same "no premature indexing" stance as pgvector's deferred HNSW (3.3)
+ *        — at <10k chunks/user (pre-filtered by userEmail) a sequential ts
+ *        match is fast enough.
+ *     2. Avoids the synchronize-orphan-column bug class (TypeORM `synchronize`
+ *        drops columns it doesn't know about — exactly what bit the embedding
+ *        column once). A generated column derived from `text` would be safe to
+ *        drop+recreate, but inline sidesteps the churn entirely.
+ *   Production upgrade when scale demands: add the STORED tsvector column +
+ *   GIN index and swap `to_tsvector('english', text)` for that column.
+ *
+ * websearch_to_tsquery parses arbitrary user input SAFELY (quotes, OR, -neg)
+ * and never throws on weird input — unlike to_tsquery/plainto_tsquery. If the
+ * query is all stopwords it yields an empty tsquery → zero matches, which is
+ * fine (the dense arm still contributes).
+ */
+export async function findLexicalChunks(
+    query: string,
+    userEmail: string,
+    opts: { n?: number } = {},
+): Promise<LexicalChunkResult[]> {
+    const db = await getDatabase();
+    const n = opts.n ?? 30;
+
+    const rows = (await db.query(
+        `WITH q AS (SELECT websearch_to_tsquery('english', $1) AS query)
+         SELECT c.id, c."transcriptionId", c."chunkIndex", c.text,
+                c."segmentIndices", c.speakers, c."startTime", c."endTime",
+                ts_rank_cd(to_tsvector('english', c.text), q.query) AS lex_score
+         FROM transcript_chunk c, q
+         WHERE c."userEmail" = $2
+           AND to_tsvector('english', c.text) @@ q.query
+         ORDER BY lex_score DESC
+         LIMIT $3`,
+        [query, userEmail, n],
+    )) as Array<{
+        id: string;
+        transcriptionId: string;
+        chunkIndex: number;
+        text: string;
+        segmentIndices: number[];
+        speakers: string[];
+        startTime: number;
+        endTime: number;
+        lex_score: string | number;
+    }>;
+
+    return rows.map((r) => ({
+        id: r.id,
+        transcriptionId: r.transcriptionId,
+        chunkIndex: r.chunkIndex,
+        text: r.text,
+        segmentIndices: parseJsonColumn<number[]>(r.segmentIndices, []),
+        speakers: parseJsonColumn<string[]>(r.speakers, []),
+        startTime: r.startTime,
+        endTime: r.endTime,
+        lexScore: Number(r.lex_score),
+    }));
+}
