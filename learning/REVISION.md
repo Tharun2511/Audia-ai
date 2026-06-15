@@ -40,21 +40,27 @@
 - [§17. Re-ranking with cross-encoders: bi-encoder vs cross-encoder, retrieve-and-rerank](#17-re-ranking-with-cross-encoders-bi-encoder-vs-cross-encoder-retrieve-and-rerank) ✅ *(Phase 8.1)*
 - [§18. Hybrid search: BM25/lexical + dense, RRF fusion, query expansion](#18-hybrid-search-bm25lexical--dense-rrf-fusion-query-expansion) ✅ *(Phase 8.2)*
 
-**Part VIII — Speech**
-- §19. ASR architectures, Whisper, diarization *(Phase 9.1 — TBD)*
-- §20. Streaming ASR *(Phase 9.2 — TBD)*
+**Part VIII — Agent frameworks (LangChain / LangGraph)** *(inserted as Phase 9; original 9–12 shifted to 10–13)*
+- [§19. LangChain fundamentals & LCEL: components, Runnables, the framework map](#19-langchain-fundamentals--lcel-components-runnables-the-framework-map) ✅ *(Phase 9.1)*
+- §20. LangGraph core: StateGraph, nodes, edges, state & reducers *(Phase 9.2 — TBD)*
+- §21. The agentic graph: tool node, conditional routing, refactoring the chat agent *(Phase 9.3 — TBD)*
+- §22. Persistence, memory, human-in-the-loop & streaming *(Phase 9.4 — TBD)*
 
-**Part IX — Multimodal**
-- §21. Vision-language models, OCR *(Phase 10 — TBD)*
+**Part IX — Speech**
+- §23. ASR architectures, Whisper, diarization *(Phase 10.1 — TBD)*
+- §24. Streaming ASR *(Phase 10.2 — TBD)*
 
-**Part X — Fine-tuning**
-- §22. When to fine-tune *(Phase 11.1 — TBD)*
-- §23. Dataset preparation *(Phase 11.2 — TBD)*
-- §24. Running a fine-tune *(Phase 11.3 — TBD)*
+**Part X — Multimodal**
+- §25. Vision-language models, OCR *(Phase 11 — TBD)*
 
-**Part XI — Production AI Ops**
-- §25. Observability, prompt versioning, cost tracking *(Phase 12.1 — TBD)*
-- §26. Production hardening: caching, rate limiting, guardrails *(Phase 12.2 — TBD)*
+**Part XI — Fine-tuning**
+- §26. When to fine-tune *(Phase 12.1 — TBD)*
+- §27. Dataset preparation *(Phase 12.2 — TBD)*
+- §28. Running a fine-tune *(Phase 12.3 — TBD)*
+
+**Part XII — Production AI Ops**
+- §29. Observability, prompt versioning, cost tracking *(Phase 13.1 — TBD)*
+- §30. Production hardening: caching, rate limiting, guardrails *(Phase 13.2 — TBD)*
 
 **Appendices**
 - [A. Glossary](#appendix-a-glossary)
@@ -2998,10 +3004,76 @@ query ──┬─► dense: findSimilarChunks (pgvector <=>)            → lis
 
 ---
 
+## §19. LangChain fundamentals & LCEL: components, Runnables, the framework map
+
+### 19.1 The whole game in one sentence
+
+> LangChain is a toolkit of composable components + integrations wired by a uniform interface (LCEL/Runnables); it standardizes plumbing, not intelligence — and the skill is knowing *which layer* (primitives → LCEL → `createAgent` → `StateGraph`) a given job needs.
+
+### 19.2 What LangChain is (and isn't)
+
+Not a monolith, not intelligence. It's **components** (models, prompts, output parsers, retrievers, tools) + **hundreds of integrations**, composed by a uniform interface. Post-v1 (Oct 2025) packages:
+- **`@langchain/core`** — base abstractions + the `Runnable` interface (the contract everything implements).
+- **provider packages** (`@langchain/groq`, `@langchain/openai`, …) — one model API behind a common interface → swap providers in a line.
+- **`@langchain/langgraph`** — the orchestration runtime (§20+).
+- **`@langchain/community`** — long-tail integrations.
+
+Its value is **standardization**, not capability: it can't do anything the primitives can't; it makes the pieces snap together and the plumbing uniform.
+
+### 19.3 LCEL & the Runnable
+
+Every component implements **`Runnable`**: `.invoke()`, `.stream()`, `.batch()`. **LCEL** composes them with `.pipe()` — one's output feeds the next, and the chain is itself a Runnable:
+```ts
+const chain = prompt.pipe(model).pipe(parser);   // prompt → model → parse
+await chain.invoke({ transcript });               // .stream()/.batch() come free
+```
+The payoff: streaming, batching, retries, tracing come **uniformly** across any chain, no per-step wiring. The cost: a layer of indirection between you and the raw call. LCEL is the happy path for **linear** pipelines; the moment you need **loops/branches** (an agent), straight-line composition stops fitting and LangGraph takes over.
+
+### 19.4 🗺️ The framework map — which layer, when
+
+| Layer | Reach for it when |
+|---|---|
+| **Raw primitives** | full control, zero deps, learning, or a flow the framework fights |
+| **LangChain / LCEL** | a **linear pipeline**; want provider-swap + free stream/batch/trace |
+| **`createAgent`** | a **standard tool-using agent**, no custom control flow needed (runs *on* LangGraph) |
+| **LangGraph `StateGraph`** | need **mid-run state intercept, human-in-the-loop, conditional retries, multi-agent, persistence** |
+
+**Decision rule:** *Linear → LCEL · standard agent → `createAgent` · control the flow → `StateGraph` · full control/zero-deps → primitives.* `createAgent` and `StateGraph` aren't rivals — `createAgent` IS a prebuilt StateGraph you drop below when you outgrow it. The old `AgentExecutor` is deprecated (maint. until Dec 2026).
+
+### 19.5 The Audia A/B (what it proved)
+
+Re-expressed `summarizeTranscriptStructured` as an LCEL chain in [summarize-lc.ts](../src/lib/summarize-lc.ts): `ChatPromptTemplate.pipe(model.withStructuredOutput(schema, {method:"jsonMode"}))` — same model, prompt, json-mode, Zod schema (reused from ai.ts). `npm run eval:lc-compare` on the golden set: **equivalent output** (budget/greeting identical, hiring same-shape). ~25 lines of hand-rolled parse/validate collapsed to a 2-step pipe. The cost showed up live: the LCEL call **bypassed `logUsage`** (the library owns the request → custom observability is lost; you'd wire LangSmith/callbacks).
+
+### 19.6 🎯 Defense talking points
+
+- **"Is LangGraph replacing LangChain?"** No — layered. LangChain = components/integrations/LCEL/`createAgent`; LangGraph = the `StateGraph` runtime underneath. `createAgent` runs on LangGraph; the deprecated `AgentExecutor` is what LangGraph replaced.
+- **"Why use LangChain if it just matches your primitive?"** It's a *wiring* choice, not a capability one. Value = uniform stream/batch/trace + provider-swap + ecosystem at scale; cost = dependency + indirection + lost custom instrumentation. For one hand-tuned call, the primitive is clearer.
+- **"When drop from `createAgent` to `StateGraph`?"** When you need mid-run state intercept, human approval, conditional retries, or multi-agent — `createAgent`'s fixed loop stops fitting.
+
+### 19.7 ⚠️ Common pitfalls
+
+- Curly braces in a `ChatPromptTemplate` (literal JSON `{}`) parsed as variables — use a fixed `SystemMessage` or `{{ }}`.
+- `withStructuredOutput` default is `functionCalling`; use `{method:"jsonMode"}` to match a `response_format:json_object` provider feature.
+- Assuming the framework sees your custom instrumentation — it owns the call now (`logUsage` bypassed); move to LangSmith/callbacks.
+- Reaching for the framework reflexively — primitives-first; adopt LCEL when many chains / provider-swap / ecosystem justify it.
+
+### 19.8 Glossary additions (land in Appendix A)
+
+- **LangChain (components + LCEL)** — see §19.2.
+- **Runnable / LCEL** — see §19.3.
+- **The framework map (primitives / LCEL / createAgent / StateGraph)** — see §19.4.
+- **withStructuredOutput (jsonMode vs functionCalling)** — see §19.5.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
 
+- **LangChain** — toolkit of composable components (models/prompts/parsers/retrievers/tools) + integrations, wired by LCEL. Standardizes plumbing, not capability. `@langchain/core` holds the abstractions; provider packages, `@langchain/langgraph`, `@langchain/community` extend it. See §19.2.
+- **LCEL / Runnable** — every component implements `Runnable` (.invoke/.stream/.batch); `.pipe()` composes them and the chain is itself a Runnable, so stream/batch/retry/trace come uniformly. See §19.3.
+- **The framework map** — primitives (full control) → LCEL (linear pipelines) → `createAgent` (standard agent, runs on LangGraph) → `StateGraph` (control the agent flow). Drop a layer only when the one above stops fitting. See §19.4.
+- **createAgent vs AgentExecutor** — `createAgent` (LangChain v1) is the agent factory built ON LangGraph; the old `AgentExecutor` is deprecated (maint. until Dec 2026). See §19.4.
 - **Hybrid search** — running dense (semantic) and lexical (keyword/BM25) retrieval together and fusing the results, to recall what neither gets alone. Fixes recall; complements the reranker's precision. See §18.
 - **BM25 / lexical (sparse) retrieval** — bag-of-words keyword ranking: TF (with saturation, knob k1) × IDF × length-normalization (knob b). Nails exact rare tokens (IDs, names, codes); blind to synonyms. "Sparse" = mostly-zero vector over the vocabulary. See §18.3.
 - **Reciprocal Rank Fusion (RRF)** — fuse multiple ranked lists by summing 1/(k+rank) per doc (k≈60, rank 1-based). Scale-invariant (uses ranks not scores), no tuning, rewards docs ranked high in multiple lists. See §18.4.

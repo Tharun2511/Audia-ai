@@ -9,12 +9,15 @@
     "lint": "eslint",
     "eval": "node --import tsx --conditions=react-server --env-file=.env src/evals/summary.eval.ts",
     "eval:chat": "node --import tsx --conditions=react-server --env-file=.env src/evals/chat.eval.ts",
-    "eval:all": "npm run eval && npm run eval:chat"
+    "eval:all": "npm run eval && npm run eval:chat",
+    "eval:lc-compare": "node --import tsx --conditions=react-server --env-file=.env src/evals/compare-lc.ts"
   },
   "dependencies": {
     "@deepgram/sdk": "^5.0.0",
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
+    "@langchain/core": "^1.1.49",
+    "@langchain/groq": "^1.2.1",
     "@mui/icons-material": "^9.0.0",
     "@mui/material": "^9.0.0",
     "@mui/material-nextjs": "^9.0.0",
