@@ -43,3 +43,46 @@ LangChain is **not a monolith and not intelligence** — it's a toolkit of compo
 - **Run the A/B:** `npm run eval:lc-compare` — primitive vs LCEL on 3 golden cases. Equivalent output confirms it's a wiring change.
 - **Deferred to 9.2+:** LangGraph (`@langchain/langgraph`) — StateGraph core (9.2), refactor the chat agent (9.3), persistence/HITL/streaming (9.4).
 - **Decision rule to memorize:** *Linear → LCEL · standard agent → `createAgent` · control the flow → `StateGraph` · full control/zero-deps → primitives.*
+
+---
+
+## Session 9.2 — LangGraph core: StateGraph, nodes, edges, state & reducers
+
+**Built in Audia:**
+- Installed `@langchain/langgraph` (^1.4.2).
+- New [src/lib/chat-graph.ts](../src/lib/chat-graph.ts) — Audia's chat agent as a `StateGraph` **skeleton**: `ChatState` via `Annotation.Root` (a `messages` channel with an **append reducer** + a `question` channel with default/overwrite); STUB `model` + `tools` nodes; `shouldContinue` conditional edge; back-edge `tools → model` (the cycle). Compiled, runnable. 9.3 swaps stubs for the real model + AUDIA_TOOLS.
+- New [src/evals/chat-graph-demo.ts](../src/evals/chat-graph-demo.ts) + `npm run graph:demo`. **Ran clean:** node firings `model → tools → model`; final messages `human → ai(tool_calls=listMyMeetings) → tool → ai(answer)` — the conditional cycle + append reducer, visible. `tsc` clean.
+
+### Concept summary
+
+LangGraph is the runtime for what LCEL **can't** express — loops and branches. A **`StateGraph`** is nodes (units of work) + edges (control flow) + a typed **State** threaded through every node. A **node** is `(state) => Partial<State>`: it reads state, does work, and returns *only the keys it changes* — it never mutates state directly. An **edge** wires A→B unconditionally; a **conditional edge** runs a router on the state and picks the next node — this is how you get branching and the **cycle** (a back-edge `tools → model`). `START`/`END` are entry/exit. The genuinely new piece is **state channels + reducers**: each State key is a channel, and its **reducer** defines how a node's partial update merges — default is **overwrite**, but a `messages` channel uses an **append** reducer so returning `{ messages: [turn] }` concatenates (the declarative form of `messages.push()`; `MessagesAnnotation` is the prebuilt version, which also de-dupes by id). The cycle needs a bound — **`recursionLimit`** is LangGraph's `MAX_TOOL_ITERATIONS`. The 1:1 map to the hand-rolled loop: `messages[]`+`.push()` → messages channel + append reducer; `while(iter<MAX)` → back-edge + recursionLimit; `if(toolCalls) else break` → conditional edge; `dispatchTool` then push → the tools node returning `{messages:[...]}`. Why bother when the loop works: the flow is **declared not buried** (readable/inspectable), you can **stream per-node**, and — the real payoff (9.4) — you can **checkpoint the State and interrupt at a node** (persistence + human-in-the-loop), which a raw `while`-loop can't give you cleanly.
+
+### 5 most-likely interview questions
+
+1. **Q: What's a StateGraph, in one breath?**
+   A: "Nodes + edges + a shared typed state. Nodes are functions that read the state and return a partial update; edges declare what runs next; a conditional edge branches on the state, which is how you get loops. You compile the graph and invoke or stream it. It's a state machine for an agent — the control flow is declared as a graph instead of buried in an imperative loop."
+
+2. **Q: What's a reducer and why does it matter?**
+   A: "Each key in the state is a channel, and its reducer defines how a node's partial update merges into it. The default is overwrite — last write wins. For a message list you want append, so the reducer concatenates: a node returns `{ messages: [newTurn] }` and the reducer does the push. That's the formalization of 'how does this turn get added to history' — in my hand-rolled loop I called `messages.push()` manually; the reducer makes it declarative and automatic every iteration."
+
+3. **Q: How does a graph express a loop? Isn't a graph acyclic?**
+   A: "Not in LangGraph — it allows cycles deliberately. The loop is a back-edge: my model node has a conditional edge that routes to a tools node when the model emits tool calls, and the tools node has an edge straight back to the model. That `tools → model` back-edge is the cycle — it's exactly my `while (tool_calls) { execute; loop }`. The `recursionLimit` bounds it, same role as `MAX_TOOL_ITERATIONS`, so a model that never stops calling tools throws instead of spinning forever."
+
+4. **Q: You already had a working loop. Why rewrite it as a graph?**
+   A: "Three reasons, and the third is the real one. First, the control flow is declared as a graph instead of tangled in imperative branches — readable and inspectable. Second, I can stream per-node and visualize it. Third — and this is what a raw loop can't give cleanly — the state is a first-class object the runtime owns, so I can checkpoint it per conversation thread (persistence/memory for free) and interrupt the graph mid-run for human approval, then resume. That's Phase 9.4. For a simple loop the graph is overhead; it earns its keep when you need those runtime features."
+
+5. **Q: A node returns `{ messages: [x] }` — does that replace the whole state?**
+   A: "No. A node returns only the channels it wants to change, and each channel's reducer merges the update. For `messages` with an append reducer, returning `{ messages: [x] }` appends x; the `question` channel is untouched. That partial-update-plus-reducer model is why nodes compose cleanly — they don't need to know or reconstruct the full state, just declare their delta."
+
+### Gotchas
+
+- **Default reducer overwrites.** Forget to set an append reducer on `messages` and each node *replaces* the history instead of extending it. Use `MessagesAnnotation` or an explicit `concat` reducer.
+- **Nodes return deltas, not full state.** Return only changed channels; the reducer merges. Returning the whole state (or mutating `state` in place) fights the model.
+- **Cycles need `recursionLimit`.** A back-edge with no bound + a model that keeps calling tools = infinite loop. Set the limit (= your MAX_TOOL_ITERATIONS).
+- **Conditional-edge return values must map to real targets.** `shouldContinue` returns `"tools"`/`"end"`; the `pathMap` `{tools:"tools", end:END}` maps those to nodes/END. A typo routes nowhere.
+
+### Operational notes
+
+- **Run it:** `npm run graph:demo` — prints node firings (`model→tools→model`) + the accumulated messages. Stubbed, no API key.
+- **9.3 turns the skeleton real:** model node → llama-3.3-70b with `AUDIA_TOOLS`; tools node → `dispatchTool`; wire to `/api/chat-graph` as a parallel route; A/B vs the primitive loop.
+- **`MessagesAnnotation`** is the prebuilt messages channel (append + de-dupe by id). We spelled the reducer out by hand for visibility; 9.3 may switch to the prebuilt.
