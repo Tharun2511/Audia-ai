@@ -132,3 +132,55 @@ Turning 9.2's stub skeleton real is three swaps: the model node becomes **`ChatG
 - **A/B the real thing:** POST `/api/chat-graph` (`{question, mode:"explicit"|"react"}`) vs `/api/chat` with a meeting-entity question, under `next dev`. Same tool fires.
 - **Scope:** agentic loop only — no RAG/memory/streaming in the graph route (orthogonal). A retrieve node would slot upstream of the model node. Streaming + persistence are 9.4.
 - **The primitive `/api/chat` is untouched** — "built it by hand AND as a graph," A/B-able, interview-ready.
+
+---
+
+## Session 9.4 — Persistence, memory & human-in-the-loop
+
+**Built in Audia:**
+- [chat-graph-agent.ts](../src/lib/chat-graph-agent.ts) — module-level `MemorySaver` checkpointer; `buildChatGraph` compiles with `{ checkpointer }`, `buildReactAgent` with `checkpointSaver`. The agent now has memory.
+- [/api/chat-graph route](../src/app/api/chat-graph/route.ts) — accepts/mint `sessionId`, passes it as `thread_id`, returns it. Follow-ups on the same `sessionId` remember prior turns.
+- [chat-graph-memory-demo.ts](../src/evals/chat-graph-memory-demo.ts) + `npm run graph:memory-demo`. **Ran live:** memory (Q2 "how long was the first one?" answered from Q1's context on the same thread; a fresh thread couldn't and looped to the cap) + interrupt (paused on `invoke`, resumed with `Command({resume})`). `tsc` clean.
+
+### Concept summary (definition · types · example)
+
+The 9.3 agent had amnesia (each request blank). 9.4 fixes it and unlocks pause/resume — all from one fact: the runtime owns a **durable State**.
+
+- **Checkpointer** — *Def:* snapshots the graph's full State after each step and persists it, so a later run loads + continues. *Types:* `MemorySaver` (RAM, dev), `SqliteSaver`, `PostgresSaver` (durable, prod). *Ex:* `graph.compile({ checkpointer: new MemorySaver() })`.
+- **Thread (`thread_id`)** — *Def:* a string id for one conversation; the checkpointer keys State by it. *Type:* a config value `{ configurable: { thread_id } }`. *Ex:* `invoke(input, { configurable: { thread_id: "user42-chat1" } })` — same id shares memory; = Phase-5 `sessionId`.
+- **Interrupt / HITL** — *Def:* pause mid-run for human input, resume from the saved checkpoint with that input. Needs a checkpointer. *Types:* dynamic `interrupt(payload)` inside a node; static `interruptBefore`/`interruptAfter` at compile. *Ex:* node runs `const ok = interrupt("Delete? yes/no")` → pauses; `invoke(new Command({ resume: "yes" }), {configurable:{thread_id}})` → `ok` = "yes".
+- **Streaming modes** — *Def:* how to watch a run live. *Types:* `values` (full state/step), `updates` (per-node deltas), `messages` (LLM tokens), `custom`. *Ex:* `graph.stream(input, { streamMode: "messages", configurable: { thread_id } })`.
+
+It replaces hand-built [chat-memory.ts](../src/lib/chat-memory.ts): the checkpointer auto-saves the **whole** State per thread (vs your manual save/load of the last-N window), and HITL + streaming fall out of the same durable-State machinery — none of which a raw `while`-loop gives cleanly.
+
+### 5 most-likely interview questions
+
+1. **Q: How does a LangGraph agent get conversation memory?**
+   A: "A checkpointer plus a thread_id. You compile the graph with a checkpointer — MemorySaver for dev, PostgresSaver in prod — and pass a thread_id in the config on every invoke. After each step the checkpointer snapshots the full State; the next invoke on the same thread_id loads it and continues, so follow-ups like 'how long was the first one?' resolve against the earlier turn. It replaces hand-rolled save/load, and it persists the whole state, not just a trimmed window."
+
+2. **Q: Checkpointer memory vs the rolling-buffer you hand-built earlier — difference?**
+   A: "My hand-built memory (chat-memory.ts) was manual: I wrote the save on each turn, the load of the last N turns, and managed the session id. The checkpointer is automatic and saves the entire State per thread, not a trimmed window — so I don't lose older context, and I don't write persistence code. The trade-off is it's the framework's format in the framework's store; with PostgresSaver it's still my Neon DB, but the schema is LangGraph's, not mine."
+
+3. **Q: What is a human-in-the-loop interrupt, and why does it need persistence?**
+   A: "It's pausing the graph mid-run to wait for a human — e.g. approve a delete — then resuming. It needs persistence because pausing means the run's State has to survive between two separate requests: the one that hit the interrupt and the later one that resumes. The checkpointer saves the State at the interrupt; you resume by re-invoking with a Command carrying the human's answer, which becomes the return value of the interrupt() call inside the node. No durable State, no pause-and-resume — which is why a plain in-memory loop can't do it cleanly."
+
+4. **Q: How do you actually trigger and resume an interrupt in LangGraph.js?**
+   A: "Inside a node you call `interrupt(payload)` — it throws control back out, and the invoke returns with an `__interrupt__` field describing what's needed. The graph state is checkpointed at that point. To resume, you invoke the same graph with the same thread_id but pass `new Command({ resume: value })` — LangGraph re-enters the interrupted node, and this time `interrupt()` returns `value` instead of pausing. I demoed exactly this: invoke paused with the approval prompt, `Command({resume:'yes'})` resumed it and the node saw 'yes'."
+
+5. **Q: The graph forgot context once and just looped — what happened?**
+   A: "On a fresh thread with no memory, I asked 'how long was the first one?' — there was no 'first one' in context, so the model kept re-calling the list tool trying to resolve the reference and hit the recursion limit. Two lessons: memory is load-bearing for referential follow-ups, and the recursion limit is the safety net that stopped an unbounded loop. The fix for the loop specifically is the same thread/checkpointer memory, plus optionally a repeated-call guard."
+
+### Gotchas
+
+- **Checkpointer must outlive the request.** A per-request `new MemorySaver()` won't persist across turns — use a module-level singleton (dev) or PostgresSaver (prod).
+- **No memory → referential follow-ups loop.** Without the prior turn, "the first one" is unresolvable; the model flails to the recursion cap. The cap is the safety net.
+- **`thread_id` is mandatory for memory.** Forget it and every turn is a fresh conversation even with a checkpointer attached.
+- **Interrupt requires a checkpointer.** No durable State → nowhere to pause; `interrupt()` can't resume.
+- **MemorySaver is RAM-only.** Restart = memory gone. Ship `PostgresSaver`.
+
+### Operational notes
+
+- **Run it:** `npm run graph:memory-demo` (real model, stub tools, MemorySaver) — memory + interrupt, no DB.
+- **In the route:** `/api/chat-graph` now takes/returns `sessionId`; same id = continued conversation. (MemorySaver singleton persists within `next dev`; swap to PostgresSaver for production durability.)
+- **Deferred:** PostgresSaver (durable, same Neon DB); streaming the graph response token-by-token (`streamMode:"messages"`) to match `/api/chat`'s live typing; a real HITL approval flow in the route + UI (the demo proves the mechanism).
+- **Phase 9 COMPLETE** — LangChain (LCEL) + LangGraph (StateGraph, agent, persistence/HITL). The chat agent exists hand-rolled AND as a graph, A/B-able.

@@ -1,9 +1,18 @@
 import "server-only";
 import { ChatGroq } from "@langchain/groq";
 import { AIMessage, BaseMessage, SystemMessage } from "@langchain/core/messages";
-import { StateGraph, START, END, MessagesAnnotation } from "@langchain/langgraph";
+import { StateGraph, START, END, MessagesAnnotation, MemorySaver } from "@langchain/langgraph";
 import { ToolNode, createReactAgent } from "@langchain/langgraph/prebuilt";
 import { buildAudiaTools } from "./agent-tools-lc";
+
+/**
+ * Phase 9.4 — the checkpointer. A module-level singleton so the saved State
+ * survives ACROSS requests (each request rebuilds the graph for per-user tools,
+ * but they all share this saver). MemorySaver = RAM (fine for dev; lost on
+ * restart). Production swap: PostgresSaver on the same Neon DB — one line.
+ * The graph is keyed by thread_id at invoke time, so conversations stay separate.
+ */
+const checkpointer = new MemorySaver();
 
 /**
  * Phase 9.3 — Audia's chat agent as a REAL LangGraph agent, built TWO ways:
@@ -33,7 +42,8 @@ export const AGENT_SYSTEM_PROMPT =
 export function buildReactAgent(userEmail: string) {
     const tools = buildAudiaTools(userEmail);
     const llm = new ChatGroq({ apiKey: process.env.GROQ_API_KEY, model: MODEL, temperature: 0.2 });
-    return createReactAgent({ llm, tools, prompt: AGENT_SYSTEM_PROMPT });
+    // checkpointSaver gives the prebuilt agent the same per-thread memory.
+    return createReactAgent({ llm, tools, prompt: AGENT_SYSTEM_PROMPT, checkpointSaver: checkpointer });
 }
 
 // ── The control path: the explicit StateGraph (9.2's skeleton, now real) ────
@@ -64,7 +74,7 @@ export function buildChatGraph(userEmail: string) {
         .addEdge(START, "model")
         .addConditionalEdges("model", shouldContinue, { tools: "tools", end: END })
         .addEdge("tools", "model") // the back-edge = the cycle
-        .compile();
+        .compile({ checkpointer }); // ← persist State per thread_id (Phase 9.4)
 }
 
 /** Extract the final text answer + the names of every tool the run fired. */

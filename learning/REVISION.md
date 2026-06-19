@@ -44,7 +44,7 @@
 - [§19. LangChain fundamentals & LCEL: components, Runnables, the framework map](#19-langchain-fundamentals--lcel-components-runnables-the-framework-map) ✅ *(Phase 9.1)*
 - [§20. LangGraph core: StateGraph, nodes, edges, state & reducers](#20-langgraph-core-stategraph-nodes-edges-state--reducers) ✅ *(Phase 9.2)*
 - [§21. The agentic graph: bindTools, ToolNode, createReactAgent vs explicit StateGraph](#21-the-agentic-graph-bindtools-toolnode-createreactagent-vs-explicit-stategraph) ✅ *(Phase 9.3)*
-- §22. Persistence, memory, human-in-the-loop & streaming *(Phase 9.4 — TBD)*
+- [§22. Persistence, memory, human-in-the-loop & streaming](#22-persistence-memory-human-in-the-loop--streaming) ✅ *(Phase 9.4)*
 
 **Part IX — Speech**
 - §23. ASR architectures, Whisper, diarization *(Phase 10.1 — TBD)*
@@ -3059,6 +3059,10 @@ Re-expressed `summarizeTranscriptStructured` as an LCEL chain in [summarize-lc.t
 
 ### 19.8 Glossary additions (land in Appendix A)
 
+- **Checkpointer** — component that snapshots + persists the graph's full State after each step so a later run resumes it. `MemorySaver` (RAM/dev), `PostgresSaver` (durable/prod). Compiled in via `.compile({ checkpointer })`. See §22.3.
+- **thread_id** — string id for one conversation; the checkpointer keys saved State by it (`{ configurable: { thread_id } }`). Same id = continued conversation. = Phase-5 sessionId. See §22.3.
+- **Interrupt / human-in-the-loop / Command(resume)** — `interrupt(payload)` in a node pauses + persists the run; `invoke(new Command({resume}), {thread})` re-enters and `interrupt()` returns the resume value. Needs a checkpointer. See §22.3.
+- **Streaming modes** — `values` (full state/step), `updates` (per-node deltas), `messages` (LLM tokens), `custom`. See §22.3.
 - **bindTools / ToolNode** — `model.bindTools(tools)` lets the model emit tool_calls (wrapper over Groq's `tools:` param); `ToolNode(tools)` is a prebuilt node that executes the last AI message's tool_calls → ToolMessages. See §21.2.
 - **Tool-format bridge** — wrapping OpenAI/Groq JSON-schema tool specs as runnable LangChain `tool()` objects (execute fn calls `dispatchTool`) so LangGraph can use them. See §21.3.
 - **createReactAgent** — one call that builds a prebuilt agent StateGraph (model + ToolNode + conditional cycle); identical to the explicit graph (proven). Drop to explicit StateGraph to customize flow. See §21.4.
@@ -3193,6 +3197,54 @@ Live demo: **both produced byte-identical answers** — `createReactAgent` IS a 
 - **bindTools / ToolNode** — see §21.2.
 - **Tool-format bridge** — see §21.3.
 - **createReactAgent (is a prebuilt StateGraph)** — see §21.4.
+
+---
+
+## §22. Persistence, memory, human-in-the-loop & streaming
+
+### 22.1 The whole game in one sentence
+
+> Give the graph a checkpointer and a thread_id and it gains conversation memory for free; because the State is now durable, the same machinery also lets the graph pause for a human (interrupt) and resume later — none of which a raw in-memory loop does cleanly.
+
+### 22.2 The problem
+
+The 9.3 agent had amnesia — each request started blank, so referential follow-ups ("how long was *the first one*?") failed. The hand-built [chat-memory.ts](../src/lib/chat-memory.ts) fixed this manually (save each turn, load last-N). 9.4 fixes it with one component, and gets pause/resume thrown in.
+
+### 22.3 The four pieces (definition · types · example)
+
+- **Checkpointer** — *Def:* snapshots the graph's full State after each step and persists it, so a later run loads + continues. *Types:* `MemorySaver` (RAM/dev), `SqliteSaver`, `PostgresSaver` (durable/prod). *Ex:* `graph.compile({ checkpointer: new MemorySaver() })`.
+- **Thread (`thread_id`)** — *Def:* string id for one conversation; checkpointer keys State by it. *Type:* config value `{ configurable: { thread_id } }`. *Ex:* `invoke(input, { configurable: { thread_id: "u42-c1" } })`. (= Phase-5 `sessionId`.)
+- **Interrupt / HITL** — *Def:* pause mid-run for human input, resume from the checkpoint with it. Needs a checkpointer. *Types:* dynamic `interrupt(payload)` in a node; static `interruptBefore`/`interruptAfter` at compile. *Ex:* `const ok = interrupt("Delete? y/n")` pauses; `invoke(new Command({resume:"yes"}), {configurable:{thread_id}})` → `ok="yes"`.
+- **Streaming modes** — *Def:* how to watch a run live. *Types:* `values` / `updates` / `messages` / `custom`. *Ex:* `graph.stream(input, { streamMode: "messages", configurable: { thread_id } })`.
+
+### 22.4 Why this is the payoff (answers "why a graph at all")
+
+All four come from one fact: **the runtime owns a durable State.** Memory = save/load State by thread. HITL = pause with State saved, resume later (the two requests — pause and resume — only connect because the State survived between them). Streaming = watch the State evolve. A `while`-loop's state dies with the request, so it gets none of these without serious custom plumbing. This is the concrete answer to "why rewrite a working loop as a graph."
+
+### 22.5 What ran
+
+`npm run graph:memory-demo` (real `llama-3.3-70b`, stub tools, `MemorySaver`): thread `t1` Q2 "how long was the first one?" → answered from Q1's context (memory ✓); a fresh thread couldn't resolve it and looped to the recursion cap (proof the memory was load-bearing); interrupt paused on `invoke` and resumed via `Command({resume:"yes"})` (HITL ✓). Wired into [/api/chat-graph](../src/app/api/chat-graph/route.ts) via `sessionId`→`thread_id`. MemorySaver singleton (dev); PostgresSaver is the prod swap.
+
+### 22.6 🎯 Defense talking points
+
+- **"How does the agent remember?"** Checkpointer + thread_id: compile with a saver, pass thread_id per invoke; State auto-saved/loaded per thread. Whole State, not a trimmed window — unlike the hand-rolled buffer.
+- **"Why does HITL need persistence?"** Pause and resume are two separate requests; the run's State must survive between them. The checkpointer makes it durable; resume re-invokes with a `Command({resume})`. No durable State → no clean pause/resume.
+- **"checkpointer vs your chat-memory.ts?"** Automatic + full-state vs manual + last-N window. Trade-off: it's LangGraph's schema/store (PostgresSaver still on Neon).
+
+### 22.7 ⚠️ Common pitfalls
+
+- Per-request `new MemorySaver()` (doesn't persist) — use a singleton / PostgresSaver.
+- Missing `thread_id` → no memory even with a checkpointer attached.
+- No memory → referential follow-ups loop to the recursion cap.
+- Interrupt without a checkpointer → can't pause/resume.
+- `MemorySaver` is RAM-only → ship `PostgresSaver`.
+
+### 22.8 Glossary additions (land in Appendix A)
+
+- **Checkpointer (MemorySaver / PostgresSaver)** — see §22.3.
+- **thread_id** — see §22.3.
+- **Interrupt / human-in-the-loop / Command(resume)** — see §22.3.
+- **Streaming modes (values/updates/messages)** — see §22.3.
 
 ---
 

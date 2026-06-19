@@ -483,3 +483,20 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - DB-backed `/api/chat-graph` verified by `tsc` only; browser/curl A/B vs `/api/chat` pending Tharun (needs `next dev`).
   - Repeated-tool-call fingerprint suppression still unbuilt (7.2 carry-forward, observed live here).
   - **NEXT: Phase 9.4 — persistence, memory, human-in-the-loop & streaming** (where the explicit graph earns its keep). THEORY-HEAVY per the course-correction. See [[audia_ai_progress]].
+
+---
+
+**2026-06-05 · Phase 9.4 — Persistence, memory & human-in-the-loop · 🧩 PHASE 9 COMPLETE**
+- **New teaching format applied** (per [[feedback_teach_theory_before_code]] update): every topic as **Definition · Type(s) · small real example**, minimal analogy, and **theory + code in ONE response**. Tharun set this after the 9.1–9.3 too-implementation-heavy stretch + the (over-corrected) too-analogy-heavy re-teach.
+- Covered (def/type/example each): **checkpointer** (MemorySaver/SqliteSaver/PostgresSaver; `.compile({checkpointer})`), **thread_id** (config string; `{configurable:{thread_id}}`; = Phase-5 sessionId), **interrupt/HITL** (dynamic `interrupt()` in-node vs static interruptBefore/After; resume via `new Command({resume})`; needs a checkpointer), **streaming modes** (values/updates/messages/custom). The unifying point: all four fall out of the runtime owning a **durable State** — the concrete answer to "why a graph over a while-loop" (the Q4 he got backwards in 9.2).
+- Built: `MemorySaver` singleton in [chat-graph-agent.ts](../src/lib/chat-graph-agent.ts) (`compile({checkpointer})` + `checkpointSaver` on createReactAgent); [/api/chat-graph](../src/app/api/chat-graph/route.ts) now takes/returns `sessionId`→`thread_id`; [chat-graph-memory-demo.ts](../src/evals/chat-graph-memory-demo.ts) + `npm run graph:memory-demo`. `tsc` clean.
+- **Verified live (real llama-3.3-70b, stub tools):** memory — thread t1 Q2 "how long was the first one?" → "JavaScript Engine Overview, 1 min 6 sec" (remembered Q1); fresh thread couldn't resolve it and **looped to the recursion cap** (vivid proof memory was load-bearing — caught + framed); interrupt — `invoke` PAUSED with the approval payload, `Command({resume:"yes"})` resumed → `approved="yes"`.
+- **🎯 Emergent teaching moment:** the no-memory recursion-cap crash. Without the prior turn, the model re-called the tool trying to resolve "the first one" until `recursionLimit=8` threw. Two lessons surfaced naturally: memory is load-bearing for referential follow-ups, and the recursion limit is the safety net. (Repeated-call fingerprint, the 7.2 carry-forward, would also catch it.)
+- **NO quiz/Feynman again** — consistent with the format pivot (theory+code in one response); not forced. Offered as optional.
+- **🧩 PHASE 9 COMPLETE (9.1–9.4):** LangChain/LCEL + LangGraph (StateGraph core → real agent → persistence/HITL). Audia's chat agent now exists hand-rolled (`/api/chat`) AND as a LangGraph graph (`/api/chat-graph`), A/B-able, with memory + a proven interrupt mechanism. 22/30 sessions.
+- **Loose ends:**
+  - PostgresSaver (durable, same Neon DB) instead of MemorySaver for production memory.
+  - Stream the graph response token-by-token (`streamMode:"messages"`) to match `/api/chat`'s live typing.
+  - Real HITL approval flow in route + UI (mechanism proven in the demo; not wired to a user-facing approve button).
+  - DB-backed `/api/chat-graph` still verified by tsc only (browser/curl pending; tsx can't run TypeORM entities).
+  - **NEXT: Phase 10 — Speech AI** (10.1 ASR/CTC/Whisper internals, 10.2 diarization + streaming ASR → live transcription). See [[audia_ai_progress]].
