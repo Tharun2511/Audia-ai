@@ -43,7 +43,7 @@
 **Part VIII — Agent frameworks (LangChain / LangGraph)** *(inserted as Phase 9; original 9–12 shifted to 10–13)*
 - [§19. LangChain fundamentals & LCEL: components, Runnables, the framework map](#19-langchain-fundamentals--lcel-components-runnables-the-framework-map) ✅ *(Phase 9.1)*
 - [§20. LangGraph core: StateGraph, nodes, edges, state & reducers](#20-langgraph-core-stategraph-nodes-edges-state--reducers) ✅ *(Phase 9.2)*
-- §21. The agentic graph: tool node, conditional routing, refactoring the chat agent *(Phase 9.3 — TBD)*
+- [§21. The agentic graph: bindTools, ToolNode, createReactAgent vs explicit StateGraph](#21-the-agentic-graph-bindtools-toolnode-createreactagent-vs-explicit-stategraph) ✅ *(Phase 9.3)*
 - §22. Persistence, memory, human-in-the-loop & streaming *(Phase 9.4 — TBD)*
 
 **Part IX — Speech**
@@ -3059,6 +3059,9 @@ Re-expressed `summarizeTranscriptStructured` as an LCEL chain in [summarize-lc.t
 
 ### 19.8 Glossary additions (land in Appendix A)
 
+- **bindTools / ToolNode** — `model.bindTools(tools)` lets the model emit tool_calls (wrapper over Groq's `tools:` param); `ToolNode(tools)` is a prebuilt node that executes the last AI message's tool_calls → ToolMessages. See §21.2.
+- **Tool-format bridge** — wrapping OpenAI/Groq JSON-schema tool specs as runnable LangChain `tool()` objects (execute fn calls `dispatchTool`) so LangGraph can use them. See §21.3.
+- **createReactAgent** — one call that builds a prebuilt agent StateGraph (model + ToolNode + conditional cycle); identical to the explicit graph (proven). Drop to explicit StateGraph to customize flow. See §21.4.
 - **StateGraph** — LangGraph's graph: nodes (functions returning partial state) + edges (control flow incl. cycles) + a typed State threaded through. Compile → invoke/stream. The runtime for loops/branches LCEL can't express. See §20.3.
 - **State channel & reducer** — each State key is a channel; its reducer merges a node's partial update. Default = overwrite; `messages` uses append (`MessagesAnnotation` = prebuilt append+dedupe). See §20.3.
 - **Back-edge / recursionLimit** — a back-edge (e.g. `tools→model`) is the agent cycle; `recursionLimit` bounds it (= MAX_TOOL_ITERATIONS). See §20.4.
@@ -3133,6 +3136,63 @@ The reducer is the key insight: returning `{ messages: [turn] }` *is* the push, 
 - **StateGraph / node / edge / conditional edge** — see §20.3.
 - **State channel & reducer** — see §20.3.
 - **Back-edge (the cycle) / recursionLimit** — see §20.4.
+
+---
+
+## §21. The agentic graph: bindTools, ToolNode, createReactAgent vs explicit StateGraph
+
+### 21.1 The whole game in one sentence
+
+> Make 9.2's stub skeleton real with three swaps — `bindTools` (model emits tool_calls), `ToolNode` (executes them), `MessagesAnnotation` (append reducer) — bridging the OpenAI-format tool registry into runnable LangChain tools; and `createReactAgent` is just the prebuilt version of the explicit StateGraph (proven: identical output).
+
+### 21.2 Three swaps (stub → real)
+
+- **`bindTools(tools)`** — attaches tool schemas to the model so it can emit `tool_calls`; LangChain's wrapper over the `tools:` array you hand-passed to Groq. After it, `model.invoke(messages)` may return an AIMessage with `tool_calls`.
+- **`ToolNode(tools)`** — prebuilt node: reads the last AI message's `tool_calls`, executes the matching tools, returns `ToolMessage`s. = the `for (tc of toolCalls) dispatchTool(...)` block.
+- **`MessagesAnnotation`** — prebuilt messages channel (append + dedupe-by-id reducer).
+
+### 21.3 The tool-format bridge (the real wrinkle)
+
+`AUDIA_TOOLS` are **OpenAI/Groq JSON-schema specs** — *data*. `ToolNode`/`bindTools` need **runnable LangChain `tool()` objects** — *executables*. Bridge: wrap each as a `tool()` whose execute fn calls the existing **`dispatchTool`** (reuse implementation + ownership), **reusing the description verbatim** (the routing prompt — single source so the graph routes identically), restating only the small arg schema in Zod. Tools need `userEmail` → **build per-request** in a closure ([agent-tools-lc.ts](../src/lib/agent-tools-lc.ts)).
+
+### 21.4 Two builds, one lesson
+
+```ts
+// Easy path — the whole agent in one call:
+createReactAgent({ llm, tools, prompt });
+
+// Control path — the explicit graph (9.2 skeleton, real nodes):
+new StateGraph(MessagesAnnotation)
+  .addNode("model", async (s) => ({ messages: [await model.bindTools(tools).invoke([sys, ...s.messages])] }))
+  .addNode("tools", new ToolNode(tools))
+  .addEdge(START, "model")
+  .addConditionalEdges("model", shouldContinue, { tools: "tools", end: END })
+  .addEdge("tools", "model").compile();
+```
+Live demo: **both produced byte-identical answers** — `createReactAgent` IS a prebuilt StateGraph. Drop to the explicit graph only to customize flow (interrupts, state-intercept, retries → §22).
+
+### 21.5 What ran + an observation
+
+`npm run graph:agent-demo` (real `llama-3.3-70b`, stub tools): both builds fired `listMyMeetings` and answered identically. The 70B **called the tool twice** before answering — benign over-calling, bounded by `recursionLimit=8` (the graph's MAX_TOOL_ITERATIONS); a fingerprint check on repeated identical calls would suppress it. The DB-backed agent ships in [/api/chat-graph](../src/app/api/chat-graph/route.ts); it can't run under tsx (TypeORM needs `emitDecoratorMetadata`, which esbuild doesn't emit → `ColumnTypeUndefinedError`) — it runs under Next.
+
+### 21.6 🎯 Defense talking points
+
+- **"Tools were JSON specs; LangGraph needs runnables — how?"** Wrap each as a `tool()` calling `dispatchTool`; reuse description (routing) + ownership, restate arg schema in Zod; build per-request for `userEmail`.
+- **"createReactAgent vs explicit StateGraph?"** Same thing — the former is the latter, prebuilt (proven by identical output). Prebuilt for standard agents; explicit to customize flow.
+- **"How's the cycle bounded?"** `recursionLimit` (= MAX_TOOL_ITERATIONS). Mattered live (double tool-call); a repeated-call fingerprint is the sharper fix.
+
+### 21.7 ⚠️ Common pitfalls
+
+- Passing JSON tool specs where runnable `tool()` objects are required.
+- Global tools that ignore the caller → cross-tenant leak; build per-request.
+- Running TypeORM-backed agent code under tsx (decorator metadata) — verify via Next.
+- Forgetting `recursionLimit` on a cyclic agent.
+
+### 21.8 Glossary additions (land in Appendix A)
+
+- **bindTools / ToolNode** — see §21.2.
+- **Tool-format bridge** — see §21.3.
+- **createReactAgent (is a prebuilt StateGraph)** — see §21.4.
 
 ---
 

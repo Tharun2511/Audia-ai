@@ -11,7 +11,8 @@
     "eval:chat": "node --import tsx --conditions=react-server --env-file=.env src/evals/chat.eval.ts",
     "eval:all": "npm run eval && npm run eval:chat",
     "eval:lc-compare": "node --import tsx --conditions=react-server --env-file=.env src/evals/compare-lc.ts",
-    "graph:demo": "node --import tsx src/evals/chat-graph-demo.ts"
+    "graph:demo": "node --import tsx src/evals/chat-graph-demo.ts",
+    "graph:agent-demo": "node --import tsx --conditions=react-server --env-file=.env src/evals/chat-graph-agent-demo.ts"
   },
   "dependencies": {
     "@deepgram/sdk": "^5.0.0",

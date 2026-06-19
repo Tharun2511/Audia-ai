@@ -86,3 +86,49 @@ LangGraph is the runtime for what LCEL **can't** express — loops and branches.
 - **Run it:** `npm run graph:demo` — prints node firings (`model→tools→model`) + the accumulated messages. Stubbed, no API key.
 - **9.3 turns the skeleton real:** model node → llama-3.3-70b with `AUDIA_TOOLS`; tools node → `dispatchTool`; wire to `/api/chat-graph` as a parallel route; A/B vs the primitive loop.
 - **`MessagesAnnotation`** is the prebuilt messages channel (append + de-dupe by id). We spelled the reducer out by hand for visibility; 9.3 may switch to the prebuilt.
+
+---
+
+## Session 9.3 — The real agentic graph (refactor the chat agent)
+
+**Built in Audia:**
+- [src/lib/agent-tools-lc.ts](../src/lib/agent-tools-lc.ts) — `buildAudiaTools(userEmail)`: the **tool-format bridge**. Wraps `AUDIA_TOOLS` (JSON-schema specs) as runnable LangChain `tool()` objects whose execute fn calls the same `dispatchTool` — reuses descriptions verbatim (single-source routing prompt) + ownership scoping (closure over `userEmail`).
+- [src/lib/chat-graph-agent.ts](../src/lib/chat-graph-agent.ts) — the chat agent **two ways**: `buildChatGraph()` (explicit `StateGraph` over `MessagesAnnotation`: model node `ChatGroq.bindTools(tools)` + prebuilt `ToolNode` + conditional cycle) and `buildReactAgent()` (`createReactAgent({llm,tools,prompt})`, ~3 lines). Both per-request, same model (`llama-3.3-70b-versatile`) + tools.
+- [src/app/api/chat-graph/route.ts](../src/app/api/chat-graph/route.ts) — parallel POST route (`{question, mode}`), A/B surface vs the hand-rolled `/api/chat`. Non-streaming JSON; the primitive loop stays untouched.
+- [src/evals/chat-graph-agent-demo.ts](../src/evals/chat-graph-agent-demo.ts) + `npm run graph:agent-demo` — live smoke test (real model, STUB tools). **Ran clean: both builds fired `listMyMeetings` and returned identical answers.** `tsc` clean.
+
+### Concept summary
+
+Turning 9.2's stub skeleton real is three swaps: the model node becomes **`ChatGroq(...).bindTools(tools)`** (LangChain's wrapper over the `tools:` array we hand-passed to Groq — now the model really emits `tool_calls`); the tools node becomes a prebuilt **`ToolNode(tools)`** (reads the last AI message's `tool_calls`, executes the matching tools, returns `ToolMessage`s — the graph form of the `for (tc of toolCalls) dispatchTool(...)` block); and the messages channel uses **`MessagesAnnotation`** (the prebuilt append+dedupe reducer). The one real wrinkle is the **tool-format bridge**: `AUDIA_TOOLS` are OpenAI/Groq JSON-schema *specs* (data), but `ToolNode`/`bindTools` need runnable LangChain `tool()` objects, so we wrap each as a `tool()` whose execute calls `dispatchTool` — reusing implementation + ownership, restating only the small arg schema in Zod, and reusing the description verbatim so routing is identical. Tools need `userEmail`, so the graph is **built per-request** (closure). The headline lesson, shown live: **`createReactAgent` and the explicit `StateGraph` produced byte-identical answers** — because `createReactAgent` *is* a prebuilt StateGraph (model + ToolNode + conditional cycle); you drop to the explicit graph only when you need to customize the flow (9.4: checkpoints, interrupts). One operational note from the run: the 70B **called `listMyMeetings` twice** before answering (benign over-calling, bounded by `recursionLimit=8`) — the same repeated-call pattern flagged in 7.2, which a fingerprint check would suppress.
+
+### 5 most-likely interview questions
+
+1. **Q: Your tools were OpenAI-format JSON specs; LangGraph needs runnable tools. How'd you bridge that?**
+   A: "I wrapped each registry tool as a LangChain `tool()` whose execute function calls my existing `dispatchTool` — so the implementation and ownership scoping are reused, I just satisfy LangChain's runnable interface. I reuse the description verbatim (it's the routing prompt — single source of truth, so the graph routes identically), and restate only the small arg schema in Zod since LangChain wants Zod and my registry holds JSON schema. The tools are built per-request in a closure over the authed user's email so every call stays ownership-scoped."
+
+2. **Q: `createReactAgent` vs building the StateGraph yourself — when each?**
+   A: "`createReactAgent` is a prebuilt StateGraph — model node, ToolNode, conditional cycle, done in one call. I proved it: my explicit graph and `createReactAgent` returned identical answers on the same question. Use the prebuilt for a standard tool-using agent. Drop to the explicit StateGraph the moment you need to customize the flow — intercept or transform state between nodes, add a human-approval interrupt, conditional retries, multi-agent routing. The explicit graph is the same thing with the lid off."
+
+3. **Q: What does `bindTools` actually do?**
+   A: "It attaches the tool schemas to the chat model so the model can emit `tool_calls` — it's LangChain's wrapper over the `tools:` parameter I used to hand-pass to `groq.chat.completions.create`. After `bindTools`, calling `model.invoke(messages)` may return an AIMessage with `tool_calls` populated, which my conditional edge then routes to the ToolNode."
+
+4. **Q: How is the loop bounded, and did you observe it mattering?**
+   A: "`recursionLimit` on invoke — the graph form of MAX_TOOL_ITERATIONS; it throws if the graph takes too many node-steps. It mattered in the demo: the model called `listMyMeetings` twice before answering — benign over-calling, but without a bound a model that keeps re-calling would spin. The limit caught it; a sharper fix is fingerprinting repeated identical calls and short-circuiting, which I'd noted as a loose end earlier."
+
+5. **Q: Why couldn't you run the DB-backed agent in your tsx demo?**
+   A: "TypeORM relies on `emitDecoratorMetadata` to infer column types from the entity decorators, and tsx/esbuild doesn't emit that metadata — so importing the entities throws `ColumnTypeUndefinedError`. It's a toolchain limitation, not an agent bug: the DB-backed code runs fine under Next (whose compiler emits the metadata), which is why the real agent lives in the route and my CLI smoke test uses stub tools to exercise just the LangGraph + Groq mechanics."
+
+### Gotchas
+
+- **Tool-format mismatch.** OpenAI/Groq JSON specs ≠ runnable LangChain tools. `ToolNode`/`bindTools` need `tool()` objects. Wrap, don't pass the spec.
+- **Ownership scoping.** Tools need `userEmail` — build them per-request in a closure; don't hoist a global tool set that ignores the caller.
+- **tsx can't run TypeORM entities.** No `emitDecoratorMetadata` under esbuild → `ColumnTypeUndefinedError`. DB-backed agent code is verified via the Next route, not the tsx evals.
+- **`recursionLimit` is mandatory for a cyclic agent.** It's MAX_TOOL_ITERATIONS; over-calling models will hit it.
+- **`createReactAgent` system-prompt param is `prompt`** (string/SystemMessage/fn) in current LangGraph.js — older `messageModifier`/`stateModifier` are renamed/deprecated.
+
+### Operational notes
+
+- **Run the live mechanics:** `npm run graph:agent-demo` (real model, stub tools — no DB). Both builds fire the tool + answer identically.
+- **A/B the real thing:** POST `/api/chat-graph` (`{question, mode:"explicit"|"react"}`) vs `/api/chat` with a meeting-entity question, under `next dev`. Same tool fires.
+- **Scope:** agentic loop only — no RAG/memory/streaming in the graph route (orthogonal). A retrieve node would slot upstream of the model node. Streaming + persistence are 9.4.
+- **The primitive `/api/chat` is untouched** — "built it by hand AND as a graph," A/B-able, interview-ready.
