@@ -500,3 +500,24 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - Real HITL approval flow in route + UI (mechanism proven in the demo; not wired to a user-facing approve button).
   - DB-backed `/api/chat-graph` still verified by tsc only (browser/curl pending; tsx can't run TypeORM entities).
   - **NEXT: Phase 10 — Speech AI** (10.1 ASR/CTC/Whisper internals, 10.2 diarization + streaming ASR → live transcription). See [[audia_ai_progress]].
+
+---
+
+**2026-06-05 · Phase 10.1 — Speech AI: ASR architectures, CTC, Whisper internals · 🐢 PHASE 10 (Speech) BEGINS**
+- **Format:** full locked 9-section, theory+code in one response, def·type·example 🎯 boxes, minimal analogy. **🔬 trace deliberately SKIPPED** (conceptual + modest deterministic build, no LLM decision) per the "trace only when required" rule — used a short before/after instead. First session back on the locked format after the Phase-9 drift.
+- Covered (def·type·example): ASR (audio→tokens, input frames ≫ output tokens = the alignment problem); log-Mel spectrogram (+ window 25ms vs hop 10ms → 3000 cols/30s, Tharun's question); the three families — **CTC** (token-or-blank per frame, collapse), **RNN-T/transducer** (CTC + prediction-net LM, streaming + context), **AED** (Whisper; full attention, best offline, not streaming); the axis = streaming/latency vs offline accuracy; Whisper internals (680k hrs weak supervision, 30s windows, multitask tokens); **WER** = (S+D+I)/N; **confidence** (per-word [0,1], low ≈ likely error); streaming vs batch (sets up 10.2). Audia = Deepgram nova-2 over self-hosted Whisper.
+- Built: [Transcription.ts](../src/entity/Transcription.ts) `TranscriptSegment.confidence?` (simple-json, no migration); [transcribe/route.ts](../src/app/api/transcribe/route.ts) `parseSegments` averages Deepgram per-word `confidence` (was discarded); [TranscriptPanel.tsx](../src/app/components/TranscriptPanel.tsx) flags segments < `LOW_CONFIDENCE=0.7` with a muted `~NN%` chip + tooltip (warning as a genuine *state* signal). `tsc` clean; evals unaffected (optional field, UI guards undefined).
+- Build chose: capture+surface confidence (real product win, embodies "ASR is probabilistic") over a WER utility (needs ground truth — deferred).
+- **Stuck (well-internalized):**
+  - **Q1 (7.5) + Q2 (8.5).** All three families correct with properties; live-captions choice (transducer, why-not-Whisper) clean and choice-first.
+  - **Q5 (7).** Got the confidence-default risk: default `1` inflates the segment average → can mask genuinely low confidence (false negative).
+- **Fuzzy (needs reinforcement):**
+  - **🚩 Q3 (5.5) — wrong cost + SELF-CONTRADICTION.** Said RNN-T's added cost is "latency" — backwards (it's the low-latency/streaming one; he said so in Q2). Real cost = more compute/architectural complexity (prediction + joint network, harder loss). Same Q2↔Qx contradiction shape as 9.2.
+  - **🚩 Q4 (6.5) — conceded the trap premise.** Opened "Yeah, you're correct" to "use Whisper everywhere," then argued the opposite. Recurring (7.3 Q4). Drill: reject the framing first — "best accuracy ≠ best for every use case."
+  - **Name the single axis term-first (Q1)** and **CTC's blank+collapse** mechanism (stated only "independent per frame").
+- **🧠 Feynman — MODELED by me, not attempted (Tharun asked me to answer it + close).** Court-typist-over-bad-phone-line analogy: without-this-first (clean page that's secretly wrong), USE-not-NAME (typist/rush/gaps/muffled/underline), mechanism-fit on BOTH operations (slice gapless stream into words = alignment; underline muffled = confidence). Given as the exemplar shape; no Feynman score this session.
+- **Loose ends:**
+  - `wordErrorRate()` utility + transcription eval (needs ground-truth references) — deferred.
+  - Per-*word* (not per-segment) confidence highlighting; a single bad word can hide in a high-average segment.
+  - Browser-verify the low-confidence chip on real noisy audio (pending Tharun).
+  - **NEXT: Phase 10.2 — diarization deep-dive + streaming/live transcription** (where transducer-vs-AED actually bites; the 🔬 trace returns since it's a real route+stream+UI flow). See [[audia_ai_progress]].

@@ -5,6 +5,12 @@ export type TranscriptSegment = {
   text: string;
   start: number;
   end: number;
+  /**
+   * Average ASR word-confidence for this segment, in [0, 1] (Phase 10.1).
+   * Optional: legacy rows + non-ASR code paths (golden-set test segments)
+   * won't have it. Low values flag likely transcription errors in the UI.
+   */
+  confidence?: number;
 };
 
 @Entity({ name: "transcription" })

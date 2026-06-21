@@ -47,7 +47,7 @@
 - [§22. Persistence, memory, human-in-the-loop & streaming](#22-persistence-memory-human-in-the-loop--streaming) ✅ *(Phase 9.4)*
 
 **Part IX — Speech**
-- §23. ASR architectures, Whisper, diarization *(Phase 10.1 — TBD)*
+- [§23. Speech AI: ASR architectures, CTC, Whisper internals, confidence](#23-speech-ai-asr-architectures-ctc-whisper-internals-confidence) ✅ *(Phase 10.1)*
 - §24. Streaming ASR *(Phase 10.2 — TBD)*
 
 **Part X — Multimodal**
@@ -3248,9 +3248,72 @@ All four come from one fact: **the runtime owns a durable State.** Memory = save
 
 ---
 
+## §23. Speech AI: ASR architectures, CTC, Whisper internals, confidence
+
+### 23.1 The whole game in one sentence
+
+> ASR maps a long audio frame-sequence to a short token sequence with no alignment labels; CTC, RNN-T, and attention encoder-decoders are three ways to solve that alignment, trading streaming/latency against offline accuracy — and every decoder is probabilistic, so each word carries a confidence Audia now keeps.
+
+### 23.2 The pipeline + the core problem
+
+Audio → **log-Mel spectrogram** (≈25ms frames × mel bands, a 2D image of sound) → model → tokens. The hard part is **alignment**: hundreds of frames/sec, a few output tokens, no frame↔token labels.
+
+### 23.3 The three families (def · type · example)
+
+- **CTC** — *Def:* token-or-**blank** probability per frame, independently; collapse (merge repeats, drop blanks) → text. *Type:* alignment-free, encoder-only, streamable, no cross-token context. *Ex:* `h-h-∅-e-l-l-∅-l-o` → "hello".
+- **RNN-T / transducer** — *Def:* CTC + a prediction network (built-in LM) so outputs condition on prior outputs. *Type:* streaming-first, context-aware. *Ex:* voice assistants, Deepgram-class.
+- **Attention encoder-decoder (AED/seq2seq)** — *Def:* decoder attends over the whole encoded spectrogram, autoregressive (LLM shape). *Type:* best offline accuracy, not natively streaming. *Ex:* Whisper.
+
+**⚖️ Trade-off:** streaming/latency (RNN-T > CTC > AED) vs offline accuracy (AED > RNN-T > CTC).
+
+### 23.4 Whisper (def · type · example)
+
+*Def:* AED Transformer trained on ~680k hrs weakly-supervised audio; 30s log-Mel windows; **multitask** via special tokens (transcribe/translate/timestamps/language-ID). *Type:* batch (offline) AED. *Ex:* prompt decoder `<|translate|>` → English text from French audio, same model. Not ideal for live captions (wants the whole window).
+
+### 23.5 WER + confidence (def · type · example)
+
+- **📐 WER** — *Def:* `(S + D + I) / N` — word substitutions+deletions+insertions ÷ reference words. *Type:* the standard accuracy metric, lower better. *Ex:* "let's ship on friday" vs "lets ship friday" = (1 sub + 1 del)/4 = 0.5. (Normalize casing/punctuation first or it inflates.)
+- **ASR confidence** — *Def:* the decoder's per-word probability ∈ [0,1]. *Type:* per-word certainty; low ≈ likely error. *Ex:* Deepgram `{word:"Kubernetes", confidence:0.62}` on a muffled mic.
+
+### 23.6 Where Audia sits + the build
+
+Audia uses **Deepgram nova-2** (proprietary, hosted, streaming-capable, diarizing, per-word confidence) over self-hosted **Whisper** (AED, batch). 10.1 build: `parseSegments` now averages Deepgram's per-word `confidence` into `TranscriptSegment.confidence`; `TranscriptPanel` flags segments < 0.7 with a muted `~NN%` chip — "ASR is probabilistic," made visible. **Streaming vs batch**: Audia is batch today; 10.2's live-transcription mode is streaming, which structurally favors a transducer over Whisper's AED.
+
+### 23.7 🎯 Defense talking points
+
+- **"CTC vs RNN-T vs AED?"** Three answers to alignment: CTC (blank+collapse, frame-independent, streamable, no context), RNN-T (adds a prediction-net LM, streaming + context), AED (full attention, best offline, not streaming). Axis = latency vs accuracy.
+- **"Why not Whisper for live captions?"** AED needs the whole window — batch-oriented; streaming wants a transducer.
+- **"How do you measure ASR quality?"** WER = (S+D+I)/N; normalize first.
+- **"Why surface confidence?"** The decoder is probabilistic; low confidence flags likely errors so the user doesn't trust shaky words equally.
+
+### 23.8 ⚠️ Common pitfalls
+
+- Treating ASR as deterministic — it emits probabilities; keep the confidence.
+- Assuming the most accurate model (AED/Whisper) is the right one for streaming — it isn't.
+- Comparing WER without normalizing casing/punctuation.
+- Per-segment confidence averaging hides a single bad word in a good segment.
+
+### 23.9 Glossary additions (land in Appendix A)
+
+- **ASR / log-Mel spectrogram** — see §23.2.
+- **CTC / blank token** — see §23.3.
+- **RNN-T (transducer)** — see §23.3.
+- **Attention encoder-decoder (AED) / Whisper** — see §23.3–23.4.
+- **WER (Word Error Rate)** — see §23.5.
+- **ASR confidence** — see §23.5.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
+
+- **ASR / log-Mel spectrogram** — Automatic Speech Recognition maps audio→tokens; audio is first turned into a log-Mel spectrogram (≈25ms frames × mel frequency bands, a 2D image of sound) the model reads. See §23.2.
+- **CTC (blank token)** — emits a token-or-blank probability per frame independently; collapse (merge repeats, drop blanks) yields text. Alignment-free, streamable, no cross-token context. See §23.3.
+- **RNN-T / transducer** — CTC + a prediction network (built-in LM) conditioning outputs on prior outputs; streaming + context-aware (voice assistants, Deepgram-class). See §23.3.
+- **Attention encoder-decoder (AED) / Whisper** — decoder attends over the whole encoded spectrogram autoregressively; best offline accuracy, not natively streaming. Whisper is an AED. See §23.3–23.4.
+- **WER (Word Error Rate)** — `(S+D+I)/N`, word edit distance ÷ reference words; the standard ASR accuracy metric, lower better. Normalize casing/punctuation first. See §23.5.
+- **ASR confidence** — per-word probability ∈ [0,1] from the decoder; low ≈ likely error. Audia averages it per segment + flags < 0.7. See §23.5.
 
 - **LangChain** — toolkit of composable components (models/prompts/parsers/retrievers/tools) + integrations, wired by LCEL. Standardizes plumbing, not capability. `@langchain/core` holds the abstractions; provider packages, `@langchain/langgraph`, `@langchain/community` extend it. See §19.2.
 - **LCEL / Runnable** — every component implements `Runnable` (.invoke/.stream/.batch); `.pipe()` composes them and the chain is itself a Runnable, so stream/batch/retry/trace come uniformly. See §19.3.

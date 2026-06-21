@@ -14,6 +14,8 @@ type DeepgramWord = {
     end: number;
     speaker: number;
     punctuated_word?: string;
+    // Per-word ASR confidence ∈ [0,1] — the probabilistic signal we now keep (10.1).
+    confidence?: number;
 };
 
 function parseSegments(words: DeepgramWord[]): TranscriptSegment[] {
@@ -24,36 +26,44 @@ function parseSegments(words: DeepgramWord[]): TranscriptSegment[] {
     let currentWords: string[] = [];
     let segStart = words[0].start;
     let segEnd = words[0].end;
+    // Running mean of word confidences for the current segment.
+    let confSum = 0;
+    let confCount = 0;
 
-    for (const word of words) {
-        const speaker = word.speaker ?? 0;
-        const displayWord = word.punctuated_word ?? word.word;
-
-        if (speaker !== currentSpeaker) {
-            segments.push({
-                speaker: `User${currentSpeaker + 1}`,
-                text: currentWords.join(" "),
-                start: segStart,
-                end: segEnd,
-            });
-            currentSpeaker = speaker;
-            currentWords = [displayWord];
-            segStart = word.start;
-            segEnd = word.end;
-        } else {
-            currentWords.push(displayWord);
-            segEnd = word.end;
-        }
-    }
-
-    if (currentWords.length > 0) {
+    const flush = () => {
         segments.push({
             speaker: `User${currentSpeaker + 1}`,
             text: currentWords.join(" "),
             start: segStart,
             end: segEnd,
+            // Average word-confidence for the segment, or undefined if Deepgram
+            // didn't report any (graceful — UI just won't flag it).
+            confidence: confCount > 0 ? confSum / confCount : undefined,
         });
+    };
+
+    for (const word of words) {
+        const speaker = word.speaker ?? 0;
+        const displayWord = word.punctuated_word ?? word.word;
+        const conf = typeof word.confidence === "number" ? word.confidence : 1;
+
+        if (speaker !== currentSpeaker) {
+            flush();
+            currentSpeaker = speaker;
+            currentWords = [displayWord];
+            segStart = word.start;
+            segEnd = word.end;
+            confSum = conf;
+            confCount = 1;
+        } else {
+            currentWords.push(displayWord);
+            segEnd = word.end;
+            confSum += conf;
+            confCount += 1;
+        }
     }
+
+    if (currentWords.length > 0) flush();
 
     return segments;
 }

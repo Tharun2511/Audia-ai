@@ -22,6 +22,7 @@ import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import FileDownloadOutlinedIcon from "@mui/icons-material/FileDownloadOutlined";
 import TextSnippetOutlinedIcon from "@mui/icons-material/TextSnippetOutlined";
 import IconButton from "@mui/material/IconButton";
+import Tooltip from "@mui/material/Tooltip";
 import type { TranscriptSegment } from "@/entity/Transcription";
 import {
     downloadAsFile,
@@ -30,6 +31,13 @@ import {
     suggestedFilename,
 } from "@/lib/transcript-export";
 import { buildColorMap, formatDuration } from "./utils";
+
+/**
+ * Below this average ASR confidence (Phase 10.1), a segment is flagged as
+ * "lower confidence" so the user knows the transcription may contain errors.
+ * Deepgram word confidence usually sits well above 0.9; < 0.7 is genuinely shaky.
+ */
+const LOW_CONFIDENCE = 0.7;
 
 interface Props {
     segments: TranscriptSegment[];
@@ -443,6 +451,24 @@ export default function TranscriptPanel({
                                                         "& .MuiChip-label": { px: 0.75 },
                                                     }}
                                                 />
+                                                {/* Low-confidence flag (10.1): the ASR told us it's unsure here. */}
+                                                {typeof seg.confidence === "number" && seg.confidence < LOW_CONFIDENCE && (
+                                                    <Tooltip title={`Lower transcription confidence (~${Math.round(seg.confidence * 100)}%) — may contain errors`}>
+                                                        <Chip
+                                                            className="tabular-nums"
+                                                            label={`~${Math.round(seg.confidence * 100)}%`}
+                                                            size="small"
+                                                            sx={{
+                                                                height: 18,
+                                                                fontSize: 10,
+                                                                fontFamily: "var(--font-geist-mono), monospace",
+                                                                color: "warning.main",
+                                                                bgcolor: "action.hover",
+                                                                "& .MuiChip-label": { px: 0.75 },
+                                                            }}
+                                                        />
+                                                    </Tooltip>
+                                                )}
                                             </Stack>
                                             {/*
                                              * Edit affordance — subtle by default (low opacity), brightens
