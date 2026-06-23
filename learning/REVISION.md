@@ -48,7 +48,7 @@
 
 **Part IX — Speech**
 - [§23. Speech AI: ASR architectures, CTC, Whisper internals, confidence](#23-speech-ai-asr-architectures-ctc-whisper-internals-confidence) ✅ *(Phase 10.1)*
-- §24. Streaming ASR *(Phase 10.2 — TBD)*
+- [§24. Diarization & streaming/live transcription: interim/final, endpointing, ephemeral-token streaming](#24-diarization--streaminglive-transcription-interimfinal-endpointing-ephemeral-token-streaming) ✅ *(Phase 10.2)*
 
 **Part X — Multimodal**
 - §25. Vision-language models, OCR *(Phase 11 — TBD)*
@@ -3304,10 +3304,62 @@ Audia uses **Deepgram nova-2** (proprietary, hosted, streaming-capable, diarizin
 
 ---
 
+## §24. Diarization & streaming/live transcription: interim/final, endpointing, ephemeral-token streaming
+
+### 24.1 The whole game in one sentence
+
+> Live transcription = streaming ASR (revisable interim results that finalize on a pause) + streaming diarization (speaker labels with no look-ahead) over a WebSocket — and since a serverless route handler can't hold that socket, the server mints a short-lived token and the browser streams to the provider directly.
+
+### 24.2 The pieces (def · type · example)
+
+- **Diarization** — *Def:* "who spoke when" — segment + label audio by speaker. *Types:* clustering-based vs end-to-end neural (EEND); offline vs streaming (streaming = no look-ahead, harder). *Ex:* Deepgram `diarize` tags each word a `speaker` index → `parseSegments` groups them.
+- **Interim vs final results** — *Def:* interim = revisable draft (`is_final:false`); final = committed (`is_final:true`). *Type:* signaled per message; `speech_final` marks an utterance-ending pause. *Ex:* words stream in faded, then lock solid on finalize.
+- **Endpointing** — *Def:* detecting the pause that ends an utterance and triggers a final. *Type:* tunable silence threshold (ms). *Ex:* ~silence past threshold → pending interim flips to `is_final:true`.
+- **WebSocket (full-duplex)** — *Def:* persistent bidirectional connection — audio up while transcripts come down. *Type:* `wss://`. *Ex:* 250ms audio blobs up, interim/final JSON down, same socket.
+- **🎯 Ephemeral-token streaming** — *Def:* server mints a short-lived token (HTTP), browser opens the provider WebSocket directly with it. *Type:* client-direct streaming + server-minted auth. *Ex:* `POST /api/deepgram-token` → browser `listen.v1.connect({ Authorization })`.
+
+### 24.3 The streaming trade-off
+
+Streaming trades **accuracy/stability for latency** (interim drafts get revised). This is the same axis that makes streaming favor **RNN-T over Whisper's AED** (§23) — the transducer emits as it goes; the AED wants the whole window.
+
+### 24.4 The architecture decision (why it's the lesson)
+
+A **serverless Next.js route handler is request/response — it cannot host a persistent WebSocket.** So: server mints a short-lived token (a normal HTTP call it *can* do), browser opens the Deepgram socket directly. Wins: audio never proxies through our functions (latency + no serverless-WS problem), and the real `DEEPGRAM_API_KEY` never reaches the client — only a ~30s token. This is the general pattern for streaming AI from serverless.
+
+### 24.5 How it maps to Audia
+
+`/api/deepgram-token` (grant) → `useLiveTranscription` hook (browser `DeepgramClient.listen.v1.connect`, `MediaRecorder` → `sendMedia`, parse `Results` → finalized/interim) → `RecordingState` renders captions live. The **saved** transcript still comes from the batch `/api/transcribe` on stop (more accurate, has the whole clip) — live captions are real-time UX only. `tsc` clean; runtime (browser+mic+WS) pending. (Streaming diarizer: pin `diarize_model=latest`; v2 errors on streaming.)
+
+### 24.6 🎯 Defense talking points
+
+- **"Live transcription in serverless — how?"** Server can't hold a WS; mint a short-lived token, stream browser→provider directly. Key never leaves the server; audio never touches your functions.
+- **"Interim vs final?"** Interim = revisable draft (`is_final:false`); final = committed on endpointing. Render faded → solid. Latency vs stability.
+- **"Why a transducer for live, not Whisper?"** AED needs the whole window (batch); transducer emits/revises as it goes.
+- **"Live captions ≠ saved transcript — bug?"** No — live is the streaming socket (latency-optimized); saved is batch re-transcription (accuracy-optimized, whole clip). Deliberate separation.
+
+### 24.7 ⚠️ Common pitfalls
+
+- Trying to proxy a WebSocket through a serverless route handler.
+- Shipping the real API key to the browser (use a minted token).
+- Passing SDK query params as booleans (`diarize:true`) — they're strings (`"true"`).
+- Using the batch diarizer for streaming (`v2` errors; pin `latest`).
+- Assuming live captions are the source of truth — re-transcribe in batch for the saved record.
+
+### 24.8 Glossary additions (land in Appendix A)
+
+- **Diarization (streaming vs offline)** — see §24.2.
+- **Interim / final results, endpointing** — see §24.2.
+- **Ephemeral-token streaming** — see §24.2 / §24.4.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
 
+- **Diarization (streaming vs offline)** — "who spoke when"; offline clusters over the whole file, streaming must label live with no look-ahead (harder). Deepgram tags each word a speaker index. See §24.2.
+- **Interim / final results, endpointing** — interim = revisable draft (`is_final:false`); final = committed (`is_final:true`) once endpointing detects an utterance-ending pause. Render faded → solid. See §24.2.
+- **Ephemeral-token streaming** — server mints a short-lived token (HTTP); browser opens the provider WebSocket directly with it. The pattern for streaming from serverless (can't host a persistent WS). See §24.4.
 - **ASR / log-Mel spectrogram** — Automatic Speech Recognition maps audio→tokens; audio is first turned into a log-Mel spectrogram (≈25ms frames × mel frequency bands, a 2D image of sound) the model reads. See §23.2.
 - **CTC (blank token)** — emits a token-or-blank probability per frame independently; collapse (merge repeats, drop blanks) yields text. Alignment-free, streamable, no cross-token context. See §23.3.
 - **RNN-T / transducer** — CTC + a prediction network (built-in LM) conditioning outputs on prior outputs; streaming + context-aware (voice assistants, Deepgram-class). See §23.3.

@@ -25,6 +25,7 @@ import SidebarSearch from "./components/SidebarSearch";
 import type { SearchHit } from "@/app/api/search/route";
 import ThemeToggle from "./components/ThemeToggle";
 import { ReadyState, RecordingState, ProcessingState } from "./components/MainPaneStates";
+import { useLiveTranscription } from "./components/useLiveTranscription";
 
 type Status = "idle" | "recording" | "paused" | "processing" | "done" | "error";
 
@@ -82,6 +83,11 @@ export default function HomeClient({ userEmail, userName }: Props) {
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const chunksRef = useRef<Blob[]>([]);
     const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+    // Live transcription (10.2): streams the mic straight to Deepgram for
+    // real-time captions during recording. Purely additive UX — the saved
+    // transcript still comes from the batch /api/transcribe path on stop.
+    const live = useLiveTranscription();
 
     /* ---------- Data loading ---------- */
     const loadHistory = useCallback(async (): Promise<HistoryRecord[]> => {
@@ -231,6 +237,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
         setSelectedId(null);
         setJustCompletedId(null);
         setElapsed(0);
+        live.reset();
 
         let stream: MediaStream;
         try {
@@ -248,6 +255,10 @@ export default function HomeClient({ userEmail, userName }: Props) {
             return;
         }
 
+        // Live captions on the same stream — best-effort; failure here never
+        // blocks the recording/batch-save path.
+        void live.start(stream);
+
         const mediaRecorder = new MediaRecorder(stream);
         mediaRecorderRef.current = mediaRecorder;
         chunksRef.current = [];
@@ -257,6 +268,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
         };
 
         mediaRecorder.onstop = async () => {
+            live.stop();
             stream.getTracks().forEach((t) => t.stop());
             clearInterval(timerRef.current!);
             setStatus("processing");
@@ -349,6 +361,7 @@ export default function HomeClient({ userEmail, userName }: Props) {
         setError(null);
         setDrawerOpen(false);
         clearSearch();
+        live.reset();
     };
 
     /* ---------- What does the main pane show? ---------- */
@@ -483,6 +496,8 @@ export default function HomeClient({ userEmail, userName }: Props) {
                 onPause={pauseRecording}
                 onResume={resumeRecording}
                 onStop={stopRecording}
+                liveCaptions={live.finalized}
+                interimCaption={live.interim}
             />
         );
     } else if (mainView === "processing") {

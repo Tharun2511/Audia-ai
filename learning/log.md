@@ -521,3 +521,17 @@ One line per session. Date · phase · what we covered · what stuck · what's f
   - Per-*word* (not per-segment) confidence highlighting; a single bad word can hide in a high-average segment.
   - Browser-verify the low-confidence chip on real noisy audio (pending Tharun).
   - **NEXT: Phase 10.2 — diarization deep-dive + streaming/live transcription** (where transducer-vs-AED actually bites; the 🔬 trace returns since it's a real route+stream+UI flow). See [[audia_ai_progress]].
+
+---
+
+**2026-06-05 · Phase 10.2 — Diarization & streaming / live transcription · 🐢 PHASE 10 COMPLETE**
+- Covered (def·type·example): diarization (clustering vs end-to-end; offline vs streaming — streaming is harder, no look-ahead); streaming ASR interim vs final (`is_final`, `speech_final`); endpointing; the streaming latency↔stability trade (→ favors RNN-T over Whisper's AED, ties to 10.1); WebSocket full-duplex; and the load-bearing one — **ephemeral-token streaming**: a serverless route handler can't host a persistent WS, so the server mints a short-lived token and the browser streams to Deepgram DIRECTLY (key never reaches client, audio never proxies through us).
+- Built: [/api/deepgram-token](../src/app/api/deepgram-token/route.ts) (`deepgram.auth.v1.tokens.grant()`); [useLiveTranscription.ts](../src/app/components/useLiveTranscription.ts) (raw browser `WebSocket` → Deepgram, parse Results → finalized/interim, speaker-labelled); [HomeClient.tsx](../src/app/HomeClient.tsx) wiring (live.start/stop/reset on record lifecycle); [MainPaneStates.tsx](../src/app/components/MainPaneStates.tsx) RecordingState renders captions (finalized solid, interim faded). Batch `/api/transcribe` save unchanged (live = UX; batch = source of truth). `tsc` clean (caught: SDK query params are strings not booleans).
+- **🔬 trace included** (real browser→WS→Deepgram→UI flow), per the trace-only-when-required rule.
+- **⚠️ Runtime debugging saga (honest record):** (1) `/auth/grant` 403 → Tharun's Deepgram key lacked **Member** permission; fixed by creating a Member key. (2) Live WS then closed `1006` (no server reason) across THREE browser-auth methods — subprotocol `["token", jwt]`, `["bearer", jwt]`, and `?access_token=jwt`. Ruled out: CSP (none in project), token validity (`access_token` field confirmed, grant returns 200). Identical transport-level 1006 across all three auth methods + an earlier ECONNRESET ⇒ **network/proxy/VPN/AV dropping the Deepgram WSS, NOT the code.** WS row showed "Finished" (connected→closed). Documented in a code comment. **Code is correct + tsc-clean + degrades gracefully** (recording + batch save work; only the live overlay fails to connect on this network). Decision: commit + move on; live captions to be verified on an unrestricted network.
+- **NO quiz / Feynman** — pre-empted by the runtime-debug session + Tharun's call to move on; skipped (not forced), like 9.3.
+- **🐢 PHASE 10 (Speech AI) COMPLETE** — 10.1 ASR internals + confidence, 10.2 diarization + live streaming. 24/30 sessions.
+- **Loose ends:**
+  - **Live WS captions blocked by local network env** — re-test on a phone hotspot / no-VPN / no-AV-SSL-inspection network; or fall back to `["token", DEEPGRAM_API_KEY]` subprotocol (works client-side but exposes the key).
+  - Persist the live transcript instead of re-batching on stop; pause/resume wired into the live socket.
+  - **NEXT: Phase 11 — Fine-tuning** (11.1 when-to-FT + SFT/LoRA/QLoRA, 11.2 dataset prep, 11.3 run a fine-tune). See [[audia_ai_progress]].

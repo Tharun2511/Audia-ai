@@ -8,7 +8,7 @@ import MicIcon from "@mui/icons-material/Mic";
 import PauseIcon from "@mui/icons-material/Pause";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import StopIcon from "@mui/icons-material/Stop";
-import { formatDuration } from "./utils";
+import { buildColorMap, formatDuration } from "./utils";
 import FileUpload from "./FileUpload";
 
 /**
@@ -98,13 +98,21 @@ export function RecordingState({
     onPause,
     onResume,
     onStop,
+    liveCaptions = [],
+    interimCaption = "",
 }: {
     elapsed: number;
     isPaused: boolean;
     onPause: () => void;
     onResume: () => void;
     onStop: () => void;
+    /** Real-time captions (10.2) — finalized speaker-labelled segments. */
+    liveCaptions?: { speaker: string; text: string }[];
+    /** The current in-flight (revisable) caption draft. */
+    interimCaption?: string;
 }) {
+    const colorMap = buildColorMap([...new Set(liveCaptions.map((c) => c.speaker))]);
+    const hasCaptions = liveCaptions.length > 0 || interimCaption.length > 0;
     return (
         <Stack
             spacing={3.5}
@@ -217,6 +225,44 @@ export function RecordingState({
                     Stop
                 </Button>
             </Stack>
+
+            {/* Live captions (10.2): finalized segments solid, the in-flight
+                draft faded/italic — the streaming interim-vs-final distinction made visible. */}
+            {hasCaptions && (
+                <Box
+                    sx={{
+                        width: "100%",
+                        maxWidth: 560,
+                        maxHeight: 200,
+                        overflowY: "auto",
+                        textAlign: "left",
+                        borderRadius: 2,
+                        border: 1,
+                        borderColor: "divider",
+                        bgcolor: "background.paper",
+                        p: 2,
+                    }}
+                >
+                    <Typography variant="overline" sx={{ fontWeight: 700, letterSpacing: "0.18em", color: "text.disabled", display: "block", mb: 1 }}>
+                        Live captions
+                    </Typography>
+                    <Stack spacing={0.75}>
+                        {liveCaptions.map((c, i) => (
+                            <Typography key={i} variant="body2" sx={{ lineHeight: 1.5 }}>
+                                <Box component="span" sx={{ fontWeight: 700, color: colorMap[c.speaker] ?? "text.secondary", mr: 0.75 }}>
+                                    {c.speaker}:
+                                </Box>
+                                <Box component="span" sx={{ color: "text.primary" }}>{c.text}</Box>
+                            </Typography>
+                        ))}
+                        {interimCaption && (
+                            <Typography variant="body2" sx={{ color: "text.disabled", fontStyle: "italic", lineHeight: 1.5 }}>
+                                {interimCaption}
+                            </Typography>
+                        )}
+                    </Stack>
+                </Box>
+            )}
         </Stack>
     );
 }

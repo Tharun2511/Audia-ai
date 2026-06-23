@@ -41,3 +41,50 @@ ASR maps `audio → tokens`, and the input is far longer than the output (hundre
 - **Verify:** record (or upload) audio, especially something noisy/with a rare term → low-confidence segments show a `~NN%` chip + tooltip. Server stores `confidence` on each segment.
 - **Deepgram** model is `nova-2`, `diarize + smart_format + punctuate`; per-word `confidence` comes back by default in `results.channels[0].alternatives[0].words[]`.
 - **Deferred / extensions:** a `wordErrorRate()` utility + transcription eval (needs ground-truth references); per-*word* (not per-segment) confidence highlighting; Phase 10.2 = diarization deep-dive + **streaming/live transcription** (where the architecture choice — transducer vs AED — actually bites).
+
+---
+
+## Session 10.2 — Diarization & streaming / live transcription
+
+**Built in Audia:**
+- [src/app/api/deepgram-token/route.ts](../src/app/api/deepgram-token/route.ts) — POST, auth-gated; `deepgram.auth.v1.tokens.grant()` → short-lived bearer token. The keystone: lets the browser stream directly without ever seeing the real key.
+- [src/app/components/useLiveTranscription.ts](../src/app/components/useLiveTranscription.ts) — client hook: fetch token → `DeepgramClient.listen.v1.connect({ model, Authorization, diarize, interim_results, queryParams:{diarize_model:"latest"} })` → `MediaRecorder` chunks → `socket.sendMedia` → parse `Results` into `finalized` (is_final, speaker-labelled) + `interim` (draft).
+- [HomeClient.tsx](../src/app/HomeClient.tsx) — `live.start(stream)` on record, `live.stop()` on stop, `live.reset()` on new; batch `/api/transcribe` save unchanged.
+- [MainPaneStates.tsx](../src/app/components/MainPaneStates.tsx) — `RecordingState` renders live captions (finalized solid, interim faded/italic).
+- `tsc` clean (caught: SDK types `diarize`/`interim_results`/`punctuate`/`smart_format` as **string** query values, not booleans). **Runtime (browser + mic + WS) verification pending — see gotchas.**
+
+### Concept summary (definition · type · example)
+
+Live transcription needs two things batch didn't: **streaming ASR** and **streaming diarization**, both over a **WebSocket**. *Diarization* = "who spoke when" (clustering-based vs end-to-end neural; offline vs streaming — streaming is harder because it can't look ahead). *Streaming ASR* emits **interim** results (`is_final:false`, revisable drafts) then **final** ones (`is_final:true`, committed) once **endpointing** detects a pause; this trades accuracy/stability for latency, which is exactly why streaming favors **RNN-T over Whisper's AED** (10.1). Transport is a **WebSocket** (full-duplex: audio up, transcripts down, simultaneously). The load-bearing architecture decision: a **serverless Next.js route handler can't host a persistent WebSocket**, so the server mints a **short-lived token** (a normal HTTP call) and the **browser opens the Deepgram socket directly** — audio never proxies through us and the real key never reaches the client. In Audia, live captions are real-time UX during recording; the **saved** transcript still comes from the accurate **batch** `/api/transcribe` on stop. (Streaming diarization note: `diarize_model=v2` isn't available for streaming → pin `latest`.)
+
+### 5 most-likely interview questions
+
+1. **Q: How do you do live transcription in a serverless app — doesn't streaming need a WebSocket the server can't hold?**
+   A: "Right — a serverless route handler is request/response, it can't keep a socket open. So you flip it: the server mints a short-lived token over plain HTTP, and the browser opens the speech provider's WebSocket *directly* with that token. Audio streams browser→provider, never through your functions, and the real API key never reaches the client — only a token that expires in seconds. That's the ephemeral-token pattern; it's how you stream from serverless."
+
+2. **Q: Interim vs final results — what's the difference and how do you render them?**
+   A: "Interim results are revisable drafts the model emits as audio arrives, flagged `is_final:false`; finals are committed once the segment stabilizes — usually when endpointing detects a pause — flagged `is_final:true`. You render interim faded/italic and promote it to solid on final, so the user sees words appear live and then lock. The trade is latency vs stability: snappier finals mean more mid-sentence corrections."
+
+3. **Q: Why is streaming diarization harder than offline?**
+   A: "Offline diarization can cluster voice embeddings over the *whole* recording before deciding who's who; streaming has to assign a speaker the moment each word arrives with no future context, so it can label early speech wrong and only correct later. It's a no-look-ahead constraint. Practically, providers even ship different diarizers for streaming — Deepgram's v2 diarizer isn't available for streaming, so you pin `diarize_model=latest`."
+
+4. **Q: Why does streaming favor a transducer over Whisper?**
+   A: "Whisper is an attention encoder-decoder — it wants the whole window before decoding, so it's batch-oriented. Streaming needs a model that emits as audio arrives and revises, which is the transducer/RNN-T design. So the same accuracy-vs-latency axis from ASR architectures decides it: Whisper for best offline accuracy, a transducer for live."
+
+5. **Q: In Audia, the saved transcript and the live captions can differ — why, and is that a bug?**
+   A: "Not a bug — deliberate. The live captions come from the streaming socket (interim/final, optimized for latency); the *saved* record comes from re-transcribing the full audio in batch on stop, which is more accurate because it has the whole clip. Live is real-time UX; batch is the source of truth. Separating them keeps the persistence path simple and the stored transcript high-quality."
+
+### Gotchas
+
+- **⚠️ Runtime-unverified spots (tsc-clean, but not browser-tested):** (1) the token **auth header** — grant tokens are `Bearer`; if Deepgram rejects, try `Token ${token}`. (2) The v5 SDK's WebSocket running in the **browser bundle** — it's a server-oriented SDK; if it pulls Node deps, fall back to a raw browser `WebSocket` to `wss://api.deepgram.com/v1/listen?...`. (3) The connect→attach-handlers→open **sequence** — we guard both orders (`on("open")` + a `readyState === OPEN` check).
+- **SDK query params are strings, not booleans** — `diarize: "true"`, not `diarize: true` (tsc caught this).
+- **Serverless can't hold a WebSocket** — don't try to proxy audio through a route handler; mint a token, stream client-direct.
+- **Streaming diarizer ≠ batch diarizer** — pin `diarize_model=latest` for streaming (v2 errors).
+- **Two MediaRecorders on one stream** — the live hook runs its own recorder; pausing the *batch* recorder doesn't pause live captions (minor, acceptable).
+
+### Operational notes
+
+- **Verify (browser):** record → captions appear live (interim faded → finalize solid, speaker-labelled). Server log: `[deepgram-token]` grant. On stop → existing batch transcription saves the canonical record.
+- **`/api/deepgram-token`** returns a ~30s token; the browser must connect promptly.
+- **Deferred:** persist the live transcript instead of re-batching (would need assembling final segments + timing); pause/resume wired into the live socket; the raw-WebSocket fallback if the SDK isn't browser-friendly at runtime.
+- **🐢 Phase 10 (Speech AI) COMPLETE** — ASR internals + confidence (10.1) → diarization + live streaming (10.2).
