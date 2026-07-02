@@ -1,6 +1,6 @@
 # Audia — AI Meeting Transcriber
 
-Audia is an AI-powered meeting transcription app. Sign up, record a conversation in your browser (or upload an audio file), and get back a multi-speaker transcript with an AI summary. Then **chat with your transcript** (retrieval-augmented, with citations, memory, and tools), and **search semantically across every meeting** you've recorded. Every session is private to your account and synced across devices.
+Audia is an AI-powered meeting transcription app. Sign up, record a conversation in your browser (or upload an audio file), and get back an accurate multi-speaker transcript with an AI summary. Then **chat with your transcript** (retrieval-augmented, with citations, memory, and tools), and **search semantically across every meeting** you've recorded. Every session is private to your account and synced across devices.
 
 > Audia doubles as a from-scratch **AI-engineering curriculum** — RAG, evals, agents, MCP, and LangChain/LangGraph were each built primitives-first and documented in [`learning/`](learning/) (cheat sheets + a master revision doc).
 
