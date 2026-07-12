@@ -51,7 +51,7 @@
 - [§24. Diarization & streaming/live transcription: interim/final, endpointing, ephemeral-token streaming](#24-diarization--streaminglive-transcription-interimfinal-endpointing-ephemeral-token-streaming) ✅ *(Phase 10.2)*
 
 **Part X — Multimodal**
-- §25. Vision-language models, OCR *(Phase 11 — TBD)*
+- [§25. Multimodal: CLIP, vision-language models, OCR, late fusion](#25-multimodal-clip-vision-language-models-ocr-late-fusion) ✅ *(Phase 11)*
 
 **Part XI — Fine-tuning**
 - §26. When to fine-tune *(Phase 12.1 — TBD)*
@@ -3353,10 +3353,57 @@ A **serverless Next.js route handler is request/response — it cannot host a pe
 
 ---
 
+## §25. Multimodal: CLIP, vision-language models, OCR, late fusion
+
+### 25.1 The whole game in one sentence
+
+> Add images as a third modality: **CLIP** embeds images + text into one space for *comparison*; **VLMs** take image+text in and write text out for *understanding*; for Audia's slides we use a VLM (Gemini), then **late-fuse** its reading with the transcript into one joint summary.
+
+### 25.2 The pieces (def · type · example)
+
+- **Multimodal model** — *Def:* reasons over >1 modality in one context. *Types:* embedding (CLIP) vs generative (VLM). *Ex:* slide image + "summarize" → text.
+- **CLIP** — *Def:* image encoder + text encoder trained contrastively so matching (image, caption) pairs are close in a **shared vector space** → similarity by cosine. *Type:* multimodal *embedding*. *Ex:* zero-shot classification, image search. (Image analog of Phase-3 text embeddings.)
+- **VLM (vision-language model)** — *Def:* generative; interleaved image+text in → text out. *Types:* Gemini, GPT-4V, Claude, Llama-Vision, Qwen-VL. *Ex:* read a slide → bullets + chart takeaway.
+- **OCR vs VLM** — *Def:* OCR extracts raw text; VLM understands text+layout+visuals. *When:* OCR = clean/uniform/high-volume/cheap; VLM = messy/layout-rich/context. *Ex:* invoice → OCR; slide w/ diagram → VLM.
+- **Late fusion** — *Def:* process each modality separately, then combine the *outputs*. *Type:* vs early fusion (one model sees both raw). *Ex:* VLM→slideText + transcript → text model fuses → joint summary. Cheaper + debuggable + reuses the text summarizer.
+
+### 25.3 Gemini vision API
+
+Same raw-fetch REST pattern as embeddings, `:generateContent` endpoint, with a part `inline_data: { mime_type, data: <base64> }` next to a text instruction. ≤20MB inline; a media-resolution knob trades tokens for fine-text legibility.
+
+### 25.4 How it maps to Audia
+
+[vision.ts](../src/lib/vision.ts): `describeSlide` (Gemini VLM) + `jointSummary` (Groq late-fusion, prefers slide specifics where the transcript is vague). [/api/transcriptions/[id]/slide-summary](../src/app/api/transcriptions/[id]/slide-summary/route.ts): load owned transcript → VLM reads slide → fuse → `{slideText, jointSummary}`. UI: a "Slides" card in SessionView ([SlideSummary.tsx](../src/app/components/SlideSummary.tsx)) — pick image → joint summary. Chose VLM over OCR (slides are visual/layout-rich) and over CLIP (we need generation, not retrieval). No fine-tune — reading a slide is a capability a general VLM already has (per the §-fine-tune ladder).
+
+### 25.5 🎯 Defense talking points
+
+- **"CLIP vs VLM?"** CLIP = embeddings (compare image↔text by cosine; search/classification); VLM = generation (write about the image). Need generation for "summarize this slide" → VLM.
+- **"OCR or VLM for slides?"** VLM — slides are layout-rich/visual; OCR is for clean high-volume text. Trade = cost/latency.
+- **"One call or two (fusion)?"** Late fusion: VLM reads slides → text, then fuse with transcript in a text model. Cheaper, debuggable, reuses the summarizer.
+- **"Why not fine-tune a vision model?"** It's a capability, not a behavioral gap — prompt-level on a hosted VLM; fine-tuning would add cost + forgetting risk for nothing.
+
+### 25.6 ⚠️ Common pitfalls
+
+- Using CLIP (embeddings) when you need a VLM (generation), or vice versa.
+- OCR on layout/visual-rich images (loses meaning) / a VLM on clean high-volume text (overpay).
+- `data:` prefix in `inline_data.data` (send raw base64); wrong mime_type; >20MB inline.
+- Early-fusing everything when late fusion is cheaper + easier to debug.
+
+### 25.7 Glossary additions (land in Appendix A)
+
+- **Multimodal model / CLIP / VLM** — see §25.2.
+- **OCR vs VLM** — see §25.2.
+- **Late vs early fusion** — see §25.2.
+
+---
+
 ## Appendix A. Glossary
 
 *(Alphabetical. Grows with each session.)*
 
+- **Multimodal / CLIP / VLM** — multimodal = reasons over >1 modality; CLIP = image+text *embeddings* in a shared space (compare by cosine — search/classification); VLM = *generative* (image+text in → text out — captioning/VQA/understanding). See §25.2.
+- **OCR vs VLM** — OCR extracts raw text (clean/high-volume/cheap); VLM understands text+layout+visuals (messy/layout-rich). See §25.2.
+- **Late vs early fusion** — late = process each modality separately then combine outputs (cheaper, debuggable); early = one model sees both raw inputs. See §25.2.
 - **Diarization (streaming vs offline)** — "who spoke when"; offline clusters over the whole file, streaming must label live with no look-ahead (harder). Deepgram tags each word a speaker index. See §24.2.
 - **Interim / final results, endpointing** — interim = revisable draft (`is_final:false`); final = committed (`is_final:true`) once endpointing detects an utterance-ending pause. Render faded → solid. See §24.2.
 - **Ephemeral-token streaming** — server mints a short-lived token (HTTP); browser opens the provider WebSocket directly with it. The pattern for streaming from serverless (can't host a persistent WS). See §24.4.

@@ -536,4 +536,23 @@ One line per session. Date · phase · what we covered · what stuck · what's f
 - **Loose ends:**
   - **Live WS captions blocked by local network env** — re-test on a phone hotspot / no-VPN / no-AV-SSL-inspection network; or fall back to `["token", DEEPGRAM_API_KEY]` subprotocol (works client-side but exposes the key).
   - Persist the live transcript instead of re-batching on stop; pause/resume wired into the live socket.
-  - **NEXT: Phase 11 — Fine-tuning** (11.1 when-to-FT + SFT/LoRA/QLoRA, 11.2 dataset prep, 11.3 run a fine-tune). See [[audia_ai_progress]].
+  - **NEXT: Phase 11 — Fine-tuning** (11.1 when-to-FT + SFT/LoRA/QLoRA, 11.2 dataset prep, 11.3 run a fine-tune). See [[audia_ai_progress]]. **[SUPERSEDED — see numbering correction below]**
+
+---
+
+**2026-06-05 · ⚠️ NUMBERING CORRECTION.** The 10.x logs mislabeled the next phase as "Fine-tuning." Per the LangGraph-insertion renumber, **Phase 11 = Multimodal, Phase 12 = Fine-tuning.** A Fine-tuning "11.1" lesson was taught, then caught + **stashed** (`git stash` — "Phase 12.1 fine-tuning: SFT-format util + demo"; pop at Phase 12). Real Phase 11 (Multimodal) done below.
+
+---
+
+**2026-06-05 · Phase 11.1 — Multimodal: CLIP / VLM / OCR → joint summary · 🖼️ PHASE 11 COMPLETE**
+- Covered (def·type·example): multimodal (embedding vs generative); **CLIP** (image+text encoders → shared vector space; compare by cosine — search/classification; image analog of Phase-3 text embeddings); **VLM** (Gemini/GPT-4V/Claude/Llama-Vision; image+text in → text out); **OCR vs VLM** (OCR clean/high-volume/cheap; VLM messy/layout-rich/visual); **late vs early fusion** (late = process each modality separately then combine outputs — cheaper/debuggable/reuses summarizer; what we used); Gemini vision API (`:generateContent` + `inline_data` base64).
+- Built: [vision.ts](../src/lib/vision.ts) `describeSlide` (Gemini VLM, raw-fetch like embeddings) + `jointSummary` (Groq late-fusion). [/api/transcriptions/[id]/slide-summary](../src/app/api/transcriptions/[id]/slide-summary/route.ts). **Real UI feature:** [SlideSummary.tsx](../src/app/components/SlideSummary.tsx) — a "Slides" card in [SessionView](../src/app/components/SessionView.tsx) (Add a slide → joint summary + collapsible slide reading). `tsc` clean.
+- **🎯 Tharun caught a real quality gap:** first cut of the prompts skipped Phase-1/4 rigor — VLM output leaked the prompt structure (`Title: None`), joint summary had a preamble, and NO injection guard. **Hardened both** (injection guard: image text + transcript = untrusted DATA not instructions — multimodal adds an injection surface *through the image*; hallucination control: ground/don't-invent; output discipline: bullets only; delimiters). Headline lesson: prompt-hardening rigor applies to EVERY model call; a new capability isn't an excuse to drop it.
+- **Runtime debugging:** `gemini-2.5-flash` 404'd (retired for new keys) → queried the models list endpoint with the key → switched to the **`gemini-flash-latest`** alias (won't churn). Feature then worked (read a JS-runtime diagram, fused with transcript, even flagged a sync-vs-async contradiction).
+- **Quiz ≈ 8/10:** Q1 CLIP-vs-VLM (9), Q2 OCR-vs-VLM (7, vague on "structured"), **Q3 late/early fusion — SKIPPED (I under-taught it; explained after)**, **🎯 Q4 trap (8.5) — REJECTED THE PREMISE FIRST** ("slides are not just text…"), breaking the 3× recurring trap-concession (7.3/10.1/10.2). Big win — acknowledge + reinforce. Q5 no-fine-tune (8).
+- **🧠 Feynman 6/10** — "worker who couldn't see, now can" — opener-first + banned-clean, but thin/under-developed (named *that* he can see, not the two ops: read *meaning* off the picture + *blend* with what was said). Modeled the eyes-shut-note-taker version. Trajectory: 10.2 (5.5) → 11.1 (6). Drill unchanged: build the mechanism from the analogy's nouns; don't stop at the setup.
+- **🖼️ PHASE 11 (Multimodal) COMPLETE** (single session). **25/30 sessions.**
+- **Loose ends:**
+  - Multi-slide decks (loop describeSlide + fuse all); persist the joint summary on the transcription (currently ephemeral in the session view); PDF decks.
+  - Browser runtime test of the Slides card by Tharun (worked once; confirm the hardened-prompt output is clean).
+  - **NEXT: Phase 12 — Fine-tuning.** `git stash pop` the parked 12.1 work (SFT-format util + demo) to resume. Then 12.2 dataset prep, 12.3 run. See [[audia_ai_progress]].

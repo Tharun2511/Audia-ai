@@ -9,6 +9,7 @@ import type { TranscriptSegment } from "@/entity/Transcription";
 import { formatDuration } from "./utils";
 import AudioPlayer from "./AudioPlayer";
 import SummaryBlock from "./SummaryBlock";
+import SlideSummary from "./SlideSummary";
 import TitleInput from "./TitleInput";
 import TranscriptPanel from "./TranscriptPanel";
 import ChatPanel from "./ChatPanel";
@@ -186,6 +187,9 @@ export default function SessionView({
             </Box>
 
             <SummaryBlock summary={summary} />
+
+            {/* Multimodal (11.1): add a slide image → joint summary with the transcript. */}
+            <SlideSummary transcriptionId={id} />
 
             {/*
              * The audio player is "sticky" from this position onward — when
