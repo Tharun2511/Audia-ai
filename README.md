@@ -7,7 +7,7 @@ Audia is an AI-powered meeting transcription app. Sign up, record a conversation
 ## Features
 
 ### Capture & transcription
-- **Browser recording** — one-click record via the MediaRecorder API, no installs
+- **Browser recording** — one-click record via the MediaRecorder API, no installs required
 - **Audio file upload** — drag-and-drop common formats (mp3, wav, webm, m4a, ogg, flac)
 - **Speaker diarization** — speakers auto-identified (User1, User2, …) with distinct colors, renameable inline
 - **Accurate transcription** — Deepgram nova-2, smart formatting + punctuation + per-segment timestamps
