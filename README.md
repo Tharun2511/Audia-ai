@@ -25,7 +25,7 @@ Audia is an AI-powered meeting transcription app. Sign up, record a conversation
 
 ### Editing & export
 - **Speaker renaming** — rename `User1` → "Alice" inline; persists across devices (and re-chunks/re-embeds)
-- **Segment text editing** + **title rename**
+- **Segment text editing** + **inline title rename**
 - **Copy / Download** — formatted transcript as `.txt` or `.md`
 - **Delete with undo** — 5-second window before the server-side delete fires
 
