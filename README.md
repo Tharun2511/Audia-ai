@@ -16,7 +16,7 @@ Audia is an AI-powered meeting transcription app. Sign up, record a conversation
 ### AI: chat, retrieval & agents
 - **Chat with your transcript (RAG)** — on save, each transcript is chunked, embedded (Gemini) and stored in **pgvector**; questions retrieve the most relevant chunks (MMR re-ranking + lost-in-the-middle reorder) and the model answers **grounded in those chunks**
 - **Inline citations** — answers carry `[N]` markers rendered as clickable chips that **seek the audio** straight to that moment
-- **Conversation memory** — follow-up questions work ("and what about Bob?"); a rolling buffer of prior turns is threaded into each request
+- **Conversation memory** — follow-up questions just work ("and what about Bob?"); a rolling buffer of prior turns is threaded into each request
 - **Cross-meeting agent (tool use)** — the chat model can call tools (`listMyMeetings`, `getMeetingDetails`) in an agentic loop to answer questions that span your whole library, not just the open session
 - **Semantic + hybrid search across all meetings** — sidebar search: type to filter the session list instantly, press **Enter** for semantic search over transcript *content*. Combines dense (pgvector) + lexical (Postgres full-text) recall fused with **Reciprocal Rank Fusion**, then **cross-encoder re-ranking** (Jina); results show the meeting, timestamp, and a relevance score
 - **MCP server** — `/api/mcp` exposes Audia's tools over the **Model Context Protocol** (JSON-RPC 2.0), so external MCP clients can query your meetings
