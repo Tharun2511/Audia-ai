@@ -36,7 +36,7 @@ Audia is an AI-powered meeting transcription app. Sign up, record a conversation
 
 ### UI / UX
 - **Hub-and-detail layout** — sidebar lists sessions; the main pane is state-driven (Ready / Recording / Processing / Session / **Search results**)
-- **Dark mode** — light / dark / system, persisted, no flash (CSS variables)
+- **Dark mode** — light / dark / system, persisted, with no flash (CSS variables)
 - **Material UI v9 throughout**, **sonner** toasts, **mobile drawer**, mic-permission guidance
 
 ## Tech Stack
